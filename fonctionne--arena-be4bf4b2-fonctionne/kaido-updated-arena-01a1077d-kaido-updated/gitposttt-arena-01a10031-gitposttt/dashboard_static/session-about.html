@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>À Propos / Status Session - KAIDO-MD</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 2.5rem;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #667eea;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .back-link {
+            display: inline-block;
+            margin-bottom: 1rem;
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .back-link:hover { text-decoration: underline; }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #555;
+            font-weight: 600;
+        }
+        input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        input:focus { border-color: #667eea; }
+        .btn {
+            background: #667eea;
+            color: white;
+            padding: 12px 25px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            transition: background 0.3s;
+        }
+        .btn:hover { background: #5a6fd6; }
+        .result-card {
+            margin-top: 2rem;
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            border-radius: 10px;
+            padding: 1.5rem;
+            display: none;
+        }
+        .result-card h3 { color: #333; margin-bottom: 10px; }
+        .result-card p { margin: 6px 0; color: #555; }
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 10px;
+            margin-top: 1.5rem;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="/dashboard" class="back-link"><i class="fa-solid fa-arrow-left"></i> Retour au tableau de bord</a>
+        <h1><i class="fa-solid fa-circle-info"></i> Vérifier le Statut (About) WhatsApp</h1>
+
+        <form id="aboutForm">
+            <div class="form-group">
+                <label for="sessionNumber">Votre Numéro de Session Connectée :</label>
+                <input type="tel" id="sessionNumber" placeholder="Ex: 50947440869" required>
+            </div>
+            <div class="form-group">
+                <label for="targetNumber">Numéro Cible à Vérifier :</label>
+                <input type="tel" id="targetNumber" placeholder="Ex: 50947371381" required>
+            </div>
+            <button type="submit" class="btn"><i class="fa-solid fa-magnifying-glass"></i> Consulter le Statut</button>
+        </form>
+
+        <div id="errorMsg" class="message error"></div>
+
+        <div id="resultCard" class="result-card">
+            <h3>📋 Informations Statut (About)</h3>
+            <p><strong>Numéro Cible :</strong> <span id="resTarget"></span></p>
+            <p><strong>Bio / Statut WhatsApp :</strong> <span id="resAbout" style="color:#667eea; font-weight:bold;"></span></p>
+            <p><strong>Défini le :</strong> <span id="resDate"></span></p>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('aboutForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const sessionNumber = document.getElementById('sessionNumber').value.trim();
+            const targetNumber = document.getElementById('targetNumber').value.trim();
+            const errDiv = document.getElementById('errorMsg');
+            const resCard = document.getElementById('resultCard');
+
+            errDiv.style.display = 'none';
+            resCard.style.display = 'none';
+
+            try {
+                const res = await fetch(`/getabout?number=${encodeURIComponent(sessionNumber)}&target=${encodeURIComponent(targetNumber)}`);
+                const data = await res.json();
+
+                if (res.ok && data.status === 'success') {
+                    document.getElementById('resTarget').textContent = data.number;
+                    document.getElementById('resAbout').textContent = data.about;
+                    document.getElementById('resDate').textContent = data.setAt;
+                    resCard.style.display = 'block';
+                } else {
+                    errDiv.textContent = `❌ ${data.message || data.error || 'Impossible de récupérer le statut.'}`;
+                    errDiv.style.display = 'block';
+                }
+            } catch (err) {
+                errDiv.textContent = `❌ Erreur: ${err.message}`;
+                errDiv.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
