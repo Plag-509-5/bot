@@ -146,6 +146,19 @@ video.bg-video{
   border-color:#4caf50;
 }
 
+/* Copie automatique impossible (contexte non sécurisé) : le texte reste
+   sélectionné pour un Ctrl+C manuel. */
+.code-display.copy-failed{
+  background:rgba(255, 209, 102, 0.18);
+  color:#ffd166;
+  border-color:#ffd166;
+}
+
+.code-display:focus-visible{
+  outline:2px solid #4facfe;
+  outline-offset:3px;
+}
+
 /* ===== Music Button (Top Right) ===== */
 .music-btn{
   position:fixed;
@@ -215,6 +228,7 @@ video.bg-video{
 </audio>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.0.0-alpha.1/axios.min.js"></script>
+<script src="/assets/copy-code.js"></script>
 
 <script>
 let pairElement = document.getElementById("pair");
@@ -246,52 +260,101 @@ function toggleMusic() {
   }
 }
 
-async function copyCode() {
-  let codeElement = document.getElementById("codeDisplay");
-  if (!codeElement) return;
-  
-  let code = codeElement.innerText.replace('CODE: ', '');
-  await navigator.clipboard.writeText(code);
-  
-  // Visual feedback
-  codeElement.classList.add('copied');
-  codeElement.innerHTML = '<i class="fas fa-check"></i> Code copié';
-  
-  setTimeout(() => {
-    codeElement.classList.remove('copied');
-    codeElement.innerHTML = `CODE: <span style="color:#ffffff">${code}</span>`;
-  }, 2000);
+// Copie du code : déléguée à /assets/copy-code.js, qui gère les contextes non
+// sécurisés (HTTP simple, iframe) où `navigator.clipboard` n'existe pas.
+function bindCopy(element, code) {
+  return KaidoCopy.bindCodeCopy(element, {
+    getCode: () => code,
+    label: 'CODE',
+    successHtml: '<i class="fas fa-check"></i> Code copié',
+    manualHtml: '<i class="fas fa-hand-pointer"></i> Ctrl+C pour copier',
+    restoreMs: 2500
+  });
 }
 
-submitBtn.addEventListener("click", async (e) => {
-  e.preventDefault();
-  
-  if (!numberInput.value) {
-    pairElement.innerHTML = '<span style="color:#ff6b6b">Entrez votre numéro (sans le +)</span>';
-    return;
-  }
-  
-  let cleanNumber = numberInput.value.replace(/[^0-9]/g, "");
-  
-  if (cleanNumber.length < 11) {
-    pairElement.innerHTML = '<span style="color:#ff6b6b">Numéro Invalide</span>';
-    return;
-  }
-  
-  pairElement.innerHTML = '<span style="color:#ffffff">Veuillez patienter...</span>';
-  
+async function copyCode() {
+  const element = document.getElementById("codeDisplay");
+  if (!element || !window.KaidoCopy) return;
+  return KaidoCopy.copyText(KaidoCopy.readCode(element, { label: 'CODE' }));
+}
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function showMessage(html) {
+  pairElement.innerHTML = html;
+}
+
+function showFailure(message, number) {
+  showMessage(`
+    <span style="color:#ff6b6b">${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', true)"
+        style="background:#4facfe;color:#08111f;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        Réessayer maintenant
+      </button>
+    </div>
+  `);
+}
+
+async function requestPairing(cleanNumber, force) {
+  showMessage('<span style="color:#ffffff">Veuillez patienter...</span>');
+
   try {
-    let { data } = await axios(`/code?number=${cleanNumber}`);
-    let code = data.code || "Indisponible";
-    
-    pairElement.innerHTML = `
-      <div class="code-display" id="codeDisplay" onclick="copyCode()">
-        CODE: <span style="color:#ffffff">${code}</span>
-      </div>
-    `;
+    const { data } = await axios(`/code?number=${encodeURIComponent(cleanNumber)}${force ? '&force=1' : ''}`);
+    const code = data.code || data.pairingCode;
+
+    if (code) {
+      pairElement.innerHTML = `
+        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}">
+          CODE: <span style="color:#ffffff">${escapeHtml(code)}</span>
+        </div>
+      `;
+      const element = document.getElementById("codeDisplay");
+      if (element && window.KaidoCopy) bindCopy(element, code);
+      return;
+    }
+
+    // Sans code, on n'écrit plus « Indisponible » dans le bloc à copier :
+    // l'utilisateur copiait alors le libellé au lieu d'un code.
+    if (data.status === 'appairage_en_cours') {
+      showMessage(`
+        <span style="color:#ffd166">${escapeHtml(data.message || 'Un appairage est déjà en cours pour ce numéro.')}</span>
+        <div style="margin-top:14px">
+          <button type="button" onclick="requestPairing('${escapeHtml(cleanNumber)}', true)"
+            style="background:#4facfe;color:#08111f;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+            Forcer un nouveau code
+          </button>
+        </div>
+      `);
+      return;
+    }
+    showFailure(data.message || data.error || 'Aucun code reçu du serveur.', cleanNumber);
   } catch (error) {
-    pairElement.innerHTML = '<span style="color:#ff6b6b">Erreur de connexion</span>';
+    const payload = error.response && error.response.data;
+    showFailure((payload && (payload.message || payload.error)) || error.message || 'Erreur de connexion', cleanNumber);
   }
+}
+
+submitBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+
+  if (!numberInput.value) {
+    showMessage('<span style="color:#ff6b6b">Entrez votre numéro (sans le +)</span>');
+    return;
+  }
+
+  const cleanNumber = numberInput.value.replace(/[^0-9]/g, "");
+
+  if (cleanNumber.length < 11) {
+    showMessage('<span style="color:#ff6b6b">Numéro Invalide</span>');
+    return;
+  }
+
+  requestPairing(cleanNumber, false);
 });
 
 // Allow Enter key to submit

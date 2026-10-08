@@ -76,7 +76,9 @@ reste est rangé par responsabilité.
 │
 ├── dashboard/
 │   ├── static/               # 🌐 Pages HTML du tableau de bord (servies sous /dashboard)
-│   └── pages/                # 📄 Pages publiques (pairing, accueil, suppression)
+│   ├── pages/                # 📄 Pages publiques (pairing, accueil, suppression)
+│   └── assets/
+│       └── copy-code.js      # 📋 Copie du code d'appairage (servi sur /assets/)
 │
 ├── scripts/
 │   └── check-syntax.js       # ✅ `npm run test:syntax` sur tous les fichiers .js
@@ -150,6 +152,36 @@ Le dashboard, ne trouvant ni `code` ni `pairingCode`, affichait alors
 - **Le dashboard** affiche le message réel, propose **« Réessayer maintenant »**
   après un échec et **« Forcer un nouveau code »** si un appairage est déjà en
   attente (`/code?number=…&force=1`).
+
+---
+
+## 📋 Copie du code d'appairage
+
+`navigator.clipboard` n'existe **que dans un contexte sécurisé** (HTTPS ou
+`localhost`). Servi en HTTP simple — IP:port, domaine sans TLS, iframe de
+prévisualisation — `navigator.clipboard` vaut `undefined`, et
+`navigator.clipboard.writeText(...)` levait une `TypeError`. Comme `copyCode()`
+était `async` et appelée depuis un `onclick` inline, l'erreur devenait un rejet
+de promesse non géré : **rien n'était copié et aucun retour visuel
+n'apparaissait**.
+
+`dashboard/assets/copy-code.js` (servi publiquement sur `/assets/`, partagé par
+`/` et `/pair`) essaie trois niveaux :
+
+1. **Clipboard API** — contexte sécurisé ;
+2. **`execCommand('copy')`** sur un textarea temporaire hors flux — HTTP simple,
+   vieux navigateurs, iframe (avec `setSelectionRange` pour iOS Safari) ;
+3. **sélection du texte** + message « Ctrl+C pour copier » — dernier recours.
+
+`copyText()` ne lève jamais d'erreur : elle renvoie toujours
+`{ copied, method, error }`, donc l'interface affiche un retour dans tous les
+cas. `bindCodeCopy()` ajoute le clic, le clavier (Entrée/Espace) et les attributs
+d'accessibilité (`role`, `tabindex`).
+
+`readCode()` lit `data-code` en priorité : le texte affiché peut être
+transformé (« Code Copié ! »), l'attribut reste la valeur exacte. `main.html`
+n'écrivait plus le code dans un attribut et copiait donc parfois le libellé
+`Indisponible` au lieu d'un code.
 
 ---
 

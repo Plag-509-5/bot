@@ -149,6 +149,19 @@ body {
   color: #22c55e;
 }
 
+/* Copie automatique impossible (contexte non sécurisé) : le texte reste
+   sélectionné pour un Ctrl+C manuel. */
+.code-display.copy-failed {
+  background: rgba(251, 191, 36, 0.18);
+  border-color: #fbbf24;
+  color: #fbbf24;
+}
+
+.code-display:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 3px;
+}
+
 .footer-links {
   margin-top: 25px;
   display: flex;
@@ -193,24 +206,28 @@ body {
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.6.8/axios.min.js"></script>
+<script src="/assets/copy-code.js"></script>
 <script>
 const pairElement = document.getElementById("pair");
 const submitBtn = document.getElementById("submit");
 const numberInput = document.getElementById("number");
 
+// Copie du code : déléguée à /assets/copy-code.js, qui gère les contextes non
+// sécurisés (HTTP simple, iframe) où `navigator.clipboard` n'existe pas.
+function bindCopy(element, code) {
+  return KaidoCopy.bindCodeCopy(element, {
+    getCode: () => code,
+    label: 'CODE',
+    successHtml: '<i class="fa-solid fa-check"></i> Code Copié !',
+    manualHtml: '<i class="fa-solid fa-hand-pointer"></i> Ctrl+C pour copier',
+    restoreMs: 2500
+  });
+}
+
 async function copyCode() {
-  const codeElement = document.getElementById("codeDisplay");
-  if (!codeElement) return;
-  const rawCode = codeElement.getAttribute('data-code') || codeElement.innerText.replace('CODE : ', '').trim();
-  await navigator.clipboard.writeText(rawCode);
-  
-  codeElement.classList.add('copied');
-  codeElement.innerHTML = '<i class="fa-solid fa-check"></i> Code Copié !';
-  
-  setTimeout(() => {
-    codeElement.classList.remove('copied');
-    codeElement.innerHTML = `CODE : <span style="color:#ffffff">${rawCode}</span>`;
-  }, 2000);
+  const element = document.getElementById('codeDisplay');
+  if (!element || !window.KaidoCopy) return;
+  return KaidoCopy.copyText(KaidoCopy.readCode(element, { label: 'CODE' }));
 }
 
 // Dernier numéro demandé, pour permettre « forcer un nouveau code ».
@@ -264,10 +281,14 @@ async function requestPairing(cleanNumber, force) {
 
     if (code) {
       pairElement.innerHTML = `
-        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}" onclick="copyCode()">
+        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}">
           CODE : <span style="color:#ffffff">${escapeHtml(code)}</span>
         </div>
       `;
+      // Branchement après insertion : `bindCodeCopy` ajoute le clic, le clavier
+      // et les attributs d'accessibilité sur le nœud réel.
+      const element = document.getElementById('codeDisplay');
+      if (element && window.KaidoCopy) bindCopy(element, code);
       return;
     }
 

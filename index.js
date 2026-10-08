@@ -27,6 +27,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// Ressources partagées des pages publiques (pairing, accueil). Servies AVANT le
+// garde d'authentification : ces pages sont publiques, leurs scripts aussi.
+const assetsDir = path.join(__dirname, 'dashboard', 'assets');
+app.use('/assets', express.static(assetsDir, { maxAge: '1h' }));
+
 // Connexion dashboard : mot de passe uniquement, sans nom d'utilisateur.
 app.get('/dashboard/login', (req, res) => {
   if (dashboardAuth.isAuthenticated(req)) return res.redirect('/dashboard');
