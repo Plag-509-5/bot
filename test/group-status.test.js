@@ -154,16 +154,23 @@ test('construit des statuts propres sans watermark pour texte, image, vidéo et 
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
 });
 
-test('wileys relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
+test('le fork Baileys configuré relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
   const uploads = [];
   const relayed = [];
   const socket = {
     user: { id: '50900000000@s.whatsapp.net' },
-    async waUploadToServer(encryptedStream, metadata) {
-      // Contrat wileys : `options.upload` reçoit un flux chiffré (Readable),
-      // plus un chemin de fichier temporaire comme dans les anciens forks.
-      assert.ok(encryptedStream, 'aucun flux chiffré transmis à waUploadToServer');
-      assert.equal(typeof encryptedStream.pipe, 'function', 'waUploadToServer doit recevoir un flux');
+    async waUploadToServer(first, metadata) {
+      // Contrat wileys : `options.upload` reçoit un flux chiffré (Readable).
+      // Contrat xzcbailz : `options.upload` reçoit le chemin (string) du
+      // fichier chiffré. Chaque fork appelle son propre `waUploadToServer`,
+      // les deux signatures sont donc internes au fork : le test accepte les
+      // deux contrats pour rester valide quel que soit le fork configuré.
+      if (typeof first === 'string') {
+        assert.ok(fs.existsSync(first), 'xzcbailz doit transmettre un chemin de fichier existant');
+      } else {
+        assert.ok(first, 'aucun média transmis à waUploadToServer');
+        assert.equal(typeof first.pipe, 'function', 'wileys doit transmettre un flux chiffré');
+      }
       uploads.push(metadata.mediaType);
       return {
         mediaUrl: `https://upload.invalid/${metadata.mediaType}`,
@@ -237,7 +244,7 @@ test('wileys relaie image, vidéo, audio et texte avec les marqueurs de statut d
   await assert.rejects(groupStatus(socket, '123456@s.whatsapp.net', { text: 'non' }), /JID @g\.us/);
 });
 
-test('le baileys utilisé (wileys) supporte le wrapper V2 et les additionalNodes du relay', () => {
+test('le fork Baileys configuré supporte le wrapper V2 et les additionalNodes du relay', () => {
   // `.swgc` (statut de groupe) dépend de deux capacités du fork Baileys :
   //   1. relayMessage doit accepter `additionalNodes` et les ajouter à la stanza ;
   //   2. generateWAMessageContent doit reconnaître `groupStatusMessageV2`.
@@ -263,16 +270,17 @@ test('le baileys utilisé (wileys) supporte le wrapper V2 et les additionalNodes
   assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
 
   const packageJson = require('../package.json');
-  const baileysSpec = packageJson.dependencies['@whiskeysockets/baileys'];
-  assert.match(
-    String(baileysSpec),
-    /^npm:wileys/,
-    `le bot doit utiliser wileys, trouvé : ${baileysSpec}`
+  const baileysSpec = String(packageJson.dependencies['@whiskeysockets/baileys']);
+  const forkMatch = baileysSpec.match(/^npm:([a-z0-9-]+)@/i);
+  assert.ok(forkMatch, `le bot doit utiliser un fork Baileys supporté (npm:<fork>@<version>), trouvé : ${baileysSpec}`);
+  assert.ok(
+    ['wileys', 'xzcbailz'].includes(forkMatch[1]),
+    `fork Baileys non supporté : ${forkMatch[1]} (supportés : wileys, xzcbailz)`
   );
   assert.equal(
     require('@whiskeysockets/baileys/package.json').name,
-    'wileys',
-    "l'alias @whiskeysockets/baileys ne résout pas vers wileys"
+    forkMatch[1],
+    "l'alias @whiskeysockets/baileys ne résout pas vers le fork déclaré"
   );
 });
 

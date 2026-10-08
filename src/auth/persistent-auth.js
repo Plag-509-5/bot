@@ -23,9 +23,13 @@
  *   saveCreds(number, creds)
  *   saveKeys(number, [{ ref, value }])   // value === null => suppression
  *   remove(number)
+ *
+ * restoreKey(type, value) reconstruit les classes protobuf si nécessaire ;
+ * pair.js l’utilise pour app-state-sync-key, comme useMultiFileAuthState.
  */
 
 const store = require('./session-store');
+const { reviveAuthValue } = require('./auth-json');
 
 const DEFAULT_FLUSH_DELAY_MS = 750;
 
@@ -106,6 +110,7 @@ async function createPersistentAuthState(number, options = {}) {
     backend = null,
     logger = null,
     initCreds = null,
+    restoreKey = (_type, value) => value,
     flushDelayMs = Number(process.env.AUTH_FLUSH_DELAY_MS) || DEFAULT_FLUSH_DELAY_MS
   } = options;
 
@@ -144,8 +149,8 @@ async function createPersistentAuthState(number, options = {}) {
     }
   }
 
-  let creds = resolved.valid ? resolved.creds : initCreds();
-  let keys = resolved.valid ? resolved.keys : [];
+  let creds = reviveAuthValue(resolved.valid ? resolved.creds : initCreds());
+  let keys = resolved.valid ? resolved.keys.map(key => ({ ...key, value: reviveAuthValue(key.value) })) : [];
 
   if (!resolved.valid) {
     logInfo(logger, `[AUTH ${sanitized}] nouvelle session créée (aucun état exploitable).`);
@@ -233,7 +238,7 @@ async function createPersistentAuthState(number, options = {}) {
       const found = {};
       for (const id of ids || []) {
         const value = keyCache.get(store.keyRef(type, id));
-        if (value !== undefined && value !== null) found[id] = value;
+        if (value !== undefined && value !== null) found[id] = restoreKey(type, value);
       }
       return found;
     },

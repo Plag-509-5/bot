@@ -2,7 +2,7 @@
 
 /**
  * Test d'intégration : notre état d'authentification persistant est-il accepté
- * par le `makeWASocket` de wileys, et le cache de clés de Baileys
+ * par le `makeWASocket` du fork configuré, et le cache de clés de Baileys
  * (`makeCacheableSignalKeyStore`) dialogue-t-il correctement avec lui ?
  *
  * Aucune connexion WhatsApp n'est établie : on vérifie le contrat d'interface,
@@ -20,18 +20,19 @@ process.env.SESSIONS_DIR = sandbox;
 
 const baileys = require('@whiskeysockets/baileys');
 const {
-  default: makeWASocket,
   initAuthCreds,
   makeCacheableSignalKeyStore
 } = baileys;
 const pino = require('pino');
+const { makeOfflineSocket } = require('./helpers/baileys-socket');
+test.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
 
 const { createPersistentAuthState } = require('../src/auth/persistent-auth');
 const store = require('../src/auth/session-store');
 
 const logger = pino({ level: 'silent' });
 
-test('wileys expose bien ce dont le bot a besoin', () => {
+test('xzcbailz expose bien ce dont le bot a besoin', () => {
   for (const name of [
     'default',
     'initAuthCreds',
@@ -44,11 +45,11 @@ test('wileys expose bien ce dont le bot a besoin', () => {
     'generateWAMessageContent',
     'proto'
   ]) {
-    assert.ok(name in baileys, `export manquant dans wileys : ${name}`);
+    assert.ok(name in baileys, `export manquant dans xzcbailz : ${name}`);
   }
 });
 
-test('makeWASocket accepte l’état d’authentification persistant', async () => {
+test('makeWASocket accepte l’état d’authentification persistant sans connexion réseau', async t => {
   const auth = await createPersistentAuthState('50990000001', {
     logger,
     initCreds: initAuthCreds,
@@ -57,7 +58,7 @@ test('makeWASocket accepte l’état d’authentification persistant', async () 
   assert.equal(auth.source, 'nouvelle');
   assert.equal(store.credsLooksValid(auth.state.creds), true);
 
-  const socket = makeWASocket({
+  const { socket } = makeOfflineSocket(t, {
     auth: {
       creds: auth.state.creds,
       keys: makeCacheableSignalKeyStore(auth.state.keys, logger)
@@ -74,21 +75,14 @@ test('makeWASocket accepte l’état d’authentification persistant', async () 
     assert.equal(typeof socket.authState.keys.get, 'function');
     assert.equal(typeof socket.authState.keys.set, 'function');
 
-    // On laisse la websocket aboutir (ouverte, ou fermée faute de réseau) avant
-    // de la fermer : fermer une socket encore en CONNECTING lève une exception.
-    await new Promise((resolve) => {
-      const timer = setTimeout(resolve, 2000);
-      if (typeof timer.unref === 'function') timer.unref();
-      socket.ev.on('connection.update', (update) => {
-        if (update.connection === 'open' || update.connection === 'close') {
-          clearTimeout(timer);
-          resolve();
-        }
-      });
-    });
+    socket.ev.on('creds.update', auth.persistSoon);
+    const code = await socket.requestPairingCode('50990000001');
+    await auth.flush();
+    const { creds: saved } = await store.snapshotAuthDir(auth.dir);
+    assert.equal(saved.pairingCode, code);
+    assert.equal(saved.me.id, '50990000001@s.whatsapp.net');
   } finally {
-    try { socket.end?.(undefined, 'test'); } catch (e) { /* déjà fermée */ }
-    await new Promise((resolve) => setImmediate(resolve));
+    await socket.end();
     await auth.close();
   }
 });
@@ -130,4 +124,43 @@ test('le cache de clés Baileys lit et écrit à travers notre store', async () 
 
 test('les creds générés par initAuthCreds passent la validation du store', () => {
   assert.equal(store.credsLooksValid(initAuthCreds()), true);
+});
+
+test('les clés protobuf et binaires du nouveau fork survivent à un arrêt puis une restauration', async t => {
+  const number = '50990000003';
+  const initial = await createPersistentAuthState(number, { initCreds: initAuthCreds, logger });
+  const key = baileys.proto.Message.AppStateSyncKeyData.fromObject({
+    keyData: Buffer.alloc(32, 7),
+    fingerprint: { rawId: 42, currentIndex: 1, deviceIndexes: [1, 2] },
+    timestamp: 1700000000
+  });
+  try {
+    await makeCacheableSignalKeyStore(initial.state.keys, logger).set({
+      'app-state-sync-key': { 'key-one': key },
+      'pre-key': { 12: { private: Buffer.alloc(32, 3), public: Buffer.alloc(32, 4) } }
+    });
+    await initial.flush();
+  } finally { await initial.close(); }
+  const restored = await createPersistentAuthState(number, {
+    initCreds: initAuthCreds, logger,
+    restoreKey: (type, value) => type === 'app-state-sync-key'
+      ? baileys.proto.Message.AppStateSyncKeyData.fromObject(value) : value
+  });
+  try {
+    assert.equal(restored.source, 'disque');
+    assert.ok(Buffer.isBuffer(restored.state.creds.noiseKey.private));
+    assert.ok(Buffer.isBuffer(restored.state.creds.signedPreKey.signature));
+    const keys = makeCacheableSignalKeyStore(restored.state.keys, logger);
+    const appState = (await keys.get('app-state-sync-key', ['key-one']))['key-one'];
+    assert.ok(appState instanceof baileys.proto.Message.AppStateSyncKeyData);
+    const decoded = appState;
+    assert.deepEqual(Buffer.from(decoded.keyData), Buffer.alloc(32, 7));
+    assert.deepEqual(decoded.fingerprint.deviceIndexes, [1, 2]);
+    const preKey = (await keys.get('pre-key', ['12']))['12'];
+    assert.deepEqual(preKey.private, Buffer.alloc(32, 3));
+    assert.deepEqual(preKey.public, Buffer.alloc(32, 4));
+    const { socket } = makeOfflineSocket(t, { auth: { creds: restored.state.creds, keys } });
+    assert.match(await socket.requestPairingCode(number), /^[1-9A-HJ-NP-TV-Z]{8}$/);
+    await socket.end();
+  } finally { await restored.close(); }
 });

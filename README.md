@@ -49,7 +49,7 @@ reste est rangé par responsabilité.
 ├── index.js                  # 🚀 Point d'entrée : serveur Express + montage du routeur
 ├── package.json              # 📦 Dépendances et scripts
 ├── .env.example              # 🔐 Variables d'environnement documentées
-├── .npmrc                    # ⚙️ legacy-peer-deps (conflit jimp imposé par wileys)
+├── .npmrc                    # ⚙️ legacy-peer-deps (peers Jimp des forks Baileys)
 ├── .gitignore / LICENSE / README.md
 │
 ├── config/
@@ -188,16 +188,31 @@ n'écrivait plus le code dans un attribut et copiait donc parfois le libellé
 ## ⚙️ Installation & Démarrage
 
 ### 1. Prérequis
-- **Node.js** >= 18.x
+- **Node.js** 22.12+ (22 LTS récent recommandé), ou Node 20 à partir de 20.19
 - **FFmpeg** (pour la conversion audio/vidéo et stickers)
 - **MongoDB** (cluster local ou MongoDB Atlas)
 
 ### 2. Cloner le dépôt et installer les dépendances
 ```bash
-git clone https://github.com/Plag-509-5/gitposttt.git
-cd gitposttt
-npm install --legacy-peer-deps
+git clone https://github.com/Plag-509-5/bot.git
+cd bot
+npm ci
 ```
+
+Le bot utilise maintenant **`xzcbailz@1.0.6`**, version figée sous l'alias
+`@whiskeysockets/baileys`. Ce fork est ESM : Node 20.18 et les versions plus
+anciennes ne peuvent pas le charger avec les `require()` du bot sans options
+expérimentales.
+
+Vérifier les contrats et les régressions avant le déploiement :
+```bash
+npm run test:syntax
+npm run test:baileys
+npm test
+```
+Les essais automatisés n'appairent aucun compte WhatsApp réel. Voir le
+[rapport de compatibilité xzcbailz](docs/xzcbailz-compatibility.md) pour les
+résultats, les limites et la checklist de validation sur téléphone.
 
 ### 3. Configuration de l'environnement
 Copiez le fichier `.env.example` en `.env` :

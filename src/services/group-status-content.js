@@ -29,6 +29,25 @@ async function streamToBuffer(stream) {
   return Buffer.concat(chunks);
 }
 
+// Réutiliser les métadonnées déjà reçues : évite de perdre une miniature
+// vidéo quand ffmpeg n'est pas sur le PATH, ou la durée d'un message vocal.
+// Ne jamais réutiliser URL, mediaKey ou hashes : le média sera rechiffré.
+function mediaMetadata(media, type) {
+  const result = {};
+  if (type === 'image' || type === 'video') {
+    if (media.jpegThumbnail !== undefined && media.jpegThumbnail !== null) result.jpegThumbnail = media.jpegThumbnail;
+    for (const key of ['width', 'height']) {
+      if (Number.isFinite(media[key]) && media[key] > 0) result[key] = media[key];
+    }
+  }
+  if (type === 'video' || type === 'audio') {
+    if (Number.isFinite(media.seconds) && media.seconds >= 0) result.seconds = media.seconds;
+  }
+  if (type === 'video' && typeof media.gifPlayback === 'boolean') result.gifPlayback = media.gifPlayback;
+  if (type === 'audio' && media.waveform !== undefined && media.waveform !== null) result.waveform = media.waveform;
+  return result;
+}
+
 async function buildGroupStatusPayload({ quotedMessage, textInput = '', downloadContent, random = Math.random }) {
   const quoted = unwrapMessage(quotedMessage);
   const requestedText = String(textInput || '').trim();
@@ -53,6 +72,7 @@ async function buildGroupStatusPayload({ quotedMessage, textInput = '', download
         payload: {
           image: buffer,
           mimetype: media.mimetype || 'image/jpeg',
+          ...mediaMetadata(media, downloadType),
           ...(caption ? { caption } : {})
         }
       };
@@ -64,6 +84,7 @@ async function buildGroupStatusPayload({ quotedMessage, textInput = '', download
         payload: {
           video: buffer,
           mimetype: media.mimetype || 'video/mp4',
+          ...mediaMetadata(media, downloadType),
           ...(caption ? { caption } : {})
         }
       };
@@ -73,7 +94,8 @@ async function buildGroupStatusPayload({ quotedMessage, textInput = '', download
       payload: {
         audio: buffer,
         mimetype: media.mimetype || 'audio/mp4',
-        ptt: Boolean(media.ptt)
+        ptt: Boolean(media.ptt),
+        ...mediaMetadata(media, downloadType)
       }
     };
   }

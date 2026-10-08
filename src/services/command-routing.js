@@ -54,8 +54,8 @@ function parseCommandInput(body, prefix, isKnownCommand = () => true) {
 function extractLegacyCommands(source) {
   const commands = new Set();
   const text = String(source || '');
-  for (const match of text.matchAll(/\bcase\s+['"]([a-zA-Z0-9_-]+)['"]\s*:/g)) {
-    commands.add(match[1].toLowerCase());
+  for (const match of text.matchAll(/\bcase\s+(['"])([^'"\s]+)\1\s*:/g)) {
+    commands.add(match[2].toLowerCase());
   }
   return commands;
 }

@@ -67,3 +67,12 @@ test('le registre prefixless réel contient les commandes historiques mais pas l
   }
   assert.ok(commands.size > 100, 'le registre historique ne doit pas être vide ou tronqué');
 });
+
+test('les alias emoji du switch restent reconnus en mode sans préfixe', () => {
+  const source = "case '🌹': case '😍': case '❤️': case \"ping\": {}";
+  const commands = extractLegacyCommands(source);
+  for (const command of ['🌹', '😍', '❤️']) {
+    assert.ok(commands.has(command));
+    assert.equal(parseCommandInput(command, '', name => commands.has(name))?.command, command);
+  }
+});

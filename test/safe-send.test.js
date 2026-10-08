@@ -191,3 +191,18 @@ test('_unsafeSend contourne la garde pour les envois internes', async () => {
   assert.equal(result.key.id, 'DIRECT');
   assert.equal(sent.length, 1);
 });
+
+test('les WebSocketClient des forks ESM sont vérifiés comme les WebSocket bruts', () => {
+  const { websocketReadyState } = require('../src/lib/safe-send');
+  const socket = makeSocket();
+  for (const state of [0, 1, 2, 3]) {
+    socket.ws = { socket: { readyState: state } };
+    assert.equal(websocketReadyState(socket), state);
+    assert.equal(socketReadiness(socket).ready, state === WEBSOCKET_OPEN);
+  }
+  socket.ws = { isOpen: false, isClosed: true };
+  assert.equal(websocketReadyState(socket), 3);
+  assert.equal(socketReadiness(socket).ready, false);
+  socket.ws = { isOpen: true };
+  assert.equal(socketReadiness(socket).ready, true);
+});

@@ -121,9 +121,13 @@ test('le démontage de session passe par un point d’entrée unique', () => {
   assert.match(source, /authBackend\.remove\(sanitized\)/);
 });
 
-test('le bot dépend de wileys et d’aucun autre fork Baileys', () => {
-  const baileys = packageJson.dependencies['@whiskeysockets/baileys'];
-  assert.equal(baileys, 'npm:wileys@^0.7.8');
+test('le bot dépend d’un fork Baileys supporté (wileys ou xzcbailz) et d’aucun autre fork', () => {
+  const baileys = String(packageJson.dependencies['@whiskeysockets/baileys']);
+  assert.match(
+    baileys,
+    /^npm:(wileys|xzcbailz)@/,
+    `fork Baileys non supporté : ${baileys} (supportés : wileys, xzcbailz)`
+  );
 
   const forbidden = [
     '@rexxhayanasi/elaina-baileys',
@@ -149,7 +153,7 @@ test('dotenv et body-parser sont déclarés (ils sont requis au démarrage)', ()
   assert.ok(packageJson.dependencies['body-parser'], 'index.js fait require(\'body-parser\')');
 });
 
-test('.npmrc neutralise le conflit de peer jimp imposé par wileys', () => {
+test('.npmrc neutralise le conflit de peer jimp des forks Baileys (wileys et xzcbailz)', () => {
   const npmrc = fs.readFileSync(path.join(__dirname, '..', '.npmrc'), 'utf8');
   assert.match(npmrc, /legacy-peer-deps=true/);
 });
@@ -161,4 +165,9 @@ test('.gitignore exclut le dossier de sessions sans masquer src/auth', () => {
   // donc tout le correctif de persistance disparaîtrait du dépôt.
   const lignes = gitignore.split('\n').map((l) => l.trim());
   assert.ok(!lignes.includes('auth/'), 'une règle « auth/ » masquerait src/auth/');
+});
+
+test('la restauration des clés app-state utilise le protobuf du fork installé', () => {
+  assert.match(source, /restoreKey:\s*\(type, value\) => type === 'app-state-sync-key'/);
+  assert.match(source, /proto\.Message\.AppStateSyncKeyData\.fromObject\(value\)/);
 });

@@ -1,16 +1,17 @@
 {
   "name": "kaido-md",
   "version": "1.2.0",
-  "description": "Kaido MD — bot WhatsApp multi-sessions (Baileys/Wileys) + dashboard Express",
+  "description": "Kaido MD — bot WhatsApp multi-sessions (Baileys/xzcbailz) + dashboard Express",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
-    "test:syntax": "node scripts/check-syntax.js"
+    "test:syntax": "node scripts/check-syntax.js",
+    "test:baileys": "node --test --test-concurrency=1 test/baileys-*.test.js test/group-status*.test.js test/newsletter-*.test.js test/safe-send.test.js test/auth-json.test.js"
   },
   "dependencies": {
     "@vitalets/google-translate-api": "^9.2.1",
-    "@whiskeysockets/baileys": "npm:wileys@^0.7.8",
+    "@whiskeysockets/baileys": "npm:xzcbailz@1.0.6",
     "acrcloud": "^1.4.0",
     "axios": "^1.2.5",
     "body-parser": "^1.20.3",
@@ -36,16 +37,19 @@
     "yt-search": "2.12.1"
   },
   "engines": {
-    "node": ">=20.x"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "keywords": [
     "whatsapp",
     "bot",
     "multi-device",
     "baileys",
-    "wileys",
+    "xzcbailz",
     "kaido-md"
   ],
   "author": "plag",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "acorn": "^8.19.0"
+  }
 }

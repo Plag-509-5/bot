@@ -25,6 +25,7 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { authJsonReplacer, authJsonReviver } = require('./auth-json');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const SESSIONS_ROOT = path.resolve(
@@ -84,7 +85,7 @@ async function writeJsonAtomic(file, value) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const handle = await fsp.open(tmp, 'w');
   try {
-    await handle.writeFile(JSON.stringify(value), 'utf8');
+    await handle.writeFile(JSON.stringify(value, authJsonReplacer), 'utf8');
     await handle.sync();
   } finally {
     await handle.close().catch(() => {});
@@ -112,7 +113,7 @@ async function readJsonSafe(file) {
   }
   if (!raw || !raw.trim()) return null;
   try {
-    return JSON.parse(raw);
+    return JSON.parse(raw, authJsonReviver);
   } catch (err) {
     return null;
   }

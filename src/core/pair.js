@@ -36,9 +36,9 @@ const {
   DEFAULT_NEWSLETTER_EMOJIS,
   normaliseNewsletterJid,
   normaliseEmojiList,
-  resolveNewsletterEmojis,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
+const { createNewsletterReactionHandler, resolveNewsletterPost } = require('../services/newsletter-reactions');
 const {
   modeAllowsChat,
   normaliseAntideleteMode,
@@ -93,7 +93,8 @@ const {
   makeCacheableSignalKeyStore,
   Browsers,
   downloadContentFromMessage,
-  DisconnectReason
+  DisconnectReason,
+  proto
 } = require('@whiskeysockets/baileys');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 // -------- Session persistante --------
@@ -106,7 +107,7 @@ const sessionStore = require('../auth/session-store');
 const { createReconnectScheduler } = require('../auth/reconnect');
 const { createPairingGuard } = require('../auth/pairing-guard');
 const { createSessionPurger } = require('../auth/session-purge');
-const { installSafeSend, getSendStats } = require('../lib/safe-send');
+const { installSafeSend, getSendStats, websocketReadyState } = require('../lib/safe-send');
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -706,7 +707,7 @@ setInterval(() => {
   const now = Date.now();
   activeSockets.forEach((socket, number) => {
     try {
-      const readyState = socket?.ws?.readyState;
+      const readyState = websocketReadyState(socket);
       if (typeof readyState !== 'number') return;
       if (readyState === 1) { lastConnectionActivity.set(number, now); return; }
       const last = lastConnectionActivity.get(number) || now;
@@ -909,64 +910,15 @@ async function sendOTP(socket, number, otp) {
 
 // ---------------- handlers (newsletter + reactions) ----------------
 
-async function setupNewsletterHandlers(socket, sessionNumber) {
-  const rrPointers = new Map();
-
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const message = messages[0];
-    if (!message?.key) return;
-    const jid = message.key.remoteJid;
-
-    try {
-      const normalizedJid = normaliseNewsletterJid(jid);
-      if (!normalizedJid) return;
-      const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
-      const reactMap = new Map();
-      for (const item of reactConfigs) {
-        const itemJid = normaliseNewsletterJid(item.jid);
-        if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
-      }
-
-      const followed = followedDocs.find(item => item.jid === normalizedJid);
-      if (!followed && !reactMap.has(normalizedJid)) return;
-
-      // newsletter_list est la source principale partagée par le dashboard et
-      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
-      const emojis = resolveNewsletterEmojis(
-        followed?.emojis,
-        reactMap.get(normalizedJid),
-        DEFAULT_NEWSLETTER_EMOJIS
-      );
-
-      let idx = rrPointers.get(normalizedJid) || 0;
-      const emoji = emojis[idx % emojis.length];
-      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
-
-      const messageId = message.newsletterServerId || message.key.id;
-      if (!messageId) return;
-
-      let retries = 3;
-      while (retries-- > 0) {
-        try {
-          if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
-          } else {
-            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
-          }
-          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
-          break;
-        } catch (err) {
-          console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
-          await delay(1200);
-        }
-      }
-
-    } catch (error) {
-      console.error('Newsletter reaction handler error:', error?.message || error);
-    }
+function setupNewsletterHandlers(socket, sessionNumber) {
+  const handleUpsert = createNewsletterReactionHandler(socket, {
+    sessionNumber,
+    listNewsletters: listNewslettersFromMongo,
+    listReactionConfigs: listNewsletterReactsFromMongo,
+    saveReaction: saveNewsletterReaction,
+    delay
   });
+  socket.ev.on('messages.upsert', handleUpsert);
 }
 
 // Assure-toi d'avoir importé ton helper en haut du fichier
@@ -6658,44 +6610,22 @@ case 'breact': {
     if (!q.includes(',')) {
       await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
       await socket.sendMessage(sender, { 
-        text: "❌ Format : !breact <channelJid/messageId>,<emoji>\nExemple : !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍" 
+        text: `❌ Format : ${prefix}breact <channelJid/messageId>,<emoji>\nExemple : ${prefix}breact 120363421675697127@newsletter/175,👍`
       }, { quoted: msg });
       break;
     }
 
-    const parts = q.split(',');
-    let channelRef = parts[0].trim();
-    const reactEmoji = parts[1].trim();
-
-    // Extraction du channelJid et messageId
-    let channelJid = null;
-    let messageId = null;
-
-    // Format URL
-    const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-    if (urlMatch) {
-      channelJid = `${urlMatch[1]}@newsletter`;
-      messageId = urlMatch[2];
-    } 
-    // Format court
-    else {
-      const maybeParts = channelRef.split('/');
-      if (maybeParts.length >= 2) {
-        messageId = maybeParts[maybeParts.length - 1];
-        channelJid = maybeParts[maybeParts.length - 2];
-        if (!channelJid.endsWith('@newsletter')) {
-          if (/^\d+$/.test(channelJid)) {
-            channelJid = `${channelJid}@newsletter`;
-          }
-        }
-      }
-    }
-
-    // Validation du format
-    if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Format invalide. Utilisez :\n1. `!breact 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n2. `!breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`" 
+    const separator = q.indexOf(',');
+    const channelRef = q.slice(0, separator).trim();
+    const reactEmoji = q.slice(separator + 1).trim();
+    let channelJid;
+    let messageId;
+    try {
+      if (!reactEmoji) throw new Error('Indique un emoji après la virgule');
+      ({ channelJid, messageId } = await resolveNewsletterPost(socket, channelRef));
+    } catch (error) {
+      await socket.sendMessage(sender, {
+        text: `❌ ${error.message}\n\nExemples :\n${prefix}breact 120363421675697127@newsletter/175,👍\n${prefix}breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`
       }, { quoted: msg });
       break;
     }
@@ -10598,7 +10528,10 @@ async function EmpirePair(number, res, options = {}) {
     auth = await createPersistentAuthState(sanitizedNumber, {
       backend: authBackend,
       logger,
-      initCreds: initAuthCreds
+      initCreds: initAuthCreds,
+      restoreKey: (type, value) => type === 'app-state-sync-key'
+        ? proto.Message.AppStateSyncKeyData.fromObject(value)
+        : value
     });
   } catch (err) {
     if (err instanceof AuthCorruptedError) {
@@ -11137,7 +11070,7 @@ router.get('/api/session/health', async (req, res) => {
       const auth = authStates.get(number);
       sessions.push({
         number,
-        websocketOuverte: socket?.ws?.readyState === 1,
+        websocketOuverte: websocketReadyState(socket) === 1,
         enregistre: Boolean(socket?.authState?.creds?.registered),
         sourceAuth: auth ? auth.source : null,
         clesSignal: auth ? auth.keyCount() : null,

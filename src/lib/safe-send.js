@@ -35,14 +35,28 @@ function defaultDelay(ms) {
   });
 }
 
+/** Baileys peut exposer un WebSocket brut OU un WebSocketClient (xzcbailz). */
+function websocketReadyState(socket) {
+  const ws = socket?.ws;
+  if (typeof ws?.readyState === 'number') return ws.readyState;
+  if (typeof ws?.socket?.readyState === 'number') return ws.socket.readyState;
+  if (typeof ws?.isOpen === 'boolean') {
+    if (ws.isOpen) return WEBSOCKET_OPEN;
+    if (ws.isClosing) return 2;
+    if (ws.isClosed) return 3;
+    return 0;
+  }
+  return undefined;
+}
+
 /** État de la connexion d'un socket, sans effet de bord. */
 function socketReadiness(socket) {
   if (!socket || typeof socket.sendMessage !== 'function') {
     return { ready: false, reason: 'socket-absent' };
   }
-  const ws = socket.ws;
-  if (ws && typeof ws.readyState === 'number' && ws.readyState !== WEBSOCKET_OPEN) {
-    return { ready: false, reason: `websocket-fermee-${ws.readyState}` };
+  const readyState = websocketReadyState(socket);
+  if (typeof readyState === 'number' && readyState !== WEBSOCKET_OPEN) {
+    return { ready: false, reason: `websocket-fermee-${readyState}` };
   }
   const creds = socket.authState && socket.authState.creds;
   if (creds && creds.registered === false) {
@@ -151,6 +165,7 @@ function installSafeSend(socket, options = {}) {
 module.exports = {
   safeSend,
   installSafeSend,
+  websocketReadyState,
   socketReadiness,
   waitForReady,
   getSendStats,
