@@ -298,6 +298,42 @@ test('resolveAuthSource refuse de mélanger deux identités différentes', () =>
   assert.equal(resolved.keys[0].id, '1');
 });
 
+test('discard jette l’état sans rien écrire (appairage raté)', async () => {
+  const number = nextNumber();
+  const backend = fakeBackend();
+  const auth = await createPersistentAuthState(number, { backend, initCreds, logger: quiet, flushDelayMs: 1 });
+
+  // On simule un appairage qui a généré des creds et des pre-keys…
+  await auth.state.keys.set({ 'pre-key': { 1: { a: 1 } } });
+  auth.persistSoon();
+  assert.ok(auth.pendingWrites() >= 2, 'des écritures doivent être en attente');
+
+  // …puis qui échoue. discard doit tout abandonner.
+  auth.discard();
+  assert.equal(auth.pendingWrites(), 0);
+  assert.equal(auth.keyCount(), 0);
+
+  await auth.flush();
+
+  assert.equal(backend.state.calls.includes('saveCreds'), false, 'les creds ne doivent pas partir en base');
+  assert.equal(backend.state.calls.includes('saveKeys'), false, 'les clés ne doivent pas partir en base');
+});
+
+test('après discard, un flush ultérieur ne ressuscite pas la session', async () => {
+  const number = nextNumber();
+  const backend = fakeBackend();
+  const auth = await createPersistentAuthState(number, { backend, initCreds, logger: quiet, flushDelayMs: 1 });
+
+  await auth.state.keys.set({ 'pre-key': { 1: { a: 1 } } });
+  auth.persistSoon();
+  auth.discard();
+  await auth.flush();
+  await auth.flush();
+
+  assert.equal(backend.state.creds, null);
+  assert.equal(backend.state.keys.size, 0);
+});
+
 test('resolveAuthSource signale la corruption quand rien n’est valide', () => {
   assert.equal(resolveAuthSource({ local: null, remote: null }).source, 'nouvelle');
   assert.equal(resolveAuthSource({ local: { creds: { casse: 1 } }, remote: null }).source, 'corrompue');

@@ -277,12 +277,32 @@ async function createPersistentAuthState(number, options = {}) {
     await flush();
   };
 
+  /**
+   * Abandonne l'état SANS rien écrire.
+   *
+   * Utilisé quand un appairage a échoué : il faut jeter les creds à moitié
+   * générées, pas les persister. `close()` ferait exactement l'inverse (il vide
+   * les écritures en attente sur le disque et dans le backend), ce qui
+   * ressusciterait la session qu'on est en train de purger.
+   */
+  const discard = () => {
+    closed = true;
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    dirtyKeys.clear();
+    credsDirty = false;
+    keyCache.clear();
+  };
+
   return {
     state: { creds, keys: signalKeys },
     saveCreds,
     persistSoon,
     flush,
     close,
+    discard,
     dir,
     number: sanitized,
     source: resolved.valid ? resolved.source : 'nouvelle',

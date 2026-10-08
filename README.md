@@ -64,7 +64,9 @@ reste est rangé par responsabilité.
 │   │   ├── session-store.js      # Écriture atomique, instantanés, quarantaine
 │   │   ├── persistent-auth.js    # État d'auth Baileys persistant (disque + Mongo)
 │   │   ├── mongo-auth-backend.js # Miroir MongoDB des creds ET des clés Signal
-│   │   └── reconnect.js          # Ordonnanceur de reconnexion unique par session
+│   │   ├── reconnect.js          # Ordonnanceur de reconnexion unique par session
+│   │   ├── pairing-guard.js      # Verrou d'appairage à libération explicite
+│   │   └── session-purge.js      # Effacement disque + MongoDB d'une session ratée
 │   ├── lib/                  # 🧰 Utilitaires (msg, normalize, s-utils, youtube, safe-send)
 │   ├── handlers/             # 🎯 Gestionnaires métier (antilink, statut, bienvenue)
 │   ├── features/             # ✨ Modules secondaires (tictactoe, traduction, setcmd)
@@ -111,6 +113,43 @@ d'envoi réussis/échoués.
 > ⚠️ **Migration** : les sessions créées avant ce correctif n'ont aucune clé
 > Signal en base. Un **nouvel appairage** (`.pair` ou dashboard) est nécessaire
 > une seule fois ; ensuite les clés survivent aux redémarrages.
+
+---
+
+## 🔁 Appairage raté : « code indisponible »
+
+Un appairage qui échouait laissait des restes qui **bloquent définitivement** la
+demande suivante :
+
+| Reste | Effet sur la demande suivante |
+| --- | --- |
+| Verrou `connectingSessions` relâché seulement par un minuteur de 90 s | Réponse `{ status: 'already_connected_or_connecting' }`, **sans champ `code`** |
+| Socket d'appairage mort ajouté à `activeSockets` | Réponse `{ status: 'already_connected' }`, **sans champ `code`** |
+| `sessions/<numéro>/creds.json` conservé | `creds.registered` vrai → le bloc de demande de code est sauté → **aucune réponse envoyée** |
+| Document `sessions` en base | Le numéro est restauré à chaque démarrage pour générer un code que personne ne saisira |
+
+Le dashboard, ne trouvant ni `code` ni `pairingCode`, affichait alors
+`Indisponible` — de façon permanente.
+
+### Correctif
+
+- **`src/auth/pairing-guard.js`** — verrou à **libération explicite**. Le TTL ne
+  sert plus que de filet si le processus meurt en plein appairage.
+- **`src/auth/session-purge.js`** — effacement de toutes les traces persistantes :
+  dossier `sessions/<numéro>`, ancien dossier temporaire, collection `sessions`
+  (creds), collection `session_keys` (clés Signal) et collection `numbers`.
+  L'état d'authentification est **jeté** (`discard()`) et non sauvegardé
+  (`close()`), sans quoi la purge réécrirait les creds qu'elle vient d'effacer.
+- **Les sockets d'appairage sont séparés des sessions connectées** : un socket en
+  attente de code n'est plus pris pour une session active.
+- **Chaque chemin d'échec purge** : creds invalides, code impossible à générer,
+  erreur d'appairage, connexion fermée avant enregistrement.
+- **Un appairage abandonné n'est plus reconnecté en boucle** : il est purgé.
+- **Toujours une réponse HTTP explicite** : `502 code_indisponible` avec la vraie
+  raison, `session_existante`, `already_connected`, `appairage_en_cours`.
+- **Le dashboard** affiche le message réel, propose **« Réessayer maintenant »**
+  après un échec et **« Forcer un nouveau code »** si un appairage est déjà en
+  attente (`/code?number=…&force=1`).
 
 ---
 

@@ -213,35 +213,92 @@ async function copyCode() {
   }, 2000);
 }
 
-submitBtn.addEventListener("click", async (e) => {
+// Dernier numéro demandé, pour permettre « forcer un nouveau code ».
+let lastNumber = null;
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function showMessage(html) {
+  pairElement.innerHTML = html;
+}
+
+// Un appairage est déjà en attente : on propose de forcer plutôt que d'afficher
+// un faux « Indisponible ».
+function showPending(message, number) {
+  showMessage(`
+    <span style="color:#fbbf24">⏳ ${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', true)"
+        style="background:#38bdf8;color:#0b1220;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        <i class="fa-solid fa-rotate"></i> Forcer un nouveau code
+      </button>
+    </div>
+  `);
+}
+
+// Échec : le serveur a déjà effacé toutes les traces, donc réessayer fonctionne
+// immédiatement. On le dit et on met le bouton à disposition.
+function showFailure(message, number) {
+  showMessage(`
+    <span style="color:#f87171">❌ ${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', false)"
+        style="background:#38bdf8;color:#0b1220;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        <i class="fa-solid fa-rotate-right"></i> Réessayer maintenant
+      </button>
+    </div>
+  `);
+}
+
+async function requestPairing(cleanNumber, force) {
+  lastNumber = cleanNumber;
+  showMessage('<span style="color:#38bdf8"><i class="fa-solid fa-spinner fa-spin"></i> Génération du code en cours...</span>');
+
+  try {
+    const { data } = await axios(`/code?number=${encodeURIComponent(cleanNumber)}${force ? '&force=1' : ''}`);
+    const code = data.code || data.pairingCode;
+
+    if (code) {
+      pairElement.innerHTML = `
+        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}" onclick="copyCode()">
+          CODE : <span style="color:#ffffff">${escapeHtml(code)}</span>
+        </div>
+      `;
+      return;
+    }
+
+    // Réponse sans code : on affiche ce que le serveur explique vraiment.
+    if (data.status === 'appairage_en_cours') {
+      showPending(data.message || 'Un appairage est déjà en cours pour ce numéro.', cleanNumber);
+      return;
+    }
+    showFailure(data.message || data.error || 'Aucun code reçu du serveur.', cleanNumber);
+  } catch (error) {
+    const payload = error.response?.data;
+    const message = payload?.message || payload?.error || error.message || 'Erreur de connexion';
+    showFailure(message, cleanNumber);
+  }
+}
+
+submitBtn.addEventListener("click", (e) => {
   e.preventDefault();
   const val = numberInput.value.trim();
   if (!val) {
-    pairElement.innerHTML = '<span style="color:#f87171">Veuillez entrer votre numéro.</span>';
+    showMessage('<span style="color:#f87171">Veuillez entrer votre numéro.</span>');
     return;
   }
-  
+
   const cleanNumber = val.replace(/[^0-9]/g, "");
   if (cleanNumber.length < 9) {
-    pairElement.innerHTML = '<span style="color:#f87171">Numéro invalide (trop court).</span>';
+    showMessage('<span style="color:#f87171">Numéro invalide (trop court).</span>');
     return;
   }
-  
-  pairElement.innerHTML = '<span style="color:#38bdf8"><i class="fa-solid fa-spinner fa-spin"></i> Génération du code en cours...</span>';
-  
-  try {
-    const { data } = await axios(`/code?number=${cleanNumber}`);
-    const code = data.code || data.pairingCode || "Indisponible";
 
-    pairElement.innerHTML = `
-      <div class="code-display" id="codeDisplay" data-code="${code}" onclick="copyCode()">
-        CODE : <span style="color:#ffffff">${code}</span>
-      </div>
-    `;
-  } catch (error) {
-    const errMsg = error.response?.data?.error || error.message || "Erreur de connexion";
-    pairElement.innerHTML = `<span style="color:#f87171">❌ ${errMsg}</span>`;
-  }
+  requestPairing(cleanNumber, false);
 });
 
 numberInput.addEventListener("keypress", (e) => {

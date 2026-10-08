@@ -104,6 +104,8 @@ const { createPersistentAuthState, AuthCorruptedError } = require('../auth/persi
 const { createMongoAuthBackend } = require('../auth/mongo-auth-backend');
 const sessionStore = require('../auth/session-store');
 const { createReconnectScheduler } = require('../auth/reconnect');
+const { createPairingGuard } = require('../auth/pairing-guard');
+const { createSessionPurger } = require('../auth/session-purge');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
@@ -235,6 +237,14 @@ const authStates = new Map();
 function authStateFor(number) {
   return authStates.get(String(number).replace(/[^0-9]/g, '')) || null;
 }
+
+// Effacement complet d'une session ratée : disque + MongoDB (creds, clés Signal,
+// numéro). Voir src/auth/session-purge.js pour le détail.
+const sessionPurger = createSessionPurger({
+  authBackend,
+  removeSession: (n) => removeSessionFromMongo(n),
+  removeNumber: (n) => removeNumberFromMongo(n)
+});
 
 // ---------------- Mongo helpers ----------------
 // NB : la sauvegarde des creds ne passe plus par ici mais par `authBackend`
@@ -671,9 +681,15 @@ function getHaitiTimestamp() {
 
 // Résultat : "lundi 27 janvier 2025, 15:30:45"
 const activeSockets = new Map();
-// Une seule tentative de connexion par numéro : évite les sockets concurrents,
-// une cause fréquente de réponses lentes et de sessions qui se remplacent.
-const connectingSessions = new Set();
+// Sockets en cours d'appairage, en attente de la saisie du code sur le
+// téléphone. Séparés d'`activeSockets` : un socket d'appairage n'est PAS une
+// session connectée, et le confondre faisait croire au bot que le numéro était
+// déjà pris — d'où le « code indisponible » au deuxième essai.
+const pairingSockets = new Map();
+// Verrou d'appairage à libération explicite (voir src/auth/pairing-guard.js).
+const pairingGuard = createPairingGuard({
+  lockTtlMs: Math.max(30000, Number(process.env.PAIRING_LOCK_TTL_MS) || 3 * 60 * 1000)
+});
 const lastConnectionActivity = new Map();
 
 const socketCreationTime = new Map();
@@ -10401,6 +10417,44 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
   } catch (err) { console.error('deleteSessionAndCleanup error:', err); return false; }
 }
 
+/**
+ * Efface TOUTES les traces d'un appairage raté : runtime, disque et MongoDB.
+ *
+ * Sans ça, un pairing échoué laissait derrière lui un dossier `sessions/<numéro>`,
+ * un document `sessions` en base (écrit par `creds.update`), un socket fantôme
+ * dans `activeSockets` et le verrou d'appairage posé. La demande suivante
+ * retombait sur l'un de ces restes et répondait sans code → « Indisponible ».
+ *
+ * Contrairement à `deleteSessionAndCleanup` (logout d'une session qui a
+ * fonctionné), on ne notifie personne et on ne fait pas de logout WhatsApp :
+ * la session n'a jamais existé côté serveur.
+ */
+async function purgeFailedSession(number, { socket = null, reason = 'appairage échoué' } = {}) {
+  const sanitized = String(number).replace(/[^0-9]/g, '');
+  if (!sanitized) return false;
+
+  // 1) Runtime : verrou d'appairage, reconnexion en attente, sockets.
+  pairingGuard.release(sanitized);
+  reconnectScheduler.cancel(sanitized);
+  pairingSockets.delete(sanitized);
+  activeSockets.delete(sanitized);
+  socketCreationTime.delete(sanitized);
+  lastConnectionActivity.delete(sanitized);
+
+  if (socket) {
+    try { socket.ws?.close(); } catch (e) {}
+  }
+
+  // 2) Persistant : état d'auth jeté, disque et MongoDB effacés.
+  const auth = authStates.get(sanitized) || null;
+  authStates.delete(sanitized);
+  const result = await sessionPurger.purge(sanitized, { auth, reason });
+
+  const all = ['runtime', ...result.traces];
+  console.warn(`[SESSION ${sanitized}] purge après ${reason} — traces effacées : ${all.join(', ')}`);
+  return result.ok;
+}
+
 // ---------------- auto-restart ----------------
 
 // UN SEUL ordonnanceur de reconnexion pour tout le processus.
@@ -10439,12 +10493,24 @@ function setupAutoRestart(socket, number) {
                           || (lastDisconnect?.error && String(lastDisconnect.error).toLowerCase().includes('logged out'))
                           || (lastDisconnect?.reason === DisconnectReason?.loggedOut);
 
+      // Un socket qui se ferme sans avoir jamais été enregistré, c'est un
+      // appairage abandonné ou raté : il ne faut PAS le reconnecter en boucle,
+      // il faut l'effacer partout. Sinon le numéro reste « occupé », est
+      // restauré à chaque démarrage pour générer un code que personne ne
+      // saisira, et la demande suivante retombe sur « Indisponible ».
+      const neverRegistered = socket?.authState?.creds?.registered === false;
+
       // Quoi qu'il arrive : on vide l'état d'authentification AVANT de toucher
       // à quoi que ce soit d'autre, sinon les dernières clés Signal sont perdues.
       const auth = authStateFor(sanitized);
-      if (auth) { try { await auth.flush(); } catch (e) { console.error('flush auth (close)', e); } }
+      if (auth && !neverRegistered) {
+        try { await auth.flush(); } catch (e) { console.error('flush auth (close)', e); }
+      }
 
-      if (isLoggedOut) {
+      if (neverRegistered) {
+        console.warn(`[SESSION ${sanitized}] connexion fermée avant enregistrement : appairage abandonné, purge.`);
+        await purgeFailedSession(sanitized, { socket, reason: 'connexion fermée avant enregistrement' });
+      } else if (isLoggedOut) {
         console.log(`User ${number} logged out. Cleaning up...`);
         try { await deleteSessionAndCleanup(number, socket); } catch(e){ console.error(e); }
       } else {
@@ -10464,19 +10530,64 @@ function setupAutoRestart(socket, number) {
 
 // ---------------- EmpirePair (pairing, session persistante, miroir Mongo) ----------------
 
-async function EmpirePair(number, res) {
+async function EmpirePair(number, res, options = {}) {
+  // forceFresh : demande explicite d'un nouveau code (dashboard). On démolit
+  // alors l'appairage en cours et on purge les restes au lieu de refuser.
+  const { forceFresh = false, source = 'interne' } = options;
   const sanitizedNumber = String(number).replace(/[^0-9]/g, '');
   if (!sanitizedNumber) throw new Error('Numéro de session invalide');
-  if (activeSockets.has(sanitizedNumber) || connectingSessions.has(sanitizedNumber)) {
-    if (res && !res.headersSent) res.send({ status: 'already_connected_or_connecting', number: sanitizedNumber });
+
+  // --- Session déjà connectée : on ne touche à rien. ---
+  if (activeSockets.has(sanitizedNumber)) {
+    if (res && !res.headersSent) {
+      res.send({
+        status: 'already_connected',
+        number: sanitizedNumber,
+        message: 'Ce numéro est déjà connecté et actif.'
+      });
+    }
     return;
   }
-  connectingSessions.add(sanitizedNumber);
-  // Libère un verrou abandonné (pairing ou réseau bloqué), sans tuer la session.
-  setTimeout(() => connectingSessions.delete(sanitizedNumber), 90 * 1000).unref?.();
+
+  // --- Appairage déjà en cours. ---
+  if (pairingGuard.isLocked(sanitizedNumber)) {
+    if (!forceFresh) {
+      // Réponse explicite : le dashboard doit pouvoir l'afficher au lieu de
+      // retomber sur « Indisponible » faute de champ `code`.
+      if (res && !res.headersSent) {
+        res.send({
+          status: 'appairage_en_cours',
+          number: sanitizedNumber,
+          message: 'Un code est déjà en attente pour ce numéro. Saisis-le sur ton téléphone, ou force un nouveau code.'
+        });
+      }
+      return;
+    }
+    // « Recommencer tout de suite » : on démolit l'essai précédent et on efface
+    // toutes ses traces avant de repartir de zéro.
+    const pending = pairingSockets.get(sanitizedNumber) || null;
+    await purgeFailedSession(sanitizedNumber, { socket: pending, reason: 'nouvelle demande de code (force)' });
+  }
+
+  pairingGuard.reacquire(sanitizedNumber);
   await initMongo().catch(()=>{});
 
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
+
+  // --- Une demande explicite de code ne doit jamais réutiliser une session morte. ---
+  // Si des creds traînent (appairage abandonné, session corrompue), on les purge
+  // AVANT de créer l'état : sinon `creds.registered` peut valoir true, le bloc de
+  // demande de code est sauté, et aucune réponse n'est jamais envoyée.
+  if (forceFresh) {
+    const leftoverAuth = authStates.get(sanitizedNumber);
+    const avaitSession = Boolean(leftoverAuth) || fs.existsSync(sessionStore.sessionDir(sanitizedNumber));
+    if (avaitSession) {
+      await purgeFailedSession(sanitizedNumber, {
+        socket: pairingSockets.get(sanitizedNumber) || null,
+        reason: 'session résiduelle avant nouvel appairage'
+      });
+    }
+  }
 
   // État d'authentification persistant : dossier ./sessions/<numéro> (jamais le
   // tmp, qui est vidé au redémarrage) + miroir MongoDB des creds ET des clés
@@ -10490,12 +10601,13 @@ async function EmpirePair(number, res) {
       initCreds: initAuthCreds
     });
   } catch (err) {
-    connectingSessions.delete(sanitizedNumber);
     if (err instanceof AuthCorruptedError) {
       console.error(`[SESSION ${sanitizedNumber}] ${err.message}`);
     } else {
       console.error(`[SESSION ${sanitizedNumber}] état d'authentification indisponible :`, err.message || err);
     }
+    // Purge : des creds illisibles ne doivent pas bloquer le prochain essai.
+    await purgeFailedSession(sanitizedNumber, { reason: 'creds invalides' });
     if (res && !res.headersSent && typeof res.status === 'function') {
       res.status(500).send({ error: 'session_invalide', message: err.message });
     }
@@ -10547,13 +10659,57 @@ setupNewsletterHandlers(socket, sanitizedNumber);
 registerGroupParticipantListener(socket).catch(err => console.error('Listener init failed', err));
 handleMessageRevocation(socket, sanitizedNumber);
     if (!socket.authState.creds.registered) {
-      let retries = config.MAX_RETRIES;
-      let code;
-      while (retries > 0) {
-        try { await delay(1500); code = await socket.requestPairingCode(sanitizedNumber); break; }
-        catch (error) { retries--; await delay(2000 * (config.MAX_RETRIES - retries)); }
+      // Socket d'appairage : il n'est PAS encore une session connectée, il va
+      // dans `pairingSockets` et surtout pas dans `activeSockets`.
+      pairingSockets.set(sanitizedNumber, socket);
+
+      let code = null;
+      let lastError = null;
+      for (let attempt = 1; attempt <= config.MAX_RETRIES; attempt += 1) {
+        try {
+          await delay(1500);
+          code = await socket.requestPairingCode(sanitizedNumber);
+          break;
+        } catch (error) {
+          lastError = error;
+          console.warn(
+            `[SESSION ${sanitizedNumber}] demande de code échouée (essai ${attempt}/${config.MAX_RETRIES}) :`,
+            error?.message || error
+          );
+          if (attempt < config.MAX_RETRIES) await delay(1000 * attempt);
+        }
       }
-      if (!res.headersSent) res.send({ code });
+
+      if (code) {
+        // L'utilisateur a maintenant le temps de saisir le code sur son téléphone.
+        pairingGuard.refresh(sanitizedNumber);
+        if (!res.headersSent) {
+          res.send({ status: 'code_genere', code, pairingCode: code, number: sanitizedNumber });
+        }
+      } else {
+        // Échec définitif : on efface TOUTES les traces — runtime, disque et
+        // MongoDB — pour que la demande suivante reparte de zéro au lieu de
+        // retomber sur « Indisponible ».
+        await purgeFailedSession(sanitizedNumber, { socket, reason: 'génération du code impossible' });
+        if (res && !res.headersSent && typeof res.status === 'function') {
+          res.status(502).send({
+            error: 'code_indisponible',
+            message: `Impossible de générer le code pour ${sanitizedNumber}. Toutes les traces de la tentative ont été effacées : tu peux réessayer immédiatement.`,
+            detail: lastError?.message || String(lastError || 'raison inconnue')
+          });
+        }
+        return;
+      }
+    } else {
+      // Session déjà enregistrée (reconnexion interne, pas une demande de code).
+      // Il faut quand même répondre : sinon la requête HTTP reste suspendue.
+      if (res && !res.headersSent) {
+        res.send({
+          status: 'session_existante',
+          number: sanitizedNumber,
+          message: 'Session déjà enregistrée : reconnexion en cours, aucun nouveau code nécessaire.'
+        });
+      }
     }
 
     // Persistance des creds : déléguée à l'état d'authentification.
@@ -10573,7 +10729,10 @@ handleMessageRevocation(socket, sanitizedNumber);
     socket.ev.on('connection.update', async (update) => {
       const { connection } = update;
       if (connection === 'open') {
-        connectingSessions.delete(sanitizedNumber);
+        // L'appairage a abouti : le socket passe de « en attente de code » à
+        // « session connectée », et le verrou d'appairage est relâché.
+        if (pairingSockets.get(sanitizedNumber) === socket) pairingSockets.delete(sanitizedNumber);
+        pairingGuard.release(sanitizedNumber);
         reconnectScheduler.reset(sanitizedNumber);
         lastConnectionActivity.set(sanitizedNumber, Date.now());
         try {
@@ -10694,12 +10853,30 @@ Le bot est maintenant connecté et fonctionnel.`,
     });
 
 
-    activeSockets.set(sanitizedNumber, socket);
+    // Une session déjà enregistrée (reconnexion) est active tout de suite.
+    // Un appairage neuf, lui, n'est PAS encore une session : le mettre dans
+    // `activeSockets` faisait croire au bot que le numéro était pris, et la
+    // demande suivante répondait sans code → « Indisponible ».
+    if (socket.authState?.creds?.registered) {
+      activeSockets.set(sanitizedNumber, socket);
+    }
 
   } catch (error) {
     console.error('Pairing error:', error);
     socketCreationTime.delete(sanitizedNumber);
-    if (!res.headersSent) res.status(503).send({ error: 'Service Unavailable' });
+    // Purge complète : sans ça, la tentative ratée laisse un dossier, un
+    // document Mongo et un verrou qui bloquent l'essai suivant.
+    await purgeFailedSession(sanitizedNumber, {
+      socket: pairingSockets.get(sanitizedNumber) || null,
+      reason: `erreur d'appairage (${error?.message || error})`
+    });
+    if (res && !res.headersSent && typeof res.status === 'function') {
+      res.status(503).send({
+        error: 'appairage_echoue',
+        message: `L'appairage a échoué pour ${sanitizedNumber}. Toutes les traces ont été effacées : tu peux réessayer immédiatement.`,
+        detail: error?.message || String(error || 'raison inconnue')
+      });
+    }
   }
 
 }
@@ -10779,6 +10956,12 @@ router.get('/admin/list', async (req, res) => {
 
 // existing endpoints (connect, reconnect, active, etc.)
 
+/** `force` = l'utilisateur veut un nouveau code tout de suite. */
+function wantsFreshPairing(req) {
+  const raw = String(req.query?.force ?? req.body?.force ?? '').toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'oui' || raw === 'yes';
+}
+
 router.get('/', async (req, res) => {
   const { number } = req.query;
   if (!number) {
@@ -10786,7 +10969,7 @@ router.get('/', async (req, res) => {
   }
   const sanitized = number.replace(/[^0-9]/g, '');
   if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
-  await EmpirePair(sanitized, res);
+  await EmpirePair(sanitized, res, { forceFresh: wantsFreshPairing(req), source: 'dashboard' });
 });
 
 router.get('/code', async (req, res) => {
@@ -10794,7 +10977,7 @@ router.get('/code', async (req, res) => {
   if (!number) return res.status(400).send({ error: 'Number parameter is required' });
   const sanitized = number.replace(/[^0-9]/g, '');
   if (activeSockets.has(sanitized)) return res.status(200).send({ status: 'already_connected', message: 'This number is already connected' });
-  await EmpirePair(sanitized, res);
+  await EmpirePair(sanitized, res, { forceFresh: wantsFreshPairing(req), source: 'dashboard' });
 });
 
 router.get('/pair', (req, res) => {
@@ -11075,7 +11258,7 @@ async function restoreSessionsOnBoot() {
 
   console.log(`[BOOT] ${numbers.size} session(s) à restaurer.`);
   for (const n of numbers) {
-    if (activeSockets.has(n) || connectingSessions.has(n)) continue;
+    if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
     try { await EmpirePair(n, mockRes); } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
     await delay(500);
