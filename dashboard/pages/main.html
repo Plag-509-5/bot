@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KAIDO-MD X TECH MONDIAL MD PAIRING</title>
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css"/>
+
+<style>
+*{
+  margin:0;
+  padding:0;
+  box-sizing:border-box;
+  font-family:Arial, sans-serif;
+}
+
+body{
+  height:100vh;
+  overflow:hidden;
+}
+
+/* ===== Background Video ===== */
+video.bg-video{
+  position:fixed;
+  top:0;
+  left:0;
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  z-index:-1;
+  filter:brightness(0.4);
+}
+
+/* ===== Center ===== */
+.container{
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  height:100vh;
+}
+
+/* ===== Box ===== */
+.box{
+  width:350px;
+  padding:30px;
+  background:rgba(0, 0, 0, 0.85);
+  border-radius:12px;
+  text-align:center;
+  position:relative;
+  border:1px solid rgba(255, 255, 255, 0.1);
+  box-shadow:0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+/* ===== TITLE ===== */
+.title{
+  font-size:26px;
+  font-weight:bold;
+  color:#ffffff;
+  margin-bottom:8px;
+  letter-spacing:1px;
+}
+
+.subtitle{
+  color:#b0b0b0;
+  margin-top:8px;
+  font-size:14px;
+}
+
+.label{
+  color:#4fc3f7;
+  margin:20px 0 10px 0;
+  font-size:15px;
+}
+
+/* ===== Input ===== */
+.input-container{
+  display:flex;
+  margin-top:15px;
+}
+
+.input-container input{
+  width:70%;
+  height:48px;
+  border:none;
+  outline:none;
+  border-radius:8px 0 0 8px;
+  padding-left:15px;
+  font-size:16px;
+  background:rgba(255, 255, 255, 0.1);
+  color:white;
+  border:1px solid rgba(255, 255, 255, 0.2);
+}
+
+.input-container input::placeholder{
+  color:#aaa;
+}
+
+.input-container button{
+  width:30%;
+  height:48px;
+  border:none;
+  border-radius:0 8px 8px 0;
+  background:#4fc3f7;
+  font-weight:bold;
+  cursor:pointer;
+  color:#000;
+  transition:background 0.3s;
+}
+
+.input-container button:hover{
+  background:#29b6f6;
+}
+
+/* ===== Code Display ===== */
+#pair{
+  margin-top:20px;
+  min-height:50px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+
+.code-display{
+  background:rgba(0, 0, 0, 0.6);
+  border:1px solid rgba(255, 255, 255, 0.15);
+  border-radius:8px;
+  padding:12px 20px;
+  color:#4fc3f7;
+  font-weight:bold;
+  font-size:18px;
+  cursor:pointer;
+  transition:all 0.3s;
+  width:100%;
+  text-align:center;
+}
+
+.code-display:hover{
+  background:rgba(79, 195, 247, 0.1);
+  border-color:#4fc3f7;
+}
+
+.code-display.copied{
+  background:rgba(76, 175, 80, 0.2);
+  color:#4caf50;
+  border-color:#4caf50;
+}
+
+/* Copie automatique impossible (contexte non sécurisé) : le texte reste
+   sélectionné pour un Ctrl+C manuel. */
+.code-display.copy-failed{
+  background:rgba(255, 209, 102, 0.18);
+  color:#ffd166;
+  border-color:#ffd166;
+}
+
+.code-display:focus-visible{
+  outline:2px solid #4facfe;
+  outline-offset:3px;
+}
+
+/* ===== Music Button (Top Right) ===== */
+.music-btn{
+  position:fixed;
+  right:20px;
+  top:20px;
+  background:rgba(0, 0, 0, 0.7);
+  color:#4fc3f7;
+  padding:10px 16px;
+  border-radius:30px;
+  font-weight:bold;
+  cursor:pointer;
+  border:1px solid #4fc3f7;
+  z-index:10;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  transition:all 0.3s;
+}
+
+.music-btn:hover{
+  background:rgba(79, 195, 247, 0.2);
+  box-shadow:0 0 10px rgba(79, 195, 247, 0.5);
+}
+
+/* ===== Icon ===== */
+.icon{
+  color:#4fc3f7;
+  font-size:24px;
+  margin-bottom:10px;
+}
+</style>
+</head>
+
+<body>
+
+<!-- Background Video -->
+<video class="bg-video" autoplay muted loop>
+  <source src="https://uploader.zenzxz.dpdns.org/uploads/1769499275224.mp4" type="video/mp4">
+</video>
+
+<!-- Music Button Top Right -->
+<div class="music-btn" onclick="toggleMusic()" id="musicBtn">
+  <i class="fas fa-music"></i>
+  <span>Play</span>
+</div>
+
+<div class="container">
+  <div class="box">
+    <i class="fas fa-user icon"></i>
+
+    <div class="title">KAIDO-MD X TECH MONDIAL-MD MINI</div>
+    <div class="subtitle">DEVELOPPÉ PAR PLAG X TEAM TECH MONDIAL</div>
+    <div class="label">👑 ENTER YOUR NUMBER (sans le +)</div>
+
+    <div class="input-container">
+      <input type="number" id="number" placeholder="5094744xxxxxxx">
+      <button id="submit">Submit</button>
+    </div>
+
+    <main id="pair"></main>
+  </div>
+</div>
+
+<!-- Music -->
+<audio id="bgMusic" loop>
+  <source src="https://files.catbox.moe/mhvjlu.mp3" type="audio/mp3">
+</audio>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.0.0-alpha.1/axios.min.js"></script>
+<script src="/assets/copy-code.js"></script>
+
+<script>
+let pairElement = document.getElementById("pair");
+let submitBtn = document.getElementById("submit");
+let numberInput = document.getElementById("number");
+
+let music = document.getElementById("bgMusic");
+let musicBtn = document.getElementById("musicBtn");
+let started = false;
+
+// Mobile safe autoplay
+document.body.addEventListener("click", () => {
+  if (!started) {
+    music.play().then(() => {
+      musicBtn.querySelector('span').textContent = "Pause";
+      musicBtn.innerHTML = '<i class="fas fa-pause"></i><span>Pause</span>';
+      started = true;
+    }).catch(() => {});
+  }
+}, { once: true });
+
+function toggleMusic() {
+  if (music.paused) {
+    music.play();
+    musicBtn.innerHTML = '<i class="fas fa-pause"></i><span>Pause</span>';
+  } else {
+    music.pause();
+    musicBtn.innerHTML = '<i class="fas fa-music"></i><span>Play</span>';
+  }
+}
+
+// Copie du code : déléguée à /assets/copy-code.js, qui gère les contextes non
+// sécurisés (HTTP simple, iframe) où `navigator.clipboard` n'existe pas.
+function bindCopy(element, code) {
+  return KaidoCopy.bindCodeCopy(element, {
+    getCode: () => code,
+    label: 'CODE',
+    successHtml: '<i class="fas fa-check"></i> Code copié',
+    manualHtml: '<i class="fas fa-hand-pointer"></i> Ctrl+C pour copier',
+    restoreMs: 2500
+  });
+}
+
+async function copyCode() {
+  const element = document.getElementById("codeDisplay");
+  if (!element || !window.KaidoCopy) return;
+  return KaidoCopy.copyText(KaidoCopy.readCode(element, { label: 'CODE' }));
+}
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function showMessage(html) {
+  pairElement.innerHTML = html;
+}
+
+function showFailure(message, number) {
+  showMessage(`
+    <span style="color:#ff6b6b">${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', true)"
+        style="background:#4facfe;color:#08111f;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        Réessayer maintenant
+      </button>
+    </div>
+  `);
+}
+
+async function requestPairing(cleanNumber, force) {
+  showMessage('<span style="color:#ffffff">Veuillez patienter...</span>');
+
+  try {
+    const { data } = await axios(`/code?number=${encodeURIComponent(cleanNumber)}${force ? '&force=1' : ''}`);
+    const code = data.code || data.pairingCode;
+
+    if (code) {
+      pairElement.innerHTML = `
+        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}">
+          CODE: <span style="color:#ffffff">${escapeHtml(code)}</span>
+        </div>
+      `;
+      const element = document.getElementById("codeDisplay");
+      if (element && window.KaidoCopy) bindCopy(element, code);
+      return;
+    }
+
+    // Sans code, on n'écrit plus « Indisponible » dans le bloc à copier :
+    // l'utilisateur copiait alors le libellé au lieu d'un code.
+    if (data.status === 'appairage_en_cours') {
+      showMessage(`
+        <span style="color:#ffd166">${escapeHtml(data.message || 'Un appairage est déjà en cours pour ce numéro.')}</span>
+        <div style="margin-top:14px">
+          <button type="button" onclick="requestPairing('${escapeHtml(cleanNumber)}', true)"
+            style="background:#4facfe;color:#08111f;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+            Forcer un nouveau code
+          </button>
+        </div>
+      `);
+      return;
+    }
+    showFailure(data.message || data.error || 'Aucun code reçu du serveur.', cleanNumber);
+  } catch (error) {
+    const payload = error.response && error.response.data;
+    showFailure((payload && (payload.message || payload.error)) || error.message || 'Erreur de connexion', cleanNumber);
+  }
+}
+
+submitBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+
+  if (!numberInput.value) {
+    showMessage('<span style="color:#ff6b6b">Entrez votre numéro (sans le +)</span>');
+    return;
+  }
+
+  const cleanNumber = numberInput.value.replace(/[^0-9]/g, "");
+
+  if (cleanNumber.length < 11) {
+    showMessage('<span style="color:#ff6b6b">Numéro Invalide</span>');
+    return;
+  }
+
+  requestPairing(cleanNumber, false);
+});
+
+// Allow Enter key to submit
+numberInput.addEventListener("keypress", (e) => {
+  if (e.key === "Enter") {
+    submitBtn.click();
+  }
+});
+</script>
+
+</body>
+</html>

@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KAIDO-MD PAIRING CODE</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+  height: 100vh;
+  overflow: hidden;
+  background: #0f172a;
+}
+
+.bg-video {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: -1;
+  filter: brightness(0.3);
+}
+
+.container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  padding: 20px;
+}
+
+.box {
+  width: 100%;
+  max-width: 420px;
+  padding: 35px 25px;
+  background: rgba(15, 23, 42, 0.85);
+  backdrop-filter: blur(12px);
+  border-radius: 16px;
+  text-align: center;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+}
+
+.icon {
+  font-size: 40px;
+  color: #38bdf8;
+  margin-bottom: 15px;
+}
+
+.title {
+  font-size: 24px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+}
+
+.subtitle {
+  color: #94a3b8;
+  font-size: 13px;
+  margin-bottom: 25px;
+}
+
+.label {
+  color: #38bdf8;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  text-align: left;
+}
+
+.input-container {
+  display: flex;
+  width: 100%;
+  margin-bottom: 20px;
+}
+
+.input-container input {
+  width: 70%;
+  height: 48px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 10px 0 0 10px;
+  padding: 0 15px;
+  font-size: 16px;
+  background: rgba(255, 255, 255, 0.08);
+  color: white;
+  outline: none;
+}
+
+.input-container input::placeholder {
+  color: #64748b;
+}
+
+.input-container button {
+  width: 30%;
+  height: 48px;
+  border: none;
+  border-radius: 0 10px 10px 0;
+  background: #38bdf8;
+  font-weight: 700;
+  cursor: pointer;
+  color: #0f172a;
+  transition: all 0.3s;
+}
+
+.input-container button:hover {
+  background: #0ea5e9;
+}
+
+#pair {
+  min-height: 55px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.code-display {
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid #38bdf8;
+  border-radius: 10px;
+  padding: 14px 20px;
+  color: #38bdf8;
+  font-weight: 700;
+  font-size: 20px;
+  cursor: pointer;
+  transition: all 0.3s;
+  width: 100%;
+  letter-spacing: 2px;
+}
+
+.code-display:hover {
+  background: rgba(56, 189, 248, 0.25);
+  box-shadow: 0 0 15px rgba(56, 189, 248, 0.4);
+}
+
+.code-display.copied {
+  background: rgba(34, 197, 94, 0.2);
+  border-color: #22c55e;
+  color: #22c55e;
+}
+
+/* Copie automatique impossible (contexte non sécurisé) : le texte reste
+   sélectionné pour un Ctrl+C manuel. */
+.code-display.copy-failed {
+  background: rgba(251, 191, 36, 0.18);
+  border-color: #fbbf24;
+  color: #fbbf24;
+}
+
+.code-display:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 3px;
+}
+
+.footer-links {
+  margin-top: 25px;
+  display: flex;
+  justify-content: center;
+  gap: 15px;
+}
+
+.footer-links a {
+  color: #94a3b8;
+  font-size: 13px;
+  text-decoration: none;
+  transition: color 0.3s;
+}
+
+.footer-links a:hover {
+  color: #38bdf8;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <div class="box">
+    <i class="fa-brands fa-whatsapp icon"></i>
+    <div class="title">KAIDO-MD PAIRING</div>
+    <div class="subtitle">Connexion sans QR code via numéro de téléphone</div>
+
+    <div class="label">Numéro WhatsApp (avec indicatif, sans +) :</div>
+    <div class="input-container">
+      <input type="tel" id="number" placeholder="5094744xxxx">
+      <button id="submit"><i class="fa-solid fa-arrow-right"></i> Obtenir</button>
+    </div>
+
+    <main id="pair"></main>
+
+    <div class="footer-links">
+      <a href="/dashboard"><i class="fa-solid fa-gauge"></i> Dashboard</a>
+      <a href="/delete"><i class="fa-solid fa-trash"></i> Supprimer Session</a>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/axios/1.6.8/axios.min.js"></script>
+<script src="/assets/copy-code.js"></script>
+<script>
+const pairElement = document.getElementById("pair");
+const submitBtn = document.getElementById("submit");
+const numberInput = document.getElementById("number");
+
+// Copie du code : déléguée à /assets/copy-code.js, qui gère les contextes non
+// sécurisés (HTTP simple, iframe) où `navigator.clipboard` n'existe pas.
+function bindCopy(element, code) {
+  return KaidoCopy.bindCodeCopy(element, {
+    getCode: () => code,
+    label: 'CODE',
+    successHtml: '<i class="fa-solid fa-check"></i> Code Copié !',
+    manualHtml: '<i class="fa-solid fa-hand-pointer"></i> Ctrl+C pour copier',
+    restoreMs: 2500
+  });
+}
+
+async function copyCode() {
+  const element = document.getElementById('codeDisplay');
+  if (!element || !window.KaidoCopy) return;
+  return KaidoCopy.copyText(KaidoCopy.readCode(element, { label: 'CODE' }));
+}
+
+// Dernier numéro demandé, pour permettre « forcer un nouveau code ».
+let lastNumber = null;
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function showMessage(html) {
+  pairElement.innerHTML = html;
+}
+
+// Un appairage est déjà en attente : on propose de forcer plutôt que d'afficher
+// un faux « Indisponible ».
+function showPending(message, number) {
+  showMessage(`
+    <span style="color:#fbbf24">⏳ ${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', true)"
+        style="background:#38bdf8;color:#0b1220;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        <i class="fa-solid fa-rotate"></i> Forcer un nouveau code
+      </button>
+    </div>
+  `);
+}
+
+// Échec : le serveur a déjà effacé toutes les traces, donc réessayer fonctionne
+// immédiatement. On le dit et on met le bouton à disposition.
+function showFailure(message, number) {
+  showMessage(`
+    <span style="color:#f87171">❌ ${escapeHtml(message)}</span>
+    <div style="margin-top:14px">
+      <button type="button" onclick="requestPairing('${escapeHtml(number)}', false)"
+        style="background:#38bdf8;color:#0b1220;border:none;border-radius:10px;padding:10px 18px;font-weight:600;cursor:pointer">
+        <i class="fa-solid fa-rotate-right"></i> Réessayer maintenant
+      </button>
+    </div>
+  `);
+}
+
+async function requestPairing(cleanNumber, force) {
+  lastNumber = cleanNumber;
+  showMessage('<span style="color:#38bdf8"><i class="fa-solid fa-spinner fa-spin"></i> Génération du code en cours...</span>');
+
+  try {
+    const { data } = await axios(`/code?number=${encodeURIComponent(cleanNumber)}${force ? '&force=1' : ''}`);
+    const code = data.code || data.pairingCode;
+
+    if (code) {
+      pairElement.innerHTML = `
+        <div class="code-display" id="codeDisplay" data-code="${escapeHtml(code)}">
+          CODE : <span style="color:#ffffff">${escapeHtml(code)}</span>
+        </div>
+      `;
+      // Branchement après insertion : `bindCodeCopy` ajoute le clic, le clavier
+      // et les attributs d'accessibilité sur le nœud réel.
+      const element = document.getElementById('codeDisplay');
+      if (element && window.KaidoCopy) bindCopy(element, code);
+      return;
+    }
+
+    // Réponse sans code : on affiche ce que le serveur explique vraiment.
+    if (data.status === 'appairage_en_cours') {
+      showPending(data.message || 'Un appairage est déjà en cours pour ce numéro.', cleanNumber);
+      return;
+    }
+    showFailure(data.message || data.error || 'Aucun code reçu du serveur.', cleanNumber);
+  } catch (error) {
+    const payload = error.response?.data;
+    const message = payload?.message || payload?.error || error.message || 'Erreur de connexion';
+    showFailure(message, cleanNumber);
+  }
+}
+
+submitBtn.addEventListener("click", (e) => {
+  e.preventDefault();
+  const val = numberInput.value.trim();
+  if (!val) {
+    showMessage('<span style="color:#f87171">Veuillez entrer votre numéro.</span>');
+    return;
+  }
+
+  const cleanNumber = val.replace(/[^0-9]/g, "");
+  if (cleanNumber.length < 9) {
+    showMessage('<span style="color:#f87171">Numéro invalide (trop court).</span>');
+    return;
+  }
+
+  requestPairing(cleanNumber, false);
+});
+
+numberInput.addEventListener("keypress", (e) => {
+  if (e.key === "Enter") submitBtn.click();
+});
+</script>
+
+</body>
+</html>
