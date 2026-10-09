@@ -1,7 +1,8 @@
 const { MongoClient } = require('mongodb');
 
 // Configuration de la connexion MongoDB
-const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://MUGIWARA:adminplag@kaidomd.yev7rzt.mongodb.net/?appName=Kaidomd";
+// Identifiants uniquement via l'environnement (MONGO_URI, ou MONGODB_URI en secours).
+const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI || "";
 const DB_NAME = "MUGIWARA_NO_PLAG"; // Modifiez si votre base de données a un autre nom
 const COLLECTION_NAME = "session_languages";
 
@@ -11,6 +12,7 @@ const COLLECTION_NAME = "session_languages";
 async function saveSessionLanguage(sessionId, langCode) {
   let client;
   try {
+    if (!MONGO_URI) throw new Error("MONGO_URI manquant dans l'environnement");
     client = new MongoClient(MONGO_URI);
     await client.connect();
     const db = client.db(DB_NAME);
@@ -35,6 +37,7 @@ async function saveSessionLanguage(sessionId, langCode) {
 async function getSessionLanguage(sessionId) {
   let client;
   try {
+    if (!MONGO_URI) throw new Error("MONGO_URI manquant dans l'environnement");
     client = new MongoClient(MONGO_URI);
     await client.connect();
     const db = client.db(DB_NAME);

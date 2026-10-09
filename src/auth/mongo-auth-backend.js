@@ -15,6 +15,8 @@
  * (disque éphémère, conteneur recréé, tmp vidé, …).
  */
 
+const { toStorable, fromStored } = require('./auth-serializer');
+
 const DEFAULT_SESSION_COLLECTION = 'sessions';
 const DEFAULT_KEYS_COLLECTION = 'session_keys';
 
@@ -60,9 +62,11 @@ function createMongoAuthBackend({ initMongo, getDb, sessionCollection, keysColle
       // les clés sont écrites AVANT les creds. Renvoyer null ici ferait perdre
       // les pre-keys d'une session en cours d'enregistrement.
       if (!doc && keyDocs.length === 0) return null;
+      // fromStored : les Buffers reviennent des Buffers (MongoDB renvoie des
+      // objets Binary, que Baileys ne sait pas lire tels quels).
       return {
-        creds: (doc && doc.creds) || null,
-        keys: keyDocs.map((entry) => ({ type: entry.type, id: entry.id, value: entry.value }))
+        creds: (doc && doc.creds) ? fromStored(doc.creds) : null,
+        keys: keyDocs.map((entry) => ({ type: entry.type, id: entry.id, value: fromStored(entry.value) }))
       };
     },
 
@@ -71,7 +75,7 @@ function createMongoAuthBackend({ initMongo, getDb, sessionCollection, keysColle
       await ensureIndexes(db);
       await db.collection(sessionName).updateOne(
         { number: String(number) },
-        { $set: { number: String(number), creds, updatedAt: new Date() }, $unset: { keys: '' } },
+        { $set: { number: String(number), creds: toStorable(creds), updatedAt: new Date() }, $unset: { keys: '' } },
         { upsert: true }
       );
     },
@@ -92,7 +96,7 @@ function createMongoAuthBackend({ initMongo, getDb, sessionCollection, keysColle
         return {
           updateOne: {
             filter,
-            update: { $set: { ...filter, value, updatedAt: now } },
+            update: { $set: { ...filter, value: toStorable(value), updatedAt: now } },
             upsert: true
           }
         };

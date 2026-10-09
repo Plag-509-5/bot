@@ -25,6 +25,7 @@
 const fsp = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { BufferJSON } = require('@whiskeysockets/baileys');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const SESSIONS_ROOT = path.resolve(
@@ -78,13 +79,16 @@ function keyRef(type, id) {
  * Écriture JSON atomique : fichier temporaire + fsync + rename.
  * `rename` remplace la cible de façon atomique sur POSIX comme sur Windows,
  * donc un lecteur ne voit jamais un JSON à moitié écrit.
+ *
+ * Les Buffers sont encodés avec `BufferJSON` (comme Baileys le fait dans
+ * useMultiFileAuthState) : sans cela, ils seraient relus comme des objets.
  */
 async function writeJsonAtomic(file, value) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const handle = await fsp.open(tmp, 'w');
   try {
-    await handle.writeFile(JSON.stringify(value), 'utf8');
+    await handle.writeFile(JSON.stringify(value, BufferJSON.replacer), 'utf8');
     await handle.sync();
   } finally {
     await handle.close().catch(() => {});
@@ -112,7 +116,9 @@ async function readJsonSafe(file) {
   }
   if (!raw || !raw.trim()) return null;
   try {
-    return JSON.parse(raw);
+    // BufferJSON.reviver recrée les Buffers ({ type: 'Buffer', data } -> Buffer),
+    // y compris pour les fichiers écrits par les anciennes versions.
+    return JSON.parse(raw, BufferJSON.reviver);
   } catch (err) {
     return null;
   }

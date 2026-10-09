@@ -107,6 +107,7 @@ const { createReconnectScheduler } = require('../auth/reconnect');
 const { createPairingGuard } = require('../auth/pairing-guard');
 const { createSessionPurger } = require('../auth/session-purge');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
+const { createSentMessageCache, recordSentMessages } = require('../lib/sent-message-cache');
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -191,7 +192,9 @@ function primaryOwnerNumber() {
 
 // ---------------- MONGO SETUP ----------------
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://test2_db_user:cSq3iGhurIFh9xpp@clusterrender.v8sosxk.mongodb.net/?appName=Clusterrender';
+// L'URI contient des identifiants : elle vient UNIQUEMENT de l'environnement
+// (MONGO_URI, voir .env.example). Aucune valeur par défaut n'est codée en dur.
+const MONGO_URI = process.env.MONGO_URI || '';
 const MONGO_DB = process.env.MONGO_DB || 'MUGIWARA_NO_PLAG'
 let mongoClient, mongoDB;
 let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
@@ -200,6 +203,7 @@ async function initMongo() {
   try {
     if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected && mongoClient.topology.isConnected()) return;
   } catch(e){}
+  if (!MONGO_URI) throw new Error('MONGO_URI manquant : renseigne-le dans .env (voir .env.example)');
   mongoClient = new MongoClient(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
   await mongoClient.connect();
   mongoDB = mongoClient.db(MONGO_DB);
@@ -233,6 +237,9 @@ const authBackend = createMongoAuthBackend({
 
 // État d'authentification actif par numéro (permet flush/close à l'arrêt).
 const authStates = new Map();
+
+// Derniers messages envoyés, par numéro (voir EmpirePair : getMessage).
+const sentMessageCaches = new Map();
 
 function authStateFor(number) {
   return authStates.get(String(number).replace(/[^0-9]/g, '')) || null;
@@ -10633,13 +10640,24 @@ async function EmpirePair(number, res, options = {}) {
       activeSockets.delete(sanitizedNumber);
     }
 
+    // Derniers messages envoyés : Baileys en a besoin pour RÉENVOYER un message
+    // quand le téléphone d'un destinataire le demande (retry receipt). Sans
+    // `getMessage`, la demande échoue et le message reste « en attente ».
+    // Un cache par numéro, conservé à travers les reconnexions : un message envoyé
+    // juste avant une coupure doit pouvoir être renvoyé après la reconnexion.
+    if (!sentMessageCaches.has(sanitizedNumber)) sentMessageCaches.set(sanitizedNumber, createSentMessageCache());
+    const sentMessages = sentMessageCaches.get(sanitizedNumber);
+
     const socket = makeWASocket({
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
       markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
-      browser: ["Ubuntu", "Chrome", "20.0.04"]
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+      getMessage: async (key) => sentMessages.get(key)
     });
+    // Doit précéder installSafeSend : on mémorise le WAMessage brut renvoyé par Baileys.
+    recordSentMessages(socket, sentMessages);
 
     // Après avoir créé le socket et défini socketCreationTime
 
