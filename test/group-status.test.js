@@ -225,7 +225,8 @@ test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
   assert.equal(audioStatus.formatTime(3665), '1:01:05');
 });
 
-test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
+test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les relaie en statut de groupe', async () => {
+  const { proto } = require('@whiskeysockets/baileys');
   const uploads = [];
   const relayed = [];
   const socket = {
@@ -280,11 +281,15 @@ test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs d
     const inner = call.message.groupStatusMessageV2?.message;
     const messageType = type === 'text' ? 'extendedTextMessage' : `${type}Message`;
     const media = inner?.[messageType];
+    const decoded = proto.Message.decode(proto.Message.encode(call.message).finish());
 
+    assert.ok(decoded.groupStatusMessageV2?.message?.[messageType], `${type} incompatible avec le schéma Baileys du socket`);
+    assert.equal(decoded.messageContextInfo?.messageSecret?.length, 32);
     assert.equal(call.jid, '123456@g.us');
     assert.ok(media, `${messageType} absent de groupStatusMessageV2`);
     assert.equal(media.contextInfo?.isGroupStatus, true);
-    assert.ok(inner.messageContextInfo?.messageSecret);
+    assert.ok(call.message.messageContextInfo?.messageSecret);
+    assert.equal(call.message.messageContextInfo.messageSecret.length, 32);
     assert.deepEqual(call.options.additionalNodes, [{
       tag: 'meta',
       attrs: { is_group_status: 'true' },
@@ -450,7 +455,7 @@ test('le handler intercepte la réponse numérique et l’ancien case swgc bruya
   assert.doesNotMatch(statusSource, /socket\.sendMessage\(jid/);
 });
 
-test('Baileys construit le statut et nettoie le média temporaire après téléversement', async () => {
+test('NYXCORE construit le statut et le socket Baileys du projet nettoie le média temporaire après téléversement', async () => {
   const uploadedPaths = [];
   const relayed = [];
   const socket = {
@@ -484,12 +489,42 @@ test('Baileys construit le statut et nettoie le média temporaire après télév
   assert.ok(relayed[0].message.groupStatusMessageV2?.message?.imageMessage, 'imageMessage absent');
 });
 
-test('le plugin utilise les helpers de génération et le relay du Baileys du projet', () => {
+test('le plugin utilise les helpers NYXCORE et le socket Baileys de la session', () => {
+  const pluginSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'plugins', 'group', 'swgc.js'), 'utf8');
   const statusSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'status.js'), 'utf8');
-  assert.match(statusSource, /require\("@whiskeysockets\/baileys"\)/);
-  assert.match(statusSource, /generateWAMessageContent/);
-  assert.match(statusSource, /generateWAMessageFromContent/);
+  const packageJson = require('../package.json');
+
+  assert.match(pluginSource, /import\('@nyxcore\/nyxcoresocket'\)/);
+  assert.match(pluginSource, /installGroupStatusMethod\(socket\)/);
+  assert.match(pluginSource, /socket\.sendGroupStatus/);
+  assert.match(statusSource, /import\('@nyxcore\/nyxcoresocket'\)/);
+  assert.match(statusSource, /generateWAMessage\(/);
+  assert.match(statusSource, /socket\.waUploadToServer\.bind\(socket\)/);
   assert.match(statusSource, /socket\.relayMessage\(jid/);
-  assert.doesNotMatch(statusSource, /wileys/);
-  assert.equal(require('../package.json').dependencies.wileys, undefined);
+  assert.match(statusSource, /groupStatusMessageV2/);
+  assert.equal(packageJson.dependencies['@nyxcore/nyxcoresocket'], '^0.3.2');
+  assert.equal(packageJson.dependencies['@whiskeysockets/baileys'], '7.0.0-rc14');
+  assert.equal(packageJson.dependencies.wileys, undefined);
+});
+
+test('le socket du projet reçoit sendGroupStatus comme adaptateur NYXCORE', async () => {
+  const relayed = [];
+  const socket = {
+    user: { id: '50900000000@s.whatsapp.net' },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+    }
+  };
+  const { installGroupStatusMethod } = require('../src/handlers/status');
+  const sendGroupStatus = installGroupStatusMethod(socket);
+
+  assert.equal(typeof socket.sendGroupStatus, 'function');
+  assert.equal(sendGroupStatus, socket.sendGroupStatus);
+  await socket.sendGroupStatus('123456@g.us', { text: 'NYXCORE sur socket existant' });
+  assert.equal(relayed.length, 1);
+  assert.equal(relayed[0].jid, '123456@g.us');
+  assert.equal(
+    relayed[0].message.groupStatusMessageV2.message.extendedTextMessage.text,
+    'NYXCORE sur socket existant'
+  );
 });

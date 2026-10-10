@@ -122,17 +122,29 @@ async function executeSwgc(context, dependencies = {}) {
       }
     }
 
-    const downloadContent = dependencies.downloadContent
-      || require('@whiskeysockets/baileys').downloadContentFromMessage;
+    let downloadContent = dependencies.downloadContent;
+    if (!downloadContent) {
+      const nyxBaileys = await import('@nyxcore/nyxcoresocket');
+      downloadContent = nyxBaileys.downloadContentFromMessage;
+    }
     const built = await buildGroupStatusPayload({
       quotedMessage: quotedMsg,
       textInput,
       downloadContent,
       audioToStatusVideo: dependencies.audioToStatusVideo
     });
-    const publishGroupStatus = dependencies.publishGroupStatus
-      || require('../../handlers/status').groupStatus;
-    await publishGroupStatus(socket, target.jid, built.payload);
+
+    let sendGroupStatus;
+    if (dependencies.publishGroupStatus) {
+      sendGroupStatus = (jid, payload) => dependencies.publishGroupStatus(socket, jid, payload);
+    } else {
+      const { installGroupStatusMethod } = require('../../handlers/status');
+      const adapter = installGroupStatusMethod(socket);
+      sendGroupStatus = typeof socket.sendGroupStatus === 'function'
+        ? socket.sendGroupStatus.bind(socket)
+        : adapter;
+    }
+    await sendGroupStatus(target.jid, built.payload);
 
     // Aucune réaction, confirmation ou texte n’est envoyé dans le groupe. Le
     // seul envoi à la cible est le statut groupStatusMessageV2 lui-même.

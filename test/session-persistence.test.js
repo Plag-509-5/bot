@@ -1,6 +1,6 @@
 'use strict';
 
-/** Garde-fous : auth MongoDB seule et paquet Baileys officiel. */
+/** Garde-fous : auth MongoDB et duo Baileys officiel + helpers NYXCORE. */
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -46,13 +46,19 @@ test('MONGO_URI est obligatoire et aucun secret MongoDB n’est codé en dur', (
   assert.match(source, /error: 'mongodb_indisponible'/);
 });
 
-test('le Baileys officiel est épinglé directement, sans alias ni fork', () => {
+test('Baileys officiel pour les sessions et NYXCORE pour le plugin de statut', async () => {
   assert.equal(packageJson.dependencies['@whiskeysockets/baileys'], '7.0.0-rc14');
   assert.equal(require('@whiskeysockets/baileys/package.json').name, '@whiskeysockets/baileys');
   assert.equal(require('@whiskeysockets/baileys/package.json').version, '7.0.0-rc14');
+  assert.equal(packageJson.dependencies['@nyxcore/nyxcoresocket'], '^0.3.2');
 
-  // Le plugin de statut de groupe utilise lui aussi ce même Baileys officiel.
-  // Aucun fork ni paquet de helpers WhatsApp alternatif n’est requis.
+  const nyxCore = await import('@nyxcore/nyxcoresocket');
+  assert.equal(typeof nyxCore.generateWAMessage, 'function');
+  assert.equal(typeof nyxCore.generateMessageIDV2, 'function');
+  assert.equal(typeof nyxCore.downloadContentFromMessage, 'function');
+
+  // Les deux paquets sont intentionnels : Baileys officiel garde les sessions;
+  // NYXCORE fournit les helpers et la méthode de statut du plugin.
   for (const forbidden of [
     '@rexxhayanasi/elaina-baileys',
     '@ryuu-reinzz/baileys',

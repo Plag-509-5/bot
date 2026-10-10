@@ -10,6 +10,7 @@
     "test:syntax": "node scripts/check-syntax.js"
   },
   "dependencies": {
+    "@nyxcore/nyxcoresocket": "^0.3.2",
     "@vitalets/google-translate-api": "^9.2.1",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "acrcloud": "^1.4.0",

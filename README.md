@@ -44,7 +44,7 @@
 
 ```text
 ├── index.js                       # Serveur Express
-├── package.json                   # Baileys officiel + scripts
+├── package.json                   # Baileys officiel, NYXCORE + scripts
 ├── .env.example                   # Configuration documentée
 ├── src/
 │   ├── core/pair.js               # Sockets, pairing et API
@@ -73,12 +73,19 @@ d'authentification WhatsApp.
 
 ## 🔐 Sessions exclusivement dans MongoDB
 
-Le bot utilise uniquement le paquet officiel **`@whiskeysockets/baileys`**
-(version épinglée `7.0.0-rc14`), sans alias ni fork. `.swgc` utilise ses helpers
-`generateWAMessageContent` / `generateWAMessageFromContent`, son téléversement
-média, puis le socket de la session (`relayMessage`) pour publier les statuts de
-groupe. Pour que le chiffrement Signal reste celui de Baileys, `package.json`
-force `libsignal` sur le commit officiel via `overrides`.
+Les sessions, l’authentification MongoDB et les sockets principaux du bot
+utilisent le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
+`7.0.0-rc14`), sans alias ni fork. Le plugin `.swgc` / `.gcstatus` utilise aussi
+**`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour ses helpers de téléchargement et de
+génération des messages de statut.
+
+La méthode `sendGroupStatus()` de NYXCORE n’existe que sur les sockets produits
+par sa propre factory. Pour conserver les sessions actives du projet et éviter
+d’ouvrir une seconde connexion WhatsApp, le plugin installe un petit adaptateur
+`sendGroupStatus()` sur le socket Baileys existant : NYXCORE prépare le message,
+puis ce même socket assure le téléversement média et le relay. Les deux
+paquets sont donc déclarés volontairement. `package.json` force toujours
+`libsignal` sur le commit officiel via `overrides`.
 
 MongoDB est l'unique source de vérité :
 
@@ -285,7 +292,7 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 3. Il publie avec `.swgc ton texte, violet` (ou `.gcstatus`) ou répond à une image, vidéo ou note audio avec la commande.
 4. Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le projet utilise toujours les primitives Baileys officielles et relaie le statut dans `groupStatusMessageV2`; il ne dépend pas de `@nyxcore/nyxcoresocket`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
 
 Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
 
