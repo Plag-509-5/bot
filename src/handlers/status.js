@@ -1,9 +1,9 @@
 // status.js
 const crypto = require("crypto");
-const {
-  generateWAMessageContent,
-  generateWAMessageFromContent
-} = require("@whiskeysockets/baileys");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { pipeline } = require("stream/promises");
 
 const GROUP_STATUS_MESSAGE_TYPES = [
   "extendedTextMessage",
@@ -31,9 +31,50 @@ function markInnerMessageAsGroupStatus(message) {
 }
 
 /**
- * Baileys officiel expose les primitives nécessaires aux statuts de groupe. Le
- * contenu média est d'abord préparé/téléversé par generateWAMessageContent,
- * puis relayé au JID du groupe avec les deux marqueurs attendus par WhatsApp :
+ * Le paquet `wileys` fournit les helpers de construction de messages utilisés
+ * pour les statuts de groupe (generateWAMessageContent / generateWAMessageFromContent).
+ * Il est chargé à la demande : sa bannière de démarrage est masquée pendant le
+ * `require`, qui est synchrone, donc aucun autre code ne peut écrire entre-temps.
+ */
+let wileysHelpers = null;
+function loadWileysHelpers() {
+  if (wileysHelpers) return wileysHelpers;
+  const originalLog = console.log;
+  console.log = () => {};
+  try {
+    wileysHelpers = require("wileys");
+  } finally {
+    console.log = originalLog;
+  }
+  return wileysHelpers;
+}
+
+/**
+ * wileys transmet le média chiffré sous forme de flux, alors que le
+ * `waUploadToServer` du socket attend un chemin de fichier. On écrit donc le
+ * flux dans un fichier temporaire, on le téléverse, puis on le supprime.
+ */
+function uploadEncryptedStreamWithSocket(socket) {
+  return async (encryptedStream, metadata) => {
+    if (typeof socket.waUploadToServer !== "function") {
+      throw new Error("Téléversement média indisponible sur ce socket.");
+    }
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `kaido-groupstatus-${crypto.randomBytes(8).toString("hex")}.enc`
+    );
+    try {
+      await pipeline(encryptedStream, fs.createWriteStream(tmpPath));
+      return await socket.waUploadToServer(tmpPath, metadata);
+    } finally {
+      await fs.promises.unlink(tmpPath).catch(() => {});
+    }
+  };
+}
+
+/**
+ * La construction du message passe par wileys ; l'envoi reste sur le socket
+ * de la session (relayMessage) avec les deux marqueurs attendus par WhatsApp :
  * contextInfo.isGroupStatus et <meta is_group_status="true"/>.
  */
 async function groupStatus(socket, jid, content) {
@@ -47,6 +88,7 @@ async function groupStatus(socket, jid, content) {
     throw new Error("Contenu de statut invalide.");
   }
 
+  const { generateWAMessageContent, generateWAMessageFromContent } = loadWileysHelpers();
   const { backgroundColor, font, ...payload } = content;
   const generated = await generateWAMessageContent(
     {
@@ -57,7 +99,7 @@ async function groupStatus(socket, jid, content) {
       }
     },
     {
-      upload: socket.waUploadToServer,
+      upload: uploadEncryptedStreamWithSocket(socket),
       backgroundColor,
       font,
       jid

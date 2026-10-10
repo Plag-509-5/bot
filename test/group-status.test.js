@@ -339,3 +339,45 @@ test('le handler intercepte la réponse numérique et l’ancien case swgc bruya
   assert.match(statusSource, /socket\.relayMessage\(jid/);
   assert.doesNotMatch(statusSource, /socket\.sendMessage\(jid/);
 });
+
+test('wileys construit le statut, le média passe par un fichier temporaire supprimé après envoi', async () => {
+  const uploadedPaths = [];
+  const relayed = [];
+  const socket = {
+    user: { id: '50900000000@s.whatsapp.net' },
+    async waUploadToServer(filePath, metadata) {
+      assert.equal(typeof filePath, 'string');
+      assert.ok(fs.existsSync(filePath), 'fichier chiffré absent pendant le téléversement');
+      assert.ok(fs.statSync(filePath).size > 0, 'fichier chiffré vide');
+      assert.equal(metadata.mediaType, 'image');
+      uploadedPaths.push(filePath);
+      return {
+        mediaUrl: 'https://upload.invalid/image',
+        directPath: '/group-status/image'
+      };
+    },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+    }
+  };
+
+  await groupStatus(socket, '123456@g.us', {
+    image: Buffer.from('image-binaire'),
+    mimetype: 'image/png',
+    jpegThumbnail: Buffer.alloc(0)
+  });
+
+  assert.equal(uploadedPaths.length, 1);
+  assert.equal(fs.existsSync(uploadedPaths[0]), false, 'fichier temporaire non supprimé');
+  assert.equal(relayed.length, 1);
+  assert.equal(relayed[0].jid, '123456@g.us');
+  assert.ok(relayed[0].message.groupStatusMessageV2?.message?.imageMessage, 'imageMessage absent');
+});
+
+test('le statut de groupe est construit par wileys et relayé par le socket officiel', () => {
+  const statusSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'status.js'), 'utf8');
+  assert.match(statusSource, /require\("wileys"\)/);
+  assert.doesNotMatch(statusSource, /require\("@whiskeysockets\/baileys"\)/);
+  assert.match(statusSource, /socket\.relayMessage\(jid/);
+  assert.equal(require('../package.json').dependencies.wileys, '0.7.8');
+});

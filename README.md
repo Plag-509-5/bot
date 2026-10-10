@@ -74,7 +74,12 @@ d'authentification WhatsApp.
 ## 🔐 Sessions exclusivement dans MongoDB
 
 Le bot utilise le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
-`7.0.0-rc14`), sans alias npm et sans fork Wileys.
+`7.0.0-rc14`), sans alias npm. Une seule exception, décidée pour `.swgc` : le
+paquet **`wileys`** (version épinglée `0.7.8`) fournit les helpers de
+construction des statuts de groupe (`generateWAMessageContent` /
+`generateWAMessageFromContent`). L'envoi reste assuré par le socket Baileys
+officiel (`relayMessage`). Pour que le chiffrement Signal reste celui de Baileys,
+`package.json` force `libsignal` sur le commit officiel via `overrides`.
 
 MongoDB est l'unique source de vérité :
 

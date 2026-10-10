@@ -51,8 +51,9 @@ test('le Baileys officiel est épinglé directement, sans alias ni fork', () => 
   assert.equal(require('@whiskeysockets/baileys/package.json').name, '@whiskeysockets/baileys');
   assert.equal(require('@whiskeysockets/baileys/package.json').version, '7.0.0-rc14');
 
+  // `wileys` est une exception volontaire, limitée aux helpers de construction
+  // des statuts de groupe (.swgc). Le reste des forks reste interdit.
   for (const forbidden of [
-    'wileys',
     '@rexxhayanasi/elaina-baileys',
     '@ryuu-reinzz/baileys',
     'baileyz',
@@ -61,6 +62,13 @@ test('le Baileys officiel est épinglé directement, sans alias ni fork', () => 
     assert.equal(packageJson.dependencies[forbidden], undefined, `fork interdit : ${forbidden}`);
   }
   assert.doesNotMatch(packageJson.dependencies['@whiskeysockets/baileys'], /^npm:/);
+  assert.equal(packageJson.dependencies.wileys, '0.7.8', 'wileys doit être épinglé en version exacte');
+
+  // libsignal doit rester celui de Baileys officiel, même si wileys le déclare.
+  assert.equal(
+    packageJson.overrides?.libsignal,
+    'github:whiskeysockets/libsignal-node#bcea72df9ec34d9d9140ab30619cf479c7c144c7'
+  );
 });
 
 test('les creds et clés sont sauvegardés par les APIs MongoDB dédiées', () => {
