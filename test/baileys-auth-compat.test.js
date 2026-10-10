@@ -10,7 +10,8 @@ const baileys = require('@whiskeysockets/baileys');
 const {
   default: makeWASocket,
   initAuthCreds,
-  makeCacheableSignalKeyStore
+  makeCacheableSignalKeyStore,
+  Browsers
 } = baileys;
 const { createMongoAuthState } = require('../src/auth/mongo-auth-state');
 const { cloneAuthValue } = require('../src/auth/mongo-auth-backend');
@@ -56,6 +57,8 @@ test('le paquet installé est le Baileys officiel et expose les APIs utilisées'
     'delay',
     'getContentType',
     'downloadContentFromMessage',
+    'fetchLatestWaWebVersion',
+    'Browsers',
     'generateWAMessageFromContent',
     'generateWAMessageContent',
     'proto'
@@ -78,7 +81,7 @@ test('makeWASocket accepte l’état MongoDB sans créer de session locale', asy
     },
     printQRInTerminal: false,
     logger,
-    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    browser: Browsers.ubuntu('Chrome'),
     connectTimeoutMs: 1000
   });
 

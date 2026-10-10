@@ -63,17 +63,41 @@ test('un socket de pairing reste séparé des sockets actifs', () => {
   );
 });
 
-test('un appairage abandonné est purgé au lieu d’être reconnecté', () => {
+test('le cycle central distingue le 515 immédiat des vrais échecs de pairing', () => {
   const autoRestart = code.slice(
     code.indexOf('function setupAutoRestart('),
     code.indexOf('async function EmpirePair(')
   );
-  assert.match(autoRestart, /neverRegistered/);
-  assert.match(
-    autoRestart,
-    /purgeFailedSession\(sanitized, \{ socket, reason: 'connexion fermée avant enregistrement' \}\)/
+  assert.match(autoRestart, /createPairingLifecycle\(\{/);
+  assert.match(autoRestart, /onPairingAccepted:/);
+  const acceptedBranch = autoRestart.slice(
+    autoRestart.indexOf('onPairingAccepted:'),
+    autoRestart.indexOf('onReconnect:')
   );
-  assert.match(autoRestart, /if \(auth && !neverRegistered\)/);
+  assert.doesNotMatch(acceptedBranch, /pairingGuard\.release/);
+  assert.match(autoRestart, /reconnectScheduler\.scheduleImmediate\(sanitized, decision\)/);
+  assert.match(autoRestart, /onPairingFailure:/);
+  assert.match(autoRestart, /purgeFailedSession\(sanitized, \{ socket, reason: decision\.reason \}\)/);
+});
+
+test('le code attend pair-device et une reconnexion interne n’en génère jamais un autre', () => {
+  const empirePair = code.slice(code.indexOf('async function EmpirePair('));
+  assert.match(empirePair, /waitForPairingReady\(socket, \{ timeoutMs: PAIRING_READY_TIMEOUT_MS \}\)/);
+  assert.match(empirePair, /!forceFresh && !internalReconnect/);
+  assert.match(empirePair, /if \(!internalReconnect\) pairingGuard\.reacquire/);
+  assert.match(empirePair, /if \(internalReconnect\)/);
+  assert.match(empirePair, /reconnexion interne sans creds enregistrées/);
+  assert.equal(occurrences(empirePair, 'socket.requestPairingCode(sanitizedNumber)'), 1);
+  assert.doesNotMatch(empirePair, /demande de code échouée \(essai/);
+});
+
+test('le socket utilise une version WhatsApp live stable et un navigateur canonique', () => {
+  const empirePair = code.slice(code.indexOf('async function EmpirePair('));
+  assert.match(empirePair, /baileysVersionResolver\.resolve\(/);
+  assert.match(empirePair, /version: waVersion/);
+  assert.match(empirePair, /browser: WA_BROWSER/);
+  assert.match(code, /Browsers\.ubuntu\('Chrome'\)/);
+  assert.doesNotMatch(code, /\["Ubuntu", "Chrome", "20\.0\.04"\]/);
 });
 
 test('une erreur après chargement ne détruit pas une session déjà enregistrée', () => {

@@ -94,8 +94,8 @@ const {
   delay,
   getContentType,
   Browsers,
-  downloadContentFromMessage,
-  DisconnectReason
+  fetchLatestWaWebVersion,
+  downloadContentFromMessage
 } = require('@whiskeysockets/baileys');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 // -------- Sessions MongoDB uniquement --------
@@ -106,7 +106,15 @@ const { createMongoAuthBackend } = require('../auth/mongo-auth-backend');
 const { createMongoConnection } = require('../db/mongo-connection');
 const { createReconnectScheduler } = require('../auth/reconnect');
 const { createPairingGuard } = require('../auth/pairing-guard');
+const {
+  createPairingLifecycle,
+  waitForPairingReady
+} = require('../auth/pairing-lifecycle');
 const { createSessionPurger } = require('../auth/session-purge');
+const {
+  createBaileysVersionResolver,
+  formatWaVersion
+} = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
@@ -244,10 +252,6 @@ configureTranslationStorage({
 
 // État d'authentification actif par numéro (cache mémoire d'exécution seulement).
 const authStates = new Map();
-
-function authStateFor(number) {
-  return authStates.get(String(number).replace(/[^0-9]/g, '')) || null;
-}
 
 // Une session ratée est effacée exclusivement de MongoDB.
 const sessionPurger = createSessionPurger({
@@ -695,6 +699,13 @@ const activeSockets = new Map();
 // session connectée, et le confondre faisait croire au bot que le numéro était
 // déjà pris — d'où le « code indisponible » au deuxième essai.
 const pairingSockets = new Map();
+// Dernier état de cycle de vie par numéro, exposé par /api/session/health sans
+// jamais inclure le code d'appairage ni les clés.
+const connectionLifecycles = new Map();
+const socketRuntimeMetadata = new Map();
+// Les fermetures déclenchées par une purge/logout explicite ne doivent pas
+// réveiller l'ordonnanceur de reconnexion via leur propre événement `close`.
+const intentionalSocketClosures = new WeakSet();
 // Verrou d'appairage à libération explicite (voir src/auth/pairing-guard.js).
 const pairingGuard = createPairingGuard({
   lockTtlMs: Math.max(30000, Number(process.env.PAIRING_LOCK_TTL_MS) || 3 * 60 * 1000)
@@ -702,6 +713,22 @@ const pairingGuard = createPairingGuard({
 const lastConnectionActivity = new Map();
 
 const socketCreationTime = new Map();
+
+const PAIRING_READY_TIMEOUT_MS = Math.max(
+  10000,
+  Number(process.env.PAIRING_READY_TIMEOUT_MS) || 45000
+);
+const WA_VERSION_FETCH_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.WA_VERSION_FETCH_TIMEOUT_MS) || 12000
+);
+// Tuple canonique : le flux pairing-code valide plus strictement les libellés
+// navigateur/OS que le QR. `Ubuntu + Chrome` est reconnu par Baileys/WhatsApp.
+const WA_BROWSER = Object.freeze(Browsers.ubuntu('Chrome'));
+const baileysVersionResolver = createBaileysVersionResolver({
+  fetchLatestWaWebVersion,
+  fetchOptions: () => ({ signal: AbortSignal.timeout(WA_VERSION_FETCH_TIMEOUT_MS) })
+});
 
 const SESSION_RECONNECT_BASE_MS = Math.max(2000, Number(process.env.SESSION_RECONNECT_BASE_MS) || 5000);
 const SESSION_RECONNECT_MAX_MS = Math.max(30000, Number(process.env.SESSION_RECONNECT_MAX_MS) || 120000);
@@ -10385,11 +10412,18 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     // 1) On retire la session des tables de runtime : plus aucune reconnexion
     //    ne pourra être programmée pour ce numéro.
     reconnectScheduler.cancel(sanitized);
+    pairingGuard.release(sanitized);
     activeSockets.delete(sanitized);
+    pairingSockets.delete(sanitized);
     socketCreationTime.delete(sanitized);
+    lastConnectionActivity.delete(sanitized);
+    connectionLifecycles.delete(sanitized);
+    socketRuntimeMetadata.delete(sanitized);
 
-    // 2) Socket : logout côté WhatsApp puis fermeture de la websocket.
+    // 2) Socket : logout côté WhatsApp puis fermeture de la websocket. Le
+    // marqueur est posé AVANT logout(), car celui-ci peut émettre close aussitôt.
     if (socketInstance) {
+      intentionalSocketClosures.add(socketInstance);
       try {
         if (typeof socketInstance.logout === 'function') {
           await socketInstance.logout().catch(err => console.warn('logout error (ignored):', err?.message || err));
@@ -10440,8 +10474,11 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   activeSockets.delete(sanitized);
   socketCreationTime.delete(sanitized);
   lastConnectionActivity.delete(sanitized);
+  connectionLifecycles.delete(sanitized);
+  socketRuntimeMetadata.delete(sanitized);
 
   if (socket) {
+    intentionalSocketClosures.add(socket);
     try { socket.ws?.close(); } catch (e) {}
   }
 
@@ -10471,10 +10508,19 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
 const reconnectScheduler = createReconnectScheduler({
   baseMs: SESSION_RECONNECT_BASE_MS,
   maxMs: SESSION_RECONNECT_MAX_MS,
-  onReconnect: async (sanitized, { attempt } = {}) => {
-    console.log(`[SESSION ${sanitized}] reconnexion (tentative ${attempt})…`);
+  onReconnect: async (sanitized, context = {}) => {
+    const { attempt = 0, immediate = false, reason, refreshVersion = false } = context;
+    console.log(
+      immediate
+        ? `[SESSION ${sanitized}] redémarrage post-appairage immédiat (515)…`
+        : `[SESSION ${sanitized}] reconnexion (tentative ${attempt})…`
+    );
     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-    await EmpirePair(sanitized, mockRes);
+    await EmpirePair(sanitized, mockRes, {
+      internalReconnect: true,
+      reconnectReason: reason,
+      forceVersionRefresh: refreshVersion
+    });
   },
   onGiveUp: (sanitized) => {
     console.error(
@@ -10484,62 +10530,94 @@ const reconnectScheduler = createReconnectScheduler({
   }
 });
 
-function setupAutoRestart(socket, number) {
+function setupAutoRestart(socket, number, auth) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
   lastConnectionActivity.set(sanitized, Date.now());
-  socket.ev.on('connection.update', async (update) => {
-    lastConnectionActivity.set(sanitized, Date.now());
-    const { connection, lastDisconnect } = update;
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode
-                         || lastDisconnect?.error?.statusCode
-                         || (lastDisconnect?.error && lastDisconnect.error.toString().includes('401') ? 401 : undefined);
-      const isLoggedOut = statusCode === 401
-                          || (lastDisconnect?.error && lastDisconnect.error.code === 'AUTHENTICATION')
-                          || (lastDisconnect?.error && String(lastDisconnect.error).toLowerCase().includes('logged out'))
-                          || (lastDisconnect?.reason === DisconnectReason?.loggedOut);
 
-      // Un socket qui se ferme sans avoir jamais été enregistré, c'est un
-      // appairage abandonné ou raté : il ne faut PAS le reconnecter en boucle,
-      // il faut l'effacer partout. Sinon le numéro reste « occupé », est
-      // restauré à chaque démarrage pour générer un code que personne ne
-      // saisira, et la demande suivante retombe sur « Indisponible ».
-      const neverRegistered = socket?.authState?.creds?.registered === false;
+  const lifecycle = createPairingLifecycle({
+    number: sanitized,
+    socket,
+    auth,
+    initiallyRegistered: Boolean(socket?.authState?.creds?.registered),
+    isIntentionalClose: (candidate) => intentionalSocketClosures.has(candidate),
+    onPairingAccepted: () => {
+      // Le verrou externe et la référence au socket restent posés jusqu'au
+      // close 515/open : ils empêchent un clic/API concurrent d'écraser les
+      // creds et permettent à force=1 de fermer proprement ce socket. La
+      // reconnexion interne possède, elle seule, le droit de traverser le verrou.
+    },
+    onReconnect: async (decision) => {
+      if (activeSockets.get(sanitized) === socket) activeSockets.delete(sanitized);
+      if (pairingSockets.get(sanitized) === socket) pairingSockets.delete(sanitized);
+      socketCreationTime.delete(sanitized);
 
-      // Quoi qu'il arrive : on vide l'état d'authentification AVANT de toucher
-      // à quoi que ce soit d'autre, sinon les dernières clés Signal sont perdues.
-      const auth = authStateFor(sanitized);
-      if (auth && !neverRegistered) {
-        try { await auth.flush(); } catch (e) { console.error('flush auth (close)', e); }
+      const planned = decision.immediate
+        ? reconnectScheduler.scheduleImmediate(sanitized, decision)
+        : reconnectScheduler.schedule(sanitized, decision);
+
+      if (planned.scheduled) {
+        console.log(
+          decision.immediate
+            ? `[SESSION ${sanitized}] pair-success confirmé; nouveau socket programmé immédiatement.`
+            : `[SESSION ${sanitized}] ${decision.reason}; reconnexion dans ${planned.delayMs} ms (tentative ${planned.attempt}).`
+        );
+      } else if (planned.reason === 'deja-programmee') {
+        console.log(`[SESSION ${sanitized}] une reconnexion est déjà programmée.`);
       }
-
-      if (neverRegistered) {
-        console.warn(`[SESSION ${sanitized}] connexion fermée avant enregistrement : appairage abandonné, purge.`);
-        await purgeFailedSession(sanitized, { socket, reason: 'connexion fermée avant enregistrement' });
-      } else if (isLoggedOut) {
-        console.log(`User ${number} logged out. Cleaning up...`);
-        try { await deleteSessionAndCleanup(number, socket); } catch(e){ console.error(e); }
-      } else {
-        activeSockets.delete(sanitized);
-        const planned = reconnectScheduler.schedule(sanitized);
-        if (planned.scheduled) {
-          console.log(`Connection fermée pour ${sanitized}; reconnexion dans ${planned.delayMs} ms (tentative ${planned.attempt})`);
-        } else if (planned.reason === 'deja-programmee') {
-          console.log(`Connection fermée pour ${sanitized}; une reconnexion est déjà programmée.`);
-        }
+    },
+    onPairingFailure: async (decision) => {
+      console.warn(`[SESSION ${sanitized}] ${decision.reason}; purge de cette tentative.`);
+      await purgeFailedSession(sanitized, { socket, reason: decision.reason });
+    },
+    onSessionInvalid: async (decision) => {
+      console.warn(`[SESSION ${sanitized}] ${decision.reason}; suppression de la session.`);
+      await deleteSessionAndCleanup(sanitized, socket);
+    },
+    onConnectionReplaced: async (decision) => {
+      if (activeSockets.get(sanitized) === socket) activeSockets.delete(sanitized);
+      if (pairingSockets.get(sanitized) === socket) pairingSockets.delete(sanitized);
+      pairingGuard.release(sanitized);
+      socketCreationTime.delete(sanitized);
+      console.warn(`[SESSION ${sanitized}] ${decision.reason}; creds MongoDB conservées, aucune boucle de reconnexion.`);
+    },
+    onDiagnostic: (entry) => {
+      if (['pair-success', 'connection-closed', 'auth-flushed', 'auth-flush-failed'].includes(entry.phase)) {
+        console.log(`[PAIRING ${sanitized}] ${entry.phase}`, {
+          statusCode: entry.statusCode,
+          action: entry.action,
+          registered: entry.registered,
+          elapsedMs: entry.elapsedMs
+        });
       }
-
+    },
+    onError: (error) => {
+      console.error(`[SESSION ${sanitized}] erreur du cycle de connexion :`, error?.message || error);
     }
-
   });
+
+  connectionLifecycles.set(sanitized, lifecycle);
+  socket.ev.on('connection.update', (update) => {
+    lastConnectionActivity.set(sanitized, Date.now());
+    void lifecycle.handleConnectionUpdate(update).catch((error) => {
+      console.error(`[SESSION ${sanitized}] traitement connection.update :`, error?.message || error);
+    });
+  });
+  return lifecycle;
 }
 
 // ---------------- EmpirePair (pairing, sessions MongoDB uniquement) ----------------
 
 async function EmpirePair(number, res, options = {}) {
-  // forceFresh : demande explicite d'un nouveau code (dashboard). On démolit
-  // alors l'appairage en cours et on purge les restes au lieu de refuser.
-  const { forceFresh = false } = options;
+  // forceFresh : demande explicite d'un nouveau code (dashboard).
+  // internalReconnect : redémarrage piloté par le cycle Baileys ; il doit
+  // traverser le verrou encore posé entre pair-success et le close 515, et ne
+  // doit jamais générer un nouveau code que personne ne recevrait.
+  const {
+    forceFresh = false,
+    internalReconnect = false,
+    forceVersionRefresh = false,
+    reconnectReason = null
+  } = options;
   const sanitizedNumber = String(number).replace(/[^0-9]/g, '');
   if (!sanitizedNumber) throw new Error('Numéro de session invalide');
 
@@ -10556,7 +10634,9 @@ async function EmpirePair(number, res, options = {}) {
   }
 
   // --- Appairage déjà en cours. ---
-  if (pairingGuard.isLocked(sanitizedNumber) && !forceFresh) {
+  // Une reconnexion interne (notamment le 515 attendu) n'est pas une deuxième
+  // demande de code et doit pouvoir franchir ce verrou.
+  if (pairingGuard.isLocked(sanitizedNumber) && !forceFresh && !internalReconnect) {
     if (res && !res.headersSent) {
       res.send({
         status: 'appairage_en_cours',
@@ -10585,7 +10665,7 @@ async function EmpirePair(number, res, options = {}) {
     }
   }
 
-  pairingGuard.reacquire(sanitizedNumber);
+  if (!internalReconnect) pairingGuard.reacquire(sanitizedNumber);
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
 
   try {
@@ -10661,11 +10741,35 @@ async function EmpirePair(number, res, options = {}) {
   let socket = null;
 
  try {
+    const versionResolution = await baileysVersionResolver.resolve({ force: forceVersionRefresh });
+    const waVersion = versionResolution.version;
+    socketRuntimeMetadata.set(sanitizedNumber, {
+      version: [...waVersion],
+      versionSource: versionResolution.source,
+      versionStale: versionResolution.stale,
+      browser: [...WA_BROWSER],
+      internalReconnect,
+      reconnectReason,
+      resolvedAt: Date.now()
+    });
+    console.log(
+      `[SESSION ${sanitizedNumber}] WhatsApp Web ${formatWaVersion(waVersion)} ` +
+      `(${versionResolution.source}), navigateur ${WA_BROWSER[1]} (${WA_BROWSER[0]}).`
+    );
+    if (versionResolution.stale) {
+      console.warn(
+        `[SESSION ${sanitizedNumber}] version live indisponible; fallback conservé : ` +
+        `${versionResolution.warning || 'raison inconnue'}. ` +
+        'Définis WA_WEB_VERSION si web.whatsapp.com/sw.js est bloqué.'
+      );
+    }
+
     // On ferme proprement un éventuel socket résiduel du même numéro AVANT d'en
     // ouvrir un nouveau. Deux connexions simultanées sur la même identité,
     // c'est la recette exacte de la désynchronisation des clés Signal.
     const leftover = activeSockets.get(sanitizedNumber);
     if (leftover) {
+      intentionalSocketClosures.add(leftover);
       try { leftover.ws?.close(); } catch (e) {}
       activeSockets.delete(sanitizedNumber);
     }
@@ -10674,10 +10778,11 @@ async function EmpirePair(number, res, options = {}) {
       // mongo-auth-state possède déjà un cache mémoire write-through. Ajouter
       // le cache Baileys par-dessus validerait une clé avant l'acquittement DB.
       auth: { creds: state.creds, keys: state.keys },
+      version: waVersion,
       printQRInTerminal: false,
       logger,
       markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
-      browser: ["Ubuntu", "Chrome", "20.0.04"]
+      browser: WA_BROWSER
     });
 
     // Après avoir créé le socket et défini socketCreationTime
@@ -10692,8 +10797,20 @@ socket.ev.on('creds.update', () => {
     try { socket.ws?.close(); } catch (_) {}
   });
 });
-// Garde-fou d'envoi : installé EN PREMIER pour que tous les `socket.sendMessage`
-// du bot (y compris ceux décorés par le thème) vérifient la connexion réelle.
+// Branché avant tout await : il doit voir pair-success puis le close 515, même
+// si l'initialisation d'un handler métier prend du temps.
+const pairingLifecycle = setupAutoRestart(socket, sanitizedNumber, auth);
+// Le stanza pair-device peut arriver pendant l'initialisation des wrappers :
+// on s'abonne donc tout de suite, puis on attend le résultat juste avant la
+// demande de code. La promesse convertit son rejet pour éviter tout unhandled.
+const pairingReadyResult = socket.authState.creds.registered
+  ? null
+  : waitForPairingReady(socket, { timeoutMs: PAIRING_READY_TIMEOUT_MS }).then(
+      () => ({ ok: true }),
+      (error) => ({ ok: false, error })
+    );
+// Garde-fou d'envoi : installé avant les handlers métier pour que tous les
+// `socket.sendMessage` du bot vérifient la connexion réelle.
 installSafeSend(socket);
 await setupTranslationWrapper(socket, sanitizedNumber);
 setupCommandThemeWrapper(socket);
@@ -10701,33 +10818,52 @@ setupCommandThemeWrapper(socket);
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
 setupMessageHandlers(socket);
-setupAutoRestart(socket, sanitizedNumber);
 setupNewsletterHandlers(socket, sanitizedNumber);
 registerGroupParticipantListener(socket).catch(err => console.error('Listener init failed', err));
 handleMessageRevocation(socket, sanitizedNumber);
     if (!socket.authState.creds.registered) {
+      // Une reconnexion automatique ne doit JAMAIS remplacer le code encore
+      // affiché par un code secret envoyé à un mock HTTP. Pour le 515, arriver
+      // ici signale que les creds pair-success n'ont pas été restaurées.
+      if (internalReconnect) {
+        const purged = await purgeFailedSession(sanitizedNumber, {
+          socket,
+          reason: `reconnexion interne sans creds enregistrées${reconnectReason ? ` (${reconnectReason})` : ''}`
+        });
+        console.error(
+          `[SESSION ${sanitizedNumber}] reconnexion interne interrompue : creds non enregistrées; ` +
+          `purge ${purged ? 'réussie' : 'incomplète'}.`
+        );
+        return;
+      }
+
       // Socket d'appairage : il n'est PAS encore une session connectée, il va
       // dans `pairingSockets` et surtout pas dans `activeSockets`.
       pairingSockets.set(sanitizedNumber, socket);
 
       let code = null;
       let lastError = null;
-      for (let attempt = 1; attempt <= config.MAX_RETRIES; attempt += 1) {
-        try {
-          await delay(1500);
-          code = await socket.requestPairingCode(sanitizedNumber);
-          // Ne jamais remettre le code au navigateur avant que les creds qui
-          // lui correspondent soient acquittés par MongoDB.
-          await auth.saveCreds();
-          break;
-        } catch (error) {
-          lastError = error;
-          console.warn(
-            `[SESSION ${sanitizedNumber}] demande de code échouée (essai ${attempt}/${config.MAX_RETRIES}) :`,
-            error?.message || error
-          );
-          if (attempt < config.MAX_RETRIES) await delay(1000 * attempt);
-        }
+      try {
+        const ready = await pairingReadyResult;
+        if (!ready?.ok) throw ready?.error || new Error('WhatsApp non prêt pour l’appairage');
+        pairingLifecycle.markPairingReady();
+        pairingLifecycle.markCodeRequested();
+
+        // Une seule demande par socket. Réessayer automatiquement ici peut
+        // écraser creds.pairingCode alors que le téléphone traite encore la
+        // première réponse (voir le cycle delayed primary_hello de Baileys).
+        code = await socket.requestPairingCode(sanitizedNumber);
+        // Ne jamais remettre le code au navigateur avant que les creds qui lui
+        // correspondent soient acquittées par MongoDB.
+        await auth.saveCreds();
+        await auth.flush();
+        pairingLifecycle.markCodeIssued();
+      } catch (error) {
+        lastError = error;
+        console.warn(
+          `[SESSION ${sanitizedNumber}] demande unique de code échouée :`,
+          error?.message || error
+        );
       }
 
       if (code) {
@@ -10775,6 +10911,10 @@ handleMessageRevocation(socket, sanitizedNumber);
         pairingGuard.release(sanitizedNumber);
         reconnectScheduler.reset(sanitizedNumber);
         lastConnectionActivity.set(sanitizedNumber, Date.now());
+        // `connection=open` est la frontière réelle d'activité. Publier le
+        // socket avant les notifications/join non critiques évite qu'un close
+        // pendant ces tâches soit ensuite écrasé par un ancien socket.
+        activeSockets.set(sanitizedNumber, socket);
         try {
           // Rendre la session restaurable avant les notifications, délais ou
           // autres fonctionnalités non critiques du handler d'ouverture.
@@ -10796,7 +10936,6 @@ handleMessageRevocation(socket, sanitizedNumber);
             }
           } catch(e){}
 
-          activeSockets.set(sanitizedNumber, socket);
           const groupStatus = groupResult.status === 'success' ? 'Joined successfully' : `Failed to join group: ${groupResult.error}`;
 
           // Load per-session config (botName, logo)
@@ -10879,18 +11018,6 @@ Le bot est maintenant connecté et fonctionnel.`,
           try { socket.ws?.close(); } catch (closeErr) {}
         }
       }
-      if (connection === 'close') {
-        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
-        console.log(`[SESSION ${sanitizedNumber}] Connexion fermée. Code HTTP: ${statusCode}`);
-
-        activeSockets.delete(sanitizedNumber);
-        socketCreationTime.delete(sanitizedNumber);
-        // Sauvegarde immédiate des creds et clés Signal avant toute reconnexion.
-        try { await auth.flush(); } catch (e) { console.error('flush auth (close)', e); }
-        // La reconnexion et le nettoyage en cas de logout sont pilotés par
-        // setupAutoRestart (ordonnanceur unique) : rien à reprogrammer ici.
-      }
-
     });
 
 
@@ -10905,6 +11032,7 @@ Le bot est maintenant connecté et fonctionnel.`,
   } catch (error) {
     console.error('Pairing error:', error);
     socketCreationTime.delete(sanitizedNumber);
+    if (socket) intentionalSocketClosures.add(socket);
     try { socket?.ws?.close(); } catch (_) {}
 
     const registered = Boolean(auth?.state?.creds?.registered);
@@ -11075,7 +11203,7 @@ router.get('/connect-all', async (req, res) => {
     for (const number of numbers) {
       if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
       const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      await EmpirePair(number, mockRes);
+      await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'connect-all' });
       results.push({ number, status: 'connection_initiated' });
     }
     res.status(200).send({ status: 'success', connections: results });
@@ -11091,7 +11219,10 @@ router.get('/reconnect', async (req, res) => {
     for (const number of numbers) {
       if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
       const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      try { await EmpirePair(number, mockRes); results.push({ number, status: 'connection_initiated' }); } catch (err) { results.push({ number, status: 'failed', error: err.message }); }
+      try {
+        await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'api-reconnect' });
+        results.push({ number, status: 'connection_initiated' });
+      } catch (err) { results.push({ number, status: 'failed', error: err.message }); }
       await delay(1000);
     }
     res.status(200).send({ status: 'success', connections: results });
@@ -11199,13 +11330,22 @@ router.get('/api/session/health', async (req, res) => {
         clesSignal: auth ? auth.keyCount() : null,
         ecrituresEnAttente: auth ? auth.pendingWrites() : null,
         envois: typeof getSendStats === 'function' ? getSendStats(socket) : null,
-        derniereActivite: lastConnectionActivity.get(number) || null
+        derniereActivite: lastConnectionActivity.get(number) || null,
+        runtimeBaileys: socketRuntimeMetadata.get(number) || null,
+        cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null
       });
     }
+    const appairages = Array.from(pairingSockets.keys()).map((number) => ({
+      number,
+      runtimeBaileys: socketRuntimeMetadata.get(number) || null,
+      cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null
+    }));
     res.json({
       ok: true,
       stockageSessions: 'mongodb',
       mongodbConnecte: mongoConnection.isConnected(),
+      versionWhatsAppWeb: baileysVersionResolver.snapshot(),
+      appairages,
       sessions
     });
   } catch (err) {
@@ -11268,7 +11408,11 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
-  activeSockets.forEach((socket) => { try { socket.ws?.close(); } catch (e) {} });
+  const socketsToClose = new Set([...activeSockets.values(), ...pairingSockets.values()]);
+  socketsToClose.forEach((socket) => {
+    intentionalSocketClosures.add(socket);
+    try { socket.ws?.close(); } catch (e) {}
+  });
   await Promise.allSettled(
     Array.from(authStates.values()).map((auth) => auth.close())
   );
@@ -11302,7 +11446,9 @@ async function restoreSessionsOnBoot() {
   for (const n of numbers) {
     if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-    try { await EmpirePair(n, mockRes); } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
+    try {
+      await EmpirePair(n, mockRes, { internalReconnect: true, reconnectReason: 'boot' });
+    } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
     await delay(500);
   }
 }

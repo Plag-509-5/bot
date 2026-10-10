@@ -123,8 +123,40 @@ Signal, les écritures en attente et l'état de chaque websocket.
   `mongodb_purge_failed` ; le dashboard ne présente jamais un faux succès.
 - `force=1` détruit proprement l'ancienne tentative avant de demander un nouveau
   code.
-- Un problème de reconnexion ne supprime jamais une session déjà enregistrée ;
-  seules les tentatives non enregistrées sont purgées.
+- Le code n'est demandé qu'après le stanza `pair-device` de WhatsApp et une
+  seule fois par socket : une reconnexion interne ne peut donc pas remplacer en
+  arrière-plan le code que l'utilisateur est en train de saisir.
+- `pair-success` est suivi normalement d'une fermeture **515
+  `restartRequired`**. Le bot acquitte d'abord les creds/clefs MongoDB, marque
+  `isNewLogin`, puis ouvre immédiatement un nouveau socket interne sans compter
+  ce redémarrage comme une panne. Le verrou reste fermé aux requêtes externes
+  jusqu'à `connection=open`, afin qu'aucun second code n'écrase le premier. Il ne faut pas attendre
+  `connection=open` sur le premier socket : cet événement arrive sur le second.
+- Les coupures d'une session valide utilisent le backoff ; un logout/état auth
+  définitivement invalide est supprimé, tandis qu'une connexion `440` remplacée
+  est arrêtée sans effacer MongoDB.
+
+### Version et identité du client WhatsApp
+
+Baileys `7.0.0-rc14` contient une révision WhatsApp Web figée qui peut devenir
+obsolète avant la prochaine publication npm. Avant de créer un socket, le bot
+utilise donc `fetchLatestWaWebVersion()` (source directe
+`web.whatsapp.com/sw.js`). La valeur live est partagée par toutes les sessions et
+mise en cache ; si un refresh réseau échoue, une reconnexion conserve la dernière
+bonne révision au lieu de redescendre silencieusement vers le fallback embarqué.
+
+Le navigateur est construit avec `Browsers.ubuntu('Chrome')`. Ce tuple produit
+les libellés canoniques `Chrome (Ubuntu)` exigés plus strictement par le flux
+pairing-code ; l'ancien troisième champ artisanal `20.0.04` n'est plus utilisé.
+`markOnlineOnConnect` ne participe pas au handshake d'appairage (Baileys ne le
+consulte qu'après `connection=open`) et reste donc piloté par `AUTO_ONLINE`.
+
+Si l'hébergeur bloque exceptionnellement la lecture de `sw.js`, définir
+`WA_WEB_VERSION=2.3000.xxxxxxxxxx` avec une révision actuelle. Laisser la variable
+vide est le mode recommandé. `GET /api/session/health` affiche la source/version,
+le navigateur et les phases `pairing-ready`, `pairing-code-issued`,
+`pair-success`, `connection-closed` et `auth-flushed`, sans exposer le code ni les
+clés.
 
 ---
 
@@ -188,6 +220,10 @@ ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
 # Obligatoire : unique stockage des sessions WhatsApp
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
 MONGO_DB=MUGIWARA_NO_PLAG
+
+# Facultatif : le mode normal récupère et met en cache la version live.
+# À renseigner seulement si web.whatsapp.com/sw.js est bloqué.
+WA_WEB_VERSION=
 
 # Requis uniquement pour importer un pack avec .tgs
 # Créez gratuitement un bot avec @BotFather puis collez son token ici.
