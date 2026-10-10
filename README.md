@@ -30,7 +30,7 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
-  - **Statuts de groupe (`.swgc`) :** en privé, affiche les groupes communs, mémorise la cible choisie par numéro, puis publie textes/images/vidéos/audios via `groupStatusMessageV2` sans envoyer de confirmation dans la conversation du groupe.
+  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** le propriétaire choisit le groupe cible en privé, puis publie texte/image/vidéo/audio via `groupStatusMessageV2` sans confirmation dans le chat du groupe. Les textes ont une palette sombre personnalisée et une police WhatsApp plus élégante; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -42,116 +42,132 @@
 
 ## 📁 Structure du Projet
 
-Seuls les fichiers indispensables au démarrage restent à la racine : tout le
-reste est rangé par responsabilité.
-
-```
-├── index.js                  # 🚀 Point d'entrée : serveur Express + montage du routeur
-├── package.json              # 📦 Dépendances et scripts
-├── .env.example              # 🔐 Variables d'environnement documentées
-├── .npmrc                    # ⚙️ legacy-peer-deps (conflit jimp imposé par wileys)
-├── .gitignore / LICENSE / README.md
-│
-├── config/
-│   ├── app.config.js         # ⚙️ Configuration générale lue depuis l'environnement
-│   └── data/                 # 🗂  Données JSON (cjid, commandes sticker/réaction)
-│
+```text
+├── index.js                       # Serveur Express
+├── package.json                   # Baileys officiel, NYXCORE + scripts
+├── .env.example                   # Configuration documentée
 ├── src/
-│   ├── core/
-│   │   ├── pair.js           # 🤖 Moteur Baileys : sockets, commandes, routeur API
-│   │   └── pluginLoader.js   # 🔌 Chargeur + watcher de plugins
-│   ├── auth/                 # 🔐 Persistance des sessions (voir section dédiée)
-│   │   ├── session-store.js      # Écriture atomique, instantanés, quarantaine
-│   │   ├── persistent-auth.js    # État d'auth Baileys persistant (disque + Mongo)
-│   │   ├── mongo-auth-backend.js # Miroir MongoDB des creds ET des clés Signal
-│   │   ├── reconnect.js          # Ordonnanceur de reconnexion unique par session
-│   │   ├── pairing-guard.js      # Verrou d'appairage à libération explicite
-│   │   └── session-purge.js      # Effacement disque + MongoDB d'une session ratée
-│   ├── lib/                  # 🧰 Utilitaires (msg, normalize, s-utils, youtube, safe-send)
-│   ├── handlers/             # 🎯 Gestionnaires métier (antilink, statut, bienvenue)
-│   ├── features/             # ✨ Modules secondaires (tictactoe, traduction, setcmd)
-│   ├── services/             # 🛠  Services transverses (thème, présence, antidelete, …)
-│   └── plugins/              # 📦 Commandes modulaires (surveillées en temps réel)
-│       ├── general/  tools/  ai/  download/  group/  owner/
-│
-├── dashboard/
-│   ├── static/               # 🌐 Pages HTML du tableau de bord (servies sous /dashboard)
-│   ├── pages/                # 📄 Pages publiques (pairing, accueil, suppression)
-│   └── assets/
-│       └── copy-code.js      # 📋 Copie du code d'appairage (servi sur /assets/)
-│
+│   ├── core/pair.js               # Sockets, pairing et API
+│   ├── db/mongo-connection.js     # Connexion MongoDB unique + ping
+│   ├── auth/
+│   │   ├── auth-utils.js          # Validation des creds et numéros
+│   │   ├── mongo-auth-state.js    # Auth Baileys 100 % MongoDB
+│   │   ├── mongo-auth-backend.js  # Codec BufferJSON + collections auth
+│   │   ├── reconnect.js           # Reconnexion avec backoff
+│   │   ├── pairing-guard.js       # Verrou d'appairage
+│   │   └── session-purge.js       # Purge MongoDB ciblée
+│   ├── handlers/ features/ services/ lib/
+│   └── plugins/                   # Commandes rechargées à chaud
 ├── scripts/
-│   └── check-syntax.js       # ✅ `npm run test:syntax` sur tous les fichiers .js
-│
-├── sessions/                 # 🔐 Créé à l'exécution — creds + clés Signal (JAMAIS committé)
-└── test/                     # 🧪 Suite de tests (`npm test`)
+│   ├── check-mongodb.js           # `npm run mongo:check`
+│   └── check-syntax.js
+├── dashboard/
+└── test/
 ```
+
+Il n'existe plus de répertoire `sessions/` utilisé à l'exécution. Les fichiers
+temporaires créés pour traiter des médias ne contiennent jamais l'état
+d'authentification WhatsApp.
 
 ---
 
-## 🔐 Sessions : pourquoi les clés ne se corrompent plus
+## 🔐 Sessions exclusivement dans MongoDB
 
-Trois défauts se combinaient pour produire des sessions mortes et des réponses
-invisibles :
+Les sessions, l’authentification MongoDB et les sockets principaux du bot
+utilisent le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
+`7.0.0-rc14`), sans alias ni fork. Le plugin `.swgc` / `.gcstatus` utilise aussi
+**`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour ses helpers de téléchargement et de
+génération des messages de statut.
 
-| Problème | Conséquence | Correctif |
-| --- | --- | --- |
-| Les sessions vivaient dans `os.tmpdir()` et étaient **supprimées par `process.on('exit')`** | Toute redeployment repartait de zéro | Sessions dans `sessions/<numéro>`, plus jamais supprimées à l'arrêt |
-| Seules les **creds** partaient dans MongoDB ; le champ `keys` recevait `state.keys`, un objet de fonctions sérialisé en `{}` | Les clés Signal (pre-key, session, sender-key) étaient perdues → ratchet désynchronisé | Collection `session_keys` : chaque clé est stockée et rechargée individuellement |
-| `creds.json` écrit de façon **non atomique** | Un kill en pleine écriture laissait un JSON tronqué → « clé corrompue » | Écriture tmp + `fsync` + `rename` ; creds invalides mis en quarantaine |
-| **Deux** gestionnaires `connection.update` reconnectaient chacun de leur côté | Deux sockets sur la même identité, chacun avançant son ratchet | Un seul ordonnanceur, idempotent, avec backoff et nombre maximal de tentatives |
+La méthode `sendGroupStatus()` de NYXCORE n’existe que sur les sockets produits
+par sa propre factory. Pour conserver les sessions actives du projet et éviter
+d’ouvrir une seconde connexion WhatsApp, le plugin installe un petit adaptateur
+`sendGroupStatus()` sur le socket Baileys existant : NYXCORE prépare le message,
+puis ce même socket assure le téléversement média et le relay. Les deux
+paquets sont donc déclarés volontairement. `package.json` force toujours
+`libsignal` sur le commit officiel via `overrides`.
 
-À cela s'ajoute l'envoi fiable (`src/lib/safe-send.js`) : `socket.sendMessage`
-vérifie que la websocket est réellement ouverte, attend la reconnexion si
-besoin, réessaie, puis **lève une erreur explicite** au lieu de faire croire que
-la réponse est partie. C'est ce qui élimine les réponses « en attente » que
-l'utilisateur ne recevait jamais.
+MongoDB est l'unique source de vérité :
+
+| Collection | Contenu |
+| --- | --- |
+| `sessions` | Une entrée de creds par numéro, encodée avec le `BufferJSON` officiel de Baileys |
+| `session_keys` | Une entrée par clé Signal (`pre-key`, `session`, `sender-key`, `app-state-sync-key`, etc.) |
+| `numbers` | Les numéros dont l'appairage a réellement abouti et qui doivent être restaurés au démarrage |
+
+Les creds et clés sont écrits en **write-through** : une mutation n'est validée
+en mémoire qu'après acquittement de MongoDB. Si la base est indisponible, le bot
+refuse de créer un code d'appairage au lieu de basculer silencieusement vers un
+fichier local. Au démarrage, seules les sessions listées dans MongoDB sont
+restaurées.
+
+Le codec BufferJSON conserve exactement les `Buffer`/`Uint8Array` attendus par
+Signal. Les anciens documents contenant directement les champs `creds` et
+`value` sont lus puis migrés automatiquement au premier chargement. En revanche,
+une ancienne session qui ne possède pas ses clés Signal dans `session_keys` doit
+être appairée une nouvelle fois.
+
+Pour valider la connexion, les droits et les index avant de démarrer :
+
+```bash
+npm run mongo:check
+```
+
+La commande effectue un vrai `ping` et crée/vérifie les index uniques utilisés
+par les sessions sans afficher l'URI ni le mot de passe.
 
 **Diagnostic en direct** : `GET /api/session/health` (dashboard authentifié)
-renvoie pour chaque session la source de l'état d'auth, le nombre de clés
-Signal, les écritures en attente, l'état de la websocket et les compteurs
-d'envoi réussis/échoués.
-
-> ⚠️ **Migration** : les sessions créées avant ce correctif n'ont aucune clé
-> Signal en base. Un **nouvel appairage** (`.pair` ou dashboard) est nécessaire
-> une seule fois ; ensuite les clés survivent aux redémarrages.
+indique `stockageSessions: "mongodb"`, l'état de la connexion, le nombre de clés
+Signal, les écritures en attente et l'état de chaque websocket.
 
 ---
 
-## 🔁 Appairage raté : « code indisponible »
+## 🔁 Appairage et purge fiable
 
-Un appairage qui échouait laissait des restes qui **bloquent définitivement** la
-demande suivante :
+- Un socket en attente de code reste séparé des sockets actifs.
+- Un verrou par numéro empêche deux pairings ou deux ratchets concurrents.
+- Un appairage abandonné supprime les creds, les clés Signal et le numéro dans
+  MongoDB ; aucune trace locale n'est créée.
+- La purge attend d'abord les écritures déjà parties avant de supprimer les
+  documents, afin qu'une écriture tardive ne ressuscite pas la session.
+- Une erreur MongoDB renvoie explicitement `503 mongodb_indisponible` ou
+  `mongodb_purge_failed` ; le dashboard ne présente jamais un faux succès.
+- `force=1` détruit proprement l'ancienne tentative avant de demander un nouveau
+  code.
+- Le code n'est demandé qu'après le stanza `pair-device` de WhatsApp et une
+  seule fois par socket : une reconnexion interne ne peut donc pas remplacer en
+  arrière-plan le code que l'utilisateur est en train de saisir.
+- `pair-success` est suivi normalement d'une fermeture **515
+  `restartRequired`**. Le bot acquitte d'abord les creds/clefs MongoDB, marque
+  `isNewLogin`, puis ouvre immédiatement un nouveau socket interne sans compter
+  ce redémarrage comme une panne. Le verrou reste fermé aux requêtes externes
+  jusqu'à `connection=open`, afin qu'aucun second code n'écrase le premier. Il ne faut pas attendre
+  `connection=open` sur le premier socket : cet événement arrive sur le second.
+- Les coupures d'une session valide utilisent le backoff ; un logout/état auth
+  définitivement invalide est supprimé, tandis qu'une connexion `440` remplacée
+  est arrêtée sans effacer MongoDB.
 
-| Reste | Effet sur la demande suivante |
-| --- | --- |
-| Verrou `connectingSessions` relâché seulement par un minuteur de 90 s | Réponse `{ status: 'already_connected_or_connecting' }`, **sans champ `code`** |
-| Socket d'appairage mort ajouté à `activeSockets` | Réponse `{ status: 'already_connected' }`, **sans champ `code`** |
-| `sessions/<numéro>/creds.json` conservé | `creds.registered` vrai → le bloc de demande de code est sauté → **aucune réponse envoyée** |
-| Document `sessions` en base | Le numéro est restauré à chaque démarrage pour générer un code que personne ne saisira |
+### Version et identité du client WhatsApp
 
-Le dashboard, ne trouvant ni `code` ni `pairingCode`, affichait alors
-`Indisponible` — de façon permanente.
+Baileys `7.0.0-rc14` contient une révision WhatsApp Web figée qui peut devenir
+obsolète avant la prochaine publication npm. Avant de créer un socket, le bot
+utilise donc `fetchLatestWaWebVersion()` (source directe
+`web.whatsapp.com/sw.js`). La valeur live est partagée par toutes les sessions et
+mise en cache ; si un refresh réseau échoue, une reconnexion conserve la dernière
+bonne révision au lieu de redescendre silencieusement vers le fallback embarqué.
 
-### Correctif
+Le navigateur est construit avec `Browsers.ubuntu('Chrome')`. Ce tuple produit
+les libellés canoniques `Chrome (Ubuntu)` exigés plus strictement par le flux
+pairing-code ; l'ancien troisième champ artisanal `20.0.04` n'est plus utilisé.
+`markOnlineOnConnect` ne participe pas au handshake d'appairage (Baileys ne le
+consulte qu'après `connection=open`) et reste donc piloté par `AUTO_ONLINE`.
 
-- **`src/auth/pairing-guard.js`** — verrou à **libération explicite**. Le TTL ne
-  sert plus que de filet si le processus meurt en plein appairage.
-- **`src/auth/session-purge.js`** — effacement de toutes les traces persistantes :
-  dossier `sessions/<numéro>`, ancien dossier temporaire, collection `sessions`
-  (creds), collection `session_keys` (clés Signal) et collection `numbers`.
-  L'état d'authentification est **jeté** (`discard()`) et non sauvegardé
-  (`close()`), sans quoi la purge réécrirait les creds qu'elle vient d'effacer.
-- **Les sockets d'appairage sont séparés des sessions connectées** : un socket en
-  attente de code n'est plus pris pour une session active.
-- **Chaque chemin d'échec purge** : creds invalides, code impossible à générer,
-  erreur d'appairage, connexion fermée avant enregistrement.
-- **Un appairage abandonné n'est plus reconnecté en boucle** : il est purgé.
-- **Toujours une réponse HTTP explicite** : `502 code_indisponible` avec la vraie
-  raison, `session_existante`, `already_connected`, `appairage_en_cours`.
-- **Le dashboard** affiche le message réel, propose **« Réessayer maintenant »**
-  après un échec et **« Forcer un nouveau code »** si un appairage est déjà en
-  attente (`/code?number=…&force=1`).
+Si l'hébergeur bloque exceptionnellement la lecture de `sw.js`, définir
+`WA_WEB_VERSION=2.3000.xxxxxxxxxx` avec une révision actuelle. Laisser la variable
+vide est le mode recommandé. `GET /api/session/health` affiche la source/version,
+le navigateur et les phases `pairing-ready`, `pairing-code-issued`,
+`pair-success`, `connection-closed` et `auth-flushed`, sans exposer le code ni les
+clés.
 
 ---
 
@@ -188,15 +204,15 @@ n'écrivait plus le code dans un attribut et copiait donc parfois le libellé
 ## ⚙️ Installation & Démarrage
 
 ### 1. Prérequis
-- **Node.js** >= 18.x
+- **Node.js** >= 22.12 (interop CommonJS avec le paquet ESM de Baileys 7)
 - **FFmpeg** (pour la conversion audio/vidéo et stickers)
-- **MongoDB** (cluster local ou MongoDB Atlas)
+- **MongoDB** (cluster local ou MongoDB Atlas) accessible en permanence
 
 ### 2. Cloner le dépôt et installer les dépendances
 ```bash
-git clone https://github.com/Plag-509-5/gitposttt.git
-cd gitposttt
-npm install --legacy-peer-deps
+git clone https://github.com/Plag-509-5/bot.git
+cd bot
+npm install
 ```
 
 ### 3. Configuration de l'environnement
@@ -212,7 +228,13 @@ OWNER_NUMBER=50947440869
 PREFIX=.
 # Obligatoire : accès au dashboard par mot de passe uniquement
 ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
+# Obligatoire : unique stockage des sessions WhatsApp
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
+MONGO_DB=MUGIWARA_NO_PLAG
+
+# Facultatif : le mode normal récupère et met en cache la version live.
+# À renseigner seulement si web.whatsapp.com/sw.js est bloqué.
+WA_WEB_VERSION=
 
 # Requis uniquement pour importer un pack avec .tgs
 # Créez gratuitement un bot avec @BotFather puis collez son token ici.
@@ -237,10 +259,14 @@ CATBOX_USER_HASH=
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
 
-### 4. Lancer le Bot
+### 4. Tester MongoDB puis lancer le bot
 ```bash
+npm run mongo:check
 npm start
 ```
+
+N'essaie pas d'appairer un numéro tant que `mongo:check` n'affiche pas
+`MongoDB accessible`. Il n'existe volontairement aucun mode session locale.
 
 Le serveur démarrera sur `http://localhost:3000` :
 - **Page de pairing :** `http://localhost:3000/pair`
@@ -259,13 +285,16 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
-### Statut de groupe privé avec `.swgc`
+### Statut de groupe privé avec `.swgc` / `.gcstatus`
 
-1. Envoie `.swgc` au bot en conversation privée.
-2. Réponds avec le numéro du groupe affiché.
-3. Envoie `.swgc ton texte` ou réponds à une image, vidéo ou note audio avec `.swgc`.
+1. Le propriétaire du bot envoie `.swgc` (ou `.gcstatus`) au bot en conversation privée.
+2. Il répond avec le numéro du groupe affiché; le choix expire après cinq minutes.
+3. Il publie avec `.swgc ton texte, violet` (ou `.gcstatus`) ou répond à une image, vidéo ou note audio avec la commande.
+4. Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Le bot conserve le socket et le fork `xzcbailz` existants. Pour chaque publication, le média est préparé et téléversé avant d’être enveloppé dans `groupStatusMessageV2`; le message interne reçoit `contextInfo.isGroupStatus = true` et `relayMessage()` ajoute la métadonnée stanza `is_group_status="true"`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+
+Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
 
 ---
 

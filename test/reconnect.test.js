@@ -122,6 +122,53 @@ test('onReconnect reçoit le numéro et le compteur de tentatives', async () => 
   assert.equal(again.attempt, 2);
 });
 
+test('le redémarrage 515 est immédiat et ne consomme aucune tentative', async () => {
+  const clock = fakeClock();
+  const received = [];
+  const scheduler = createReconnectScheduler({
+    baseMs: 5000,
+    jitterMs: 0,
+    random: () => 0,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+    onReconnect: async (number, context) => { received.push({ number, ...context }); }
+  });
+
+  const planned = scheduler.scheduleImmediate('50951500000', { reason: 'restart-required' });
+  assert.equal(planned.scheduled, true);
+  assert.equal(planned.delayMs, 0);
+  assert.equal(planned.attempt, 0);
+  assert.equal(scheduler.getAttempts('50951500000'), 0);
+  assert.deepEqual(clock.delays(), [0]);
+
+  await clock.runAll();
+  assert.equal(received.length, 1);
+  assert.equal(received[0].immediate, true);
+  assert.equal(received[0].reason, 'restart-required');
+  assert.equal(scheduler.getAttempts('50951500000'), 0);
+});
+
+test('un 515 remplace une reconnexion différée déjà programmée', () => {
+  const clock = fakeClock();
+  const scheduler = createReconnectScheduler({
+    baseMs: 5000,
+    jitterMs: 0,
+    random: () => 0,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+    onReconnect: async () => {}
+  });
+
+  scheduler.schedule('50951500001');
+  assert.deepEqual(clock.delays(), [5000]);
+  const immediate = scheduler.scheduleImmediate('50951500001');
+  assert.equal(immediate.scheduled, true);
+  assert.deepEqual(clock.delays(), [0]);
+  // La tentative différée avait déjà été comptée, mais le remplacement 515
+  // n'en ajoute pas une deuxième.
+  assert.equal(scheduler.getAttempts('50951500001'), 1);
+});
+
 test('reset annule la reconnexion en attente et remet le compteur à zéro', async () => {
   const clock = fakeClock();
   const launched = [];

@@ -5,8 +5,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Sessions WhatsApp : creds + clés Signal. JAMAIS à committer.
-# (attention : ne PAS ignorer « auth/ » en clair, ça masquerait src/auth/)
+# Protection contre d'anciens exports locaux (le bot actuel utilise MongoDB
+# uniquement). Ne jamais committer de creds historiques.
 /sessions/
 session/
 session_*

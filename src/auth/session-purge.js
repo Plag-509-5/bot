@@ -1,116 +1,77 @@
 'use strict';
 
 /**
- * session-purge.js — effacement de TOUTES les traces persistantes d'une session.
+ * Purge MongoDB d'une session WhatsApp.
  *
- * Pourquoi ce module existe
- * -------------------------
- * Un appairage raté laissait derrière lui :
- *   - `sessions/<numéro>/creds.json` sur disque,
- *   - un document dans la collection `sessions` (écrit par `creds.update`),
- *   - d'éventuelles clés dans `session_keys`,
- *   - le numéro dans la collection `numbers`.
- *
- * À la demande suivante, `creds.registered` pouvait valoir `true` : le bloc de
- * demande de code était sauté, aucune réponse n'était envoyée, et le dashboard
- * affichait « Indisponible ». Il faut donc tout effacer, **y compris MongoDB**.
- *
- * Les dépendances sont injectées pour que le nettoyage puisse être testé sans
- * MongoDB ni WhatsApp.
+ * Il n'y a aucun dossier local à nettoyer. L'ordre est important : on attend
+ * d'abord les écritures auth déjà parties, puis on supprime creds, clés Signal
+ * et numéro. Ainsi, aucune écriture tardive ne peut ressusciter la session.
  */
 
-const os = require('node:os');
-const path = require('node:path');
-const fs = require('node:fs');
-const defaultStore = require('./session-store');
+const { sanitizeNumber } = require('./auth-utils');
 
 function createSessionPurger(options = {}) {
   const {
-    sessionStore = defaultStore,
-    authBackend = null,
-    removeSession = null,
+    authBackend,
     removeNumber = null,
-    tmpDir = os.tmpdir(),
-    removeSync = (target) => fs.rmSync(target, { recursive: true, force: true }),
     logger = console
   } = options;
 
-  function warn(message, err) {
-    if (logger && typeof logger.warn === 'function') {
-      logger.warn(message, err && err.message ? err.message : err);
+  function warn(message, error) {
+    if (typeof logger?.warn === 'function') {
+      logger.warn(message, error?.message || error);
     }
   }
 
-  /**
-   * @param {string} number
-   * @param {{ auth?: object, reason?: string }} context
-   *   `auth` : état d'authentification à JETER. On appelle `discard()` et non
-   *   `close()` : `close()` vide les écritures en attente sur disque et dans
-   *   MongoDB, ce qui ressusciterait la session qu'on est en train d'effacer.
-   * @returns {Promise<{ok: boolean, number: string, traces: string[]}>}
-   */
   async function purge(number, context = {}) {
     const { auth = null, reason = 'session ratée' } = context;
-    const sanitized = sessionStore.sanitizeNumber(number);
+    const sanitized = sanitizeNumber(number);
     if (!sanitized) {
-      return { ok: false, number: '', traces: [], reason: 'numéro invalide' };
+      return { ok: false, number: '', traces: [], errors: ['numéro invalide'], reason: 'numéro invalide' };
     }
 
     const traces = [];
+    const errors = [];
 
-    // 1) État d'authentification : jeté sans écriture.
     if (auth) {
       try {
-        if (typeof auth.discard === 'function') auth.discard();
-        traces.push('état-auth');
-      } catch (err) {
-        warn(`[PURGE ${sanitized}] discard de l'état d'auth :`, err);
+        if (typeof auth.discard === 'function') await auth.discard();
+        traces.push('mémoire-auth');
+      } catch (error) {
+        errors.push(`discard auth: ${error?.message || error}`);
+        warn(`[PURGE ${sanitized}] abandon de l'état auth :`, error);
       }
     }
 
-    // 2) Disque : dossier persistant, puis ancien dossier temporaire hérité des
-    //    versions qui stockaient les sessions dans tmp.
-    try {
-      await sessionStore.removeAuthDir(sessionStore.sessionDir(sanitized));
-      traces.push(`sessions/${sanitized}`);
-    } catch (err) {
-      warn(`[PURGE ${sanitized}] dossier de session :`, err);
-    }
-    try {
-      removeSync(path.join(tmpDir, `session_${sanitized}`));
-      traces.push('tmp');
-    } catch (err) {
-      // Absent la plupart du temps : rien à signaler.
-    }
-
-    // 3) MongoDB : clés Signal + creds d'abord (authBackend gère les deux
-    //    collections), puis les collections historiques.
-    if (authBackend && typeof authBackend.remove === 'function') {
+    if (!authBackend || typeof authBackend.remove !== 'function') {
+      errors.push('backend MongoDB absent');
+    } else {
       try {
         await authBackend.remove(sanitized);
-        traces.push('mongo:sessions+session_keys');
-      } catch (err) {
-        warn(`[PURGE ${sanitized}] authBackend.remove :`, err);
+        traces.push('mongodb:sessions+session_keys');
+      } catch (error) {
+        errors.push(`sessions MongoDB: ${error?.message || error}`);
+        warn(`[PURGE ${sanitized}] suppression de l'auth MongoDB :`, error);
       }
     }
-    if (typeof removeSession === 'function') {
-      try {
-        await removeSession(sanitized);
-        traces.push('mongo:sessions');
-      } catch (err) {
-        warn(`[PURGE ${sanitized}] removeSession :`, err);
-      }
-    }
+
     if (typeof removeNumber === 'function') {
       try {
         await removeNumber(sanitized);
-        traces.push('mongo:numbers');
-      } catch (err) {
-        warn(`[PURGE ${sanitized}] removeNumber :`, err);
+        traces.push('mongodb:numbers');
+      } catch (error) {
+        errors.push(`numéro MongoDB: ${error?.message || error}`);
+        warn(`[PURGE ${sanitized}] suppression du numéro MongoDB :`, error);
       }
     }
 
-    return { ok: true, number: sanitized, traces, reason };
+    return {
+      ok: errors.length === 0,
+      number: sanitized,
+      traces,
+      errors,
+      reason
+    };
   }
 
   return { purge };

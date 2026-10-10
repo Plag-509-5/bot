@@ -32,7 +32,7 @@ function createReconnectScheduler(options = {}) {
     random = Math.random
   } = options;
 
-  const timers = new Map();   // number -> timer
+  const timers = new Map();   // number -> { handle, immediate }
   const attempts = new Map(); // number -> count
 
   function computeDelay(attempt) {
@@ -49,7 +49,7 @@ function createReconnectScheduler(options = {}) {
     const key = String(number);
     const timer = timers.get(key);
     if (timer) {
-      clearTimeoutFn(timer);
+      clearTimeoutFn(timer.handle);
       timers.delete(key);
     }
   }
@@ -63,10 +63,23 @@ function createReconnectScheduler(options = {}) {
     return attempts.get(String(number)) || 0;
   }
 
+  function arm(key, { attempt, delayMs, immediate, context }) {
+    const handle = setTimeoutFn(async () => {
+      timers.delete(key);
+      try {
+        await onReconnect(key, { ...context, attempt, immediate });
+      } catch (err) {
+        console.error(`[RECONNECT ${key}] échec :`, err && err.message ? err.message : err);
+      }
+    }, delayMs);
+    if (handle && typeof handle.unref === 'function') handle.unref();
+    timers.set(key, { handle, immediate });
+    return { scheduled: true, attempt, delayMs, immediate };
+  }
+
   /**
-   * Programme une reconnexion. Idempotent : si une reconnexion est déjà en
-   * attente pour ce numéro, l'appel ne fait rien.
-   * @returns {{scheduled: boolean, reason?: string, attempt?: number, delayMs?: number}}
+   * Programme une reconnexion avec backoff. Idempotent : si une reconnexion est
+   * déjà en attente pour ce numéro, l'appel ne fait rien.
    */
   function schedule(number, context = {}) {
     const key = String(number);
@@ -85,21 +98,41 @@ function createReconnectScheduler(options = {}) {
     }
 
     attempts.set(key, attempt);
-    const delayMs = computeDelay(attempt);
-    const timer = setTimeoutFn(async () => {
-      timers.delete(key);
-      try {
-        await onReconnect(key, { attempt, ...context });
-      } catch (err) {
-        console.error(`[RECONNECT ${key}] échec :`, err && err.message ? err.message : err);
-      }
-    }, delayMs);
-    if (timer && typeof timer.unref === 'function') timer.unref();
-    timers.set(key, timer);
-    return { scheduled: true, attempt, delayMs };
+    return arm(key, {
+      attempt,
+      delayMs: computeDelay(attempt),
+      immediate: false,
+      context
+    });
   }
 
-  return { schedule, cancel, reset, isPending, getAttempts, computeDelay };
+  /**
+   * Le 515 post-pairing n'est pas une panne ni une tentative : WhatsApp attend
+   * le nouveau socket immédiatement. Cette voie ne consomme donc aucun essai de
+   * backoff. Elle remplace une éventuelle reconnexion différée déjà planifiée.
+   */
+  function scheduleImmediate(number, context = {}) {
+    const key = String(number);
+    const existing = timers.get(key);
+    if (existing?.immediate) {
+      return {
+        scheduled: false,
+        reason: 'deja-programmee',
+        attempt: attempts.get(key) || 0,
+        immediate: true
+      };
+    }
+    if (existing) cancel(key);
+
+    return arm(key, {
+      attempt: attempts.get(key) || 0,
+      delayMs: 0,
+      immediate: true,
+      context
+    });
+  }
+
+  return { schedule, scheduleImmediate, cancel, reset, isPending, getAttempts, computeDelay };
 }
 
 module.exports = { createReconnectScheduler };

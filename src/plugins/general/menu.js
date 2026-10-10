@@ -187,39 +187,118 @@ function buildClassicMenuText({ botName, ownerName, userName, prefix, mode, upti
   return lines.join('\n');
 }
 
-function buildMenuText({ botName, ownerName, userName, prefix, mode, uptime, year, categories, legacyCommands }) {
-  const prefixLabel = prefix ? `[ ${prefix} ]` : '[ PREFIXLESS ]';
-  const commandSections = buildCommandSections(categories, legacyCommands, prefix);
-  const headerBotName = bold(String(botName || 'KAIDO MD').replace(/[-_]+/g, ' ').toUpperCase());
+function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, categories, legacyCommands }) {
+  const p = prefix || '.';
+  const commandTotal = buildCommandSections(categories, legacyCommands, p).total;
 
-  let text = `${TOP_DIVIDER}\n\n` +
-    '```\n' +
-    `       ⛩  ${headerBotName} ⛩\n\n` +
-    '    ❖   ᵇʸ 𝑷 𝐥 ᗩ 𝗚 ❖\n\n' +
-    `     ⛩  ${bold('ONIGASHIMA THEME')}  ⛩\n` +
-    '```\n\n' +
-    `${TOP_DIVIDER}\n\n` +
-    `${sectionHeader('INFORMATIONS', '⛩')}\n\n` +
-    `   ❈  ${italic('OWNER')}   ⟿   ${bold(ownerName)}\n` +
-    `   ❈  ${italic('USER')}    ⟿   ${bold(userName)}\n` +
-    `   ❈  ${italic('PREFIX')}  ⟿   ${prefixLabel}\n` +
-    `   ❈  ${bold('MODE')}    ⟿   ${italic(String(mode || 'public').toUpperCase())}\n` +
-    `   ❈  ${bold('UPTIME')}  ⟿   ${uptime}\n` +
-    `   ❈  ${bold('STATUS')}  ⟿   ⧉ ${italic('ONLINE')} ⧉\n` +
-    `   ❈  ${bold('COMMANDS')} ⟿   ${commandSections.total}\n\n`;
+  return `
+⛩️  𝐊𝐀𝐈𝐃𝐎 - 𝐌𝐃  ⛩️
+             ─── ᵇʸ ᑭ𝗹𝖺𝘨 ───
 
-  for (const section of commandSections.sections) {
-    text += `${sectionHeader(section.title, section.icon)}\n\n${section.lines.join('\n')}\n\n`;
-  }
+\`❦︎ ᴀᴛ 1ꪜᦓ1 𝑎𝑙𝑤𝑎𝑦𝑠 ᵇᵉᵗ ᵒⁿ ᵏᵃⁱᵈᵒ ❦︎\`
 
-  text += `${TOP_DIVIDER}\n\n` +
-    '```\n' +
-    ` ⟅ 雷 ⟆  ${italic('POWERED BY')}  ⟅ 雷 ⟆\n\n` +
-    `       ❖  ${bold('PLAG TECH')}  ❖\n\n` +
-    `    ⛩  雷 ${bold('KAIDO MD')} @${year} 雷  ⛩\n` +
-    '```\n\n' +
-    `${TOP_DIVIDER}`;
-  return text;
+｢ 👤 𝐔𝐭𝐢𝐥𝐢𝐬𝐚𝐭𝐞𝐮𝐫 : ${userTag} ｣
+｢ 🔰 𝐒𝐞𝐬𝐬𝐢𝐨𝐧𝐬 𝐚𝐜𝐭𝐢𝐯𝐞𝐬 : ${activeCount} ｣
+｢ 📜 𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐞𝐬 : ${commandTotal} ｣
+
+✵ Ⓟ︎ : 𝖯𝖱𝖤𝖬𝖨𝖴𝖬
+✵ Ⓛ︎ : 𝖫𝖨𝖬𝖨𝖳𝖤𝖲 𝖰𝖴𝖮𝖳
+
+**site officiel** : https://kaidomd-byplag.mooo.com/
+
+> 〢  𝐌𝐄𝐍𝐔 𝐏𝐑𝐈𝐍𝐂𝐈𝐏𝐀𝐋 ✿︎
+
+> ・ ${p}menu
+> ・ ${p}ping
+> ・ ${p}aide / ${p}help
+> ・ ${p}owner
+> ・ ${p}alive
+
+> 〢 𝐆𝐑𝐎𝐔𝐏𝐄 ᯽
+
+> ・ ${p}kick
+> ・ ${p}add
+> ・ ${p}leave
+> ・ ${p}tagall
+> ・ ${p}hidetag / ${p}h
+> ・ ${p}mute
+> ・ ${p}unmute
+> ・ ${p}swgc / ${p}gcstatus (statut de groupe privé)
+> ・ ${p}setgpp
+> ・ ${p}listadmin
+> ・ ${p}creategroup
+> ・ ${p}acceptall
+> ・ ${p}revokeall
+> ・ ${p}listactive
+> ・ ${p}listinactive
+> ・ ${p}kickinactive
+> ・ ${p}kickall
+> ・ ${p}antilink
+> ・ ${p}antistatusmention
+
+> 〢 𝐉𝐄𝐔𝐗 🎮
+
+> ・ ${p}tictactoe / ${p}ttt
+
+> 〢 𝐎𝐔𝐓𝐈𝐋𝐒 ⚒️
+
+> ・ ${p}ai
+> ・ ${p}setcmd
+> ・ ${p}sticker
+> ・ ${p}take
+> ・ ${p}trt
+> ・ ${p}tovn
+> ・ ${p}save
+> ・ ${p}vv
+> ・ ${p}bible
+> ・ ${p}upch
+> ・ ${p}img
+> ・ ${p}jid
+> ・ ${p}cjid
+> ・ ${p}rch Ⓟ︎
+> ・ ${p}code
+> ・ ${p}getpp
+> ・ ${p}setpp
+> ・ ${p}setlang
+> ・ ${p}ssweb
+> ・ ${p}checkban
+> ・ ${p}shazam
+> ・ ${p}mediafire
+> ・ ${p}setcmd
+> ・ ${p}listcmd
+> ・ ${p}delcmd
+
+> 〢 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 ✿︎
+
+> ・ ${p}play Ⓛ︎
+> ・ ${p}playvideo Ⓛ︎
+> ・ ${p}playptt Ⓛ︎
+> ・ ${p}tiktok
+> ・ ${p}facebook
+> ・ ${p}ig
+> ・ ${p}modapk
+
+> 〢 𝐏𝐀𝐑𝐀𝐌𝐒 𖣘
+
+> ・ ${p}mode (public/private)
+> ・ ${p}config show
+> ・ ${p}config autoview
+> ・ ${p}config autolike
+> ・ ${p}config autorec
+> ・ ${p}config setemoji
+> ・ ${p}config setprefix
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+                🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+*STATUT BOT*
+• Uptime: ${uptime}
+• Prefix: ${p}
+• Version: ${version}
+
+${footer}
+`.trim();
 }
 
 module.exports = {
@@ -239,7 +318,8 @@ module.exports = {
     config,
     sessionCfg,
     legacyCommands,
-    getPluginsByCategory
+    getPluginsByCategory,
+    activeSockets
   }) {
     const year = new Intl.DateTimeFormat('en', {
       timeZone: 'America/Port-au-Prince',
@@ -249,9 +329,13 @@ module.exports = {
       botName: sessionCfg?.botName || config?.BOT_NAME || 'KAIDO MD',
       ownerName: cleanDisplayName(config?.OWNER_NAME, 'PLAG'),
       userName: cleanDisplayName(pushName, `@${senderNumber}`),
+      userTag: `@${senderNumber || (typeof sender === 'string' ? sender.split('@')[0] : 'user')}`,
       prefix,
       mode: sessionCfg?.MODE || 'public',
       uptime: formatUptime(process.uptime()),
+      version: config?.BOT_VERSION || '1.0.0',
+      footer: config?.BOT_FOOTER || '© 2026 KAIDO-MD',
+      activeCount: activeSockets?.size ? activeSockets.size : 1,
       year,
       categories: getPluginsByCategory ? getPluginsByCategory() : {},
       legacyCommands: Array.isArray(legacyCommands) ? legacyCommands : []

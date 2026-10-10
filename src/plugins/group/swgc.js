@@ -13,8 +13,13 @@ const {
 const { buildGroupStatusPayload } = require('../../services/group-status-content');
 
 function groupStatusConfirmation(type, subject) {
-  const label = type === 'text' ? 'texte' : type;
-  return `Statut ${label} posté sur : ${subject}`;
+  const labels = {
+    text: 'texte',
+    image: 'image',
+    video: 'vidéo',
+    audio: 'audio stylisé en vidéo'
+  };
+  return `Statut ${labels[type] || type} posté sur : ${subject}`;
 }
 
 async function sendPrivate(socket, jid, content, options) {
@@ -45,7 +50,10 @@ async function executeSwgc(context, dependencies = {}) {
     sessionNumber,
     args,
     prefix,
-    quotedMsg
+    quotedMsg,
+    isOwner,
+    isSessionOwner,
+    isSudo
   } = context;
   const isGroupCommand = String(from || '').endsWith('@g.us');
   const actorId = actorIdFromMessage(socket, msg, from);
@@ -63,14 +71,21 @@ async function executeSwgc(context, dependencies = {}) {
   ];
   const textInput = args.join(' ').trim();
 
+  // Même garde d’accès que les autres commandes propriétaire; les refus restent
+  // privés, y compris quand la commande a été lancée depuis un groupe.
+  if (!(isOwner || isSessionOwner || isSudo)) {
+    return sendPrivate(socket, privateJid, {
+      text: '🚫 Cette commande est réservée au propriétaire de la session.'
+    }, isGroupCommand ? undefined : { quoted: msg });
+  }
+
   try {
     let target = isGroupCommand
       ? { jid: from, subject: 'ce groupe' }
       : getSelectedGroup(sessionNumber, actorId);
 
     // En privé, `.swgc` seul ouvre toujours le sélecteur et permet aussi de
-    // changer un groupe déjà mémorisé. Une commande avec contenu utilise la
-    // cible précédemment sélectionnée.
+    // changer un groupe déjà mémorisé. La publication reste indépendante du chat.
     if (!isGroupCommand && !quotedMsg && !textInput) {
       const groups = await listUserGroups(socket, identifiers);
       if (!groups.length) {
@@ -107,19 +122,32 @@ async function executeSwgc(context, dependencies = {}) {
       }
     }
 
-    const downloadContent = dependencies.downloadContent
-      || require('@whiskeysockets/baileys').downloadContentFromMessage;
-    const publishGroupStatus = dependencies.publishGroupStatus
-      || require('../../handlers/status').groupStatus;
+    let downloadContent = dependencies.downloadContent;
+    if (!downloadContent) {
+      const nyxBaileys = await import('@nyxcore/nyxcoresocket');
+      downloadContent = nyxBaileys.downloadContentFromMessage;
+    }
     const built = await buildGroupStatusPayload({
       quotedMessage: quotedMsg,
       textInput,
-      downloadContent
+      downloadContent,
+      audioToStatusVideo: dependencies.audioToStatusVideo
     });
-    await publishGroupStatus(socket, target.jid, built.payload);
 
-    // Important : aucune réaction, confirmation ou texte n’est envoyé dans
-    // le groupe. Le seul envoi vers le JID du groupe est groupStatusMessageV2.
+    let sendGroupStatus;
+    if (dependencies.publishGroupStatus) {
+      sendGroupStatus = (jid, payload) => dependencies.publishGroupStatus(socket, jid, payload);
+    } else {
+      const { installGroupStatusMethod } = require('../../handlers/status');
+      const adapter = installGroupStatusMethod(socket);
+      sendGroupStatus = typeof socket.sendGroupStatus === 'function'
+        ? socket.sendGroupStatus.bind(socket)
+        : adapter;
+    }
+    await sendGroupStatus(target.jid, built.payload);
+
+    // Aucune réaction, confirmation ou texte n’est envoyé dans le groupe. Le
+    // seul envoi à la cible est le statut groupStatusMessageV2 lui-même.
     return sendPrivate(socket, privateJid, {
       text: groupStatusConfirmation(built.type, target.subject)
     }, isGroupCommand ? undefined : { quoted: msg });
@@ -133,10 +161,10 @@ async function executeSwgc(context, dependencies = {}) {
 
 module.exports = {
   name: 'swgc',
-  alias: ['groupstatus', 'statusgroup'],
+  alias: ['groupstatus', 'statusgroup', 'gcstatus'],
   category: 'group',
-  description: 'Choisit en privé un groupe puis y publie un statut sans message dans le chat',
-  usage: '.swgc | .swgc <texte> | répondre à un média avec .swgc',
+  description: 'Choisit en privé un groupe puis y publie texte ou média sans message dans le chat',
+  usage: '.swgc / .gcstatus | .swgc <texte>[, couleur] | répondre à un média avec .swgc',
   execute: executeSwgc,
   _test: { groupStatusConfirmation, sendPrivate, ensureMembership, executeSwgc }
 };

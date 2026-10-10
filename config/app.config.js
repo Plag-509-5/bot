@@ -27,8 +27,8 @@ module.exports = {
     OTP_EXPIRY: 300000,
     ADMIN_PASS: process.env.ADMIN_PASS || '',
     
-    // Base de données MongoDB
-    MONGO_URI: process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb+srv://test2_db_user:cSq3iGhurIFh9xpp@clusterrender.v8sosxk.mongodb.net/?appName=Clusterrender',
+    // Base de données MongoDB (obligatoire, aucun identifiant par défaut)
+    MONGO_URI: process.env.MONGO_URI || '',
     MONGO_DB: process.env.MONGO_DB || 'MUGIWARA_NO_PLAG',
 
     // Clés API Optionnelles

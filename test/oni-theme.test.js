@@ -171,25 +171,29 @@ test('le menu répertorie les commandes et alias réels sans reprendre les exemp
   assert.equal(catalog.total, 14);
 });
 
-test('le menu complet respecte le nouveau cadre et le mode prefixless', () => {
+test('le menu complet reprend le texte KAIDO-MD validé pour le thème par défaut', () => {
   const text = menuPlugin._test.buildMenuText({
-    botName: 'KAIDO-MD',
-    ownerName: 'PLAG',
-    userName: 'Mugiwara',
-    prefix: '',
-    mode: 'public',
-    uptime: '1h 2m',
-    year: '2026',
+    userTag: '@50912345678',
+    prefix: '!',
+    uptime: '1h 2m 3s',
+    version: '2.0.0',
+    footer: 'PIED DE PAGE',
+    activeCount: 3,
     categories: { general: [{ name: 'menu', aliases: ['menu', 'help'] }] },
-    legacyCommands: ['ping']
+    legacyCommands: ['ping', 'swgc']
   });
 
-  assert.match(text, /𝗞𝗔𝗜𝗗𝗢 𝗠𝗗/);
-  assert.match(text, /𝗢𝗡𝗜𝗚𝗔𝗦𝗛𝗜𝗠𝗔 𝗧𝗛𝗘𝗠𝗘/);
-  assert.match(text, /\[ PREFIXLESS \]/);
-  assert.match(text, /𝙢𝙚𝙣𝙪/);
-  assert.match(text, /𝗣𝗟𝗔𝗚 𝗧𝗘𝗖𝗛/);
-  assert.match(text, /𝗞𝗔𝗜𝗗𝗢 𝗠𝗗 @2026/);
+  assert.match(text, /⛩️  𝐊𝐀𝐈𝐃𝐎 - 𝐌𝐃  ⛩️/);
+  assert.match(text, /─── ᵇʸ ᑭ𝗹𝖺𝘨 ───/);
+  assert.match(text, /｢ 👤 𝐔𝐭𝐢𝐥𝐢𝐬𝐚𝐭𝐞𝐮𝐫 : @50912345678 ｣/);
+  assert.match(text, /｢ 🔰 𝐒𝐞𝐬𝐬𝐢𝐨𝐧𝐬 𝐚𝐜𝐭𝐢𝐯𝐞𝐬 : 3 ｣/);
+  assert.match(text, /｢ 📜 𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐞𝐬 : 4 ｣/);
+  assert.match(text, /> ・ !menu\n> ・ !ping/);
+  assert.match(text, /> ・ !swgc/);
+  assert.match(text, /🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉/);
+  assert.match(text, /• Uptime: 1h 2m 3s\n• Prefix: !\n• Version: 2\.0\.0/);
+  assert.match(text, /PIED DE PAGE$/);
+  assert.doesNotMatch(text, /&gt;|\$\{/, 'pas d’entité HTML ni d’interpolation brute');
 });
 
 test('ping utilise exactement le nouveau style sans ancien cadre', () => {
