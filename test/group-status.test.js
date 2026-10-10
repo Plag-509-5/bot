@@ -219,6 +219,15 @@ test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
   assert.match(graph, /0x0B0D19/);
   assert.match(graph, /alpha='min\(1,max\(0,/);
   assert.match(graph, /600\*t\/65\.00/);
+  const personalGraph = audioStatus.buildAudioStatusFilterGraph({
+    fontPath: '/app/assets/fonts/Poppins-SemiBold.ttf',
+    textPaths: paths,
+    durationSeconds: 65,
+    design: { background: '0x0B1020', cyan: '0x25D366' }
+  });
+  assert.match(personalGraph, /0x0B1020/);
+  assert.match(personalGraph, /colors=0x25D366/);
+  assert.match(graph, /colors=0x58E1E8/, 'le branding KAIDO reste la valeur par défaut des statuts de groupe');
   assert.ok(fs.existsSync(audioStatus.FONT_CANDIDATES[0]));
   assert.ok(fs.existsSync(path.join(__dirname, '..', 'assets', 'fonts', 'OFL-Poppins.txt')));
   assert.equal(audioStatus.formatTime(65), '01:05');
@@ -287,14 +296,10 @@ test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les 
     assert.equal(decoded.messageContextInfo?.messageSecret?.length, 32);
     assert.equal(call.jid, '123456@g.us');
     assert.ok(media, `${messageType} absent de groupStatusMessageV2`);
-    assert.equal(media.contextInfo?.isGroupStatus, true);
     assert.ok(call.message.messageContextInfo?.messageSecret);
     assert.equal(call.message.messageContextInfo.messageSecret.length, 32);
-    assert.deepEqual(call.options.additionalNodes, [{
-      tag: 'meta',
-      attrs: { is_group_status: 'true' },
-      content: undefined
-    }]);
+    assert.equal(call.options.messageId, result.key.id);
+    assert.equal(call.options.additionalNodes, undefined);
     if (payload.mimetype) assert.equal(media.mimetype, payload.mimetype);
     if (payload.caption) assert.equal(media.caption, payload.caption);
     if (type === 'text') {
@@ -313,12 +318,7 @@ test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les 
   await assert.rejects(groupStatus(socket, '123456@s.whatsapp.net', { text: 'non' }), /JID @g\.us/);
 });
 
-test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay', () => {
-  // `.swgc` dépend de deux capacités vérifiées dans le paquet officiel :
-  //   1. relayMessage accepte `additionalNodes` et les ajoute à la stanza ;
-  //   2. le schéma officiel contient `groupStatusMessageV2`.
-  // Sans elles, le statut part sans le nœud `meta` et n'apparaît pas comme
-  // statut de groupe.
+test('Baileys classe correctement les médias après déballage du statut de groupe V2', () => {
   const baileysEntry = require.resolve('@whiskeysockets/baileys');
   const baileysDir = path.dirname(baileysEntry);
   const relaySource = fs.readFileSync(
@@ -329,22 +329,42 @@ test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay
     path.join(baileysDir, 'Utils', 'messages.js'),
     'utf8'
   );
+  const { patchRelaySource } = require('../scripts/patch-baileys-group-status-media');
 
-  assert.match(relaySource, /additionalNodes/, 'relayMessage ne déclare plus additionalNodes');
+  assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
   assert.match(
     relaySource,
-    /stanza\.content\.push\(\.\.\.additionalNodes\)/,
-    'les additionalNodes ne sont plus injectés dans la stanza'
+    /const getMediaType = \(message\) => \{\s+message = normalizeMessageContent\(message\) \|\| message;/,
+    'le relay ne détecte pas le type du média à travers groupStatusMessageV2'
   );
-  assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
+  assert.deepEqual(patchRelaySource(relaySource), { source: relaySource, changed: false });
 
   const packageJson = require('../package.json');
-  const baileysSpec = packageJson.dependencies['@whiskeysockets/baileys'];
-  assert.equal(baileysSpec, '7.0.0-rc14');
+  assert.equal(packageJson.dependencies['@whiskeysockets/baileys'], '7.0.0-rc14');
+  assert.equal(packageJson.scripts.postinstall, 'node scripts/patch-baileys-group-status-media.js');
+  assert.equal(packageJson.scripts.prestart, 'node scripts/patch-baileys-group-status-media.js');
   assert.equal(
     require('@whiskeysockets/baileys/package.json').name,
     '@whiskeysockets/baileys'
   );
+});
+
+test('le postinstall corrige le relay rc14 une seule fois', () => {
+  const { patchRelaySource } = require('../scripts/patch-baileys-group-status-media');
+  const source = [
+    'const getMediaType = (message) => {',
+    '        if (message.imageMessage) {',
+    "            return 'image';",
+    '        }',
+    '    };'
+  ].join('\n');
+
+  const first = patchRelaySource(source);
+  assert.equal(first.changed, true);
+  assert.match(first.source, /message = normalizeMessageContent\(message\) \|\| message;/);
+  const second = patchRelaySource(first.source);
+  assert.equal(second.changed, false);
+  assert.equal(second.source, first.source);
 });
 
 test('les confirmations swgc restent concises pour chaque type', () => {
@@ -449,9 +469,9 @@ test('le handler intercepte la réponse numérique et l’ancien case swgc bruya
   assert.doesNotMatch(pluginSource, /sendMessage\(target\.jid|sendMessage\(from/);
   const statusSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'status.js'), 'utf8');
   assert.match(statusSource, /groupStatusMessageV2/);
-  assert.match(statusSource, /isGroupStatus:\s*true/);
-  assert.match(statusSource, /is_group_status:\s*["']true["']/);
   assert.match(statusSource, /socket\.relayMessage\(jid/);
+  assert.doesNotMatch(statusSource, /isGroupStatus\s*:/);
+  assert.doesNotMatch(statusSource, /is_group_status\s*:/);
   assert.doesNotMatch(statusSource, /socket\.sendMessage\(jid/);
 });
 

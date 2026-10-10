@@ -5,6 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "prestart": "node scripts/patch-baileys-group-status-media.js",
+    "postinstall": "node scripts/patch-baileys-group-status-media.js",
     "mongo:check": "node scripts/check-mongodb.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "test:syntax": "node scripts/check-syntax.js"

@@ -19,6 +19,7 @@ const DESIGN = Object.freeze({
   fps: 25,
   background: '0x0B0D19',
   panel: '0x15182A',
+  track: '0x282B42',
   gold: '0xFFD166',
   cyan: '0x58E1E8',
   violet: '0xA879FF',
@@ -120,7 +121,8 @@ function createTextFilter(fontPath, textPath, size, color, x, y, extra = '') {
 }
 
 /** Construit le filtre animé à part pour que le rendu puisse être vérifié sans ffmpeg. */
-function buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds }) {
+function buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds, design: designOverrides = {} }) {
+  const design = { ...DESIGN, ...(designOverrides || {}) };
   const duration = safeDuration(durationSeconds, 1).toFixed(2);
   const titleX = '(w-text_w)/2-560*exp(-3.5*t)+12*sin(2*PI*t/4)*(1-exp(-3*t))';
   const subtitleY = '270+55*exp(-4*t)';
@@ -139,30 +141,34 @@ function buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds }) {
     createTextFilter(fontPath, textFiles[key], size, color, x, y, extra);
 
   return [
-    `color=c=${DESIGN.background}:s=${DESIGN.width}x${DESIGN.height}:r=${DESIGN.fps},`
-      + `drawbox=x=0:y=0:w=${DESIGN.width}:h=9:color=${DESIGN.violet}:t=fill,`
-      + `drawbox=x=0:y=${DESIGN.height - 9}:w=${DESIGN.width}:h=9:color=${DESIGN.cyan}:t=fill,`
-      + `drawbox=x=30:y=480:w=660:h=455:color=${DESIGN.panel}:t=fill,`
-      + `drawbox=x=30:y=480:w=660:h=4:color=${DESIGN.violet}:t=fill,`
-      + `drawbox=x=30:y=931:w=660:h=4:color=${DESIGN.cyan}:t=fill[bg]`,
-    `[0:a:0]showwaves=s=640x300:mode=cline:rate=${DESIGN.fps}:colors=${DESIGN.cyan},`
+    `color=c=${design.background}:s=${design.width}x${design.height}:r=${design.fps},`
+      + `drawbox=x=0:y=0:w=${design.width}:h=9:color=${design.violet}:t=fill,`
+      + `drawbox=x=0:y=${design.height - 9}:w=${design.width}:h=9:color=${design.cyan}:t=fill,`
+      + `drawbox=x=30:y=480:w=660:h=455:color=${design.panel}:t=fill,`
+      + `drawbox=x=30:y=480:w=660:h=4:color=${design.violet}:t=fill,`
+      + `drawbox=x=30:y=931:w=660:h=4:color=${design.cyan}:t=fill[bg]`,
+    `[0:a:0]showwaves=s=640x300:mode=cline:rate=${design.fps}:colors=${design.cyan},`
       + 'format=rgba,colorkey=0x000000:0.15:0.1[wave]',
     '[bg][wave]overlay=40:545[b1]',
-    `[b1]${dt('title', 46, DESIGN.gold, titleX, '178')},`
+    `[b1]${dt('title', 46, design.gold, titleX, '178')},`
       + `${dt('subtitle', 26, 'white', '(w-text_w)/2', subtitleY, subtitleFade)},`
-      + `${dt('tags', 20, DESIGN.cyan, '(w-text_w)/2', '330', tagsPulse)},`
-      + 'drawbox=x=60:y=878:w=600:h=10:color=0x282B42:t=fill[b2]',
-    `color=c=${DESIGN.violet}:s=600x10:r=${DESIGN.fps}[bar]`,
+      + `${dt('tags', 20, design.cyan, '(w-text_w)/2', '330', tagsPulse)},`
+      + `drawbox=x=60:y=878:w=600:h=10:color=${design.track}:t=fill[b2]`,
+    `color=c=${design.violet}:s=600x10:r=${design.fps}[bar]`,
     `[b2][bar]overlay=x='60-600+600*t/${duration}':y=878,`
-      + `drawbox=x=0:y=869:w=60:h=28:color=${DESIGN.panel}:t=fill[b3]`,
-    `color=c=${DESIGN.gold}:s=18x28:r=${DESIGN.fps}[knob]`,
+      + `drawbox=x=0:y=869:w=60:h=28:color=${design.panel}:t=fill[b3]`,
+    `color=c=${design.gold}:s=18x28:r=${design.fps}[knob]`,
     `[b3][knob]overlay=x='51+600*t/${duration}':y=869[b4]`,
     `[b4]${dt('current', 28, 'white', '60', '919')},`
-      + `${dt('total', 24, DESIGN.muted, '660-text_w', '919')},format=yuv420p[v]`
+      + `${dt('total', 24, design.muted, '660-text_w', '919')},format=yuv420p[v]`
   ].join(';');
 }
 
-async function audioToStatusVideo(buffer, { durationSeconds = 0 } = {}) {
+async function audioToStatusVideo(buffer, {
+  durationSeconds = 0,
+  branding = BRANDING,
+  design = DESIGN
+} = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new Error('Aucune donnée audio téléchargée.');
   }
@@ -188,17 +194,23 @@ async function audioToStatusVideo(buffer, { durationSeconds = 0 } = {}) {
       await fs.promises.writeFile(fullPath, content, 'utf8');
       return fullPath;
     };
+    const selectedBranding = { ...BRANDING, ...(branding || {}) };
     const textPaths = {
-      title: await writeText('title.txt', BRANDING.title),
-      subtitle: await writeText('subtitle.txt', BRANDING.subtitle),
-      tags: await writeText('tags.txt', BRANDING.tags),
+      title: await writeText('title.txt', selectedBranding.title),
+      subtitle: await writeText('subtitle.txt', selectedBranding.subtitle),
+      tags: await writeText('tags.txt', selectedBranding.tags),
       current: await writeText(
         'current-time.txt',
         duration >= 3600 ? '%{pts:gmtime:0:%H\\:%M\\:%S}' : '%{pts:gmtime:0:%M\\:%S}'
       ),
       total: await writeText('duration.txt', `/ ${formatTime(duration)}`)
     };
-    const graph = buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds: duration });
+    const graph = buildAudioStatusFilterGraph({
+      fontPath,
+      textPaths,
+      durationSeconds: duration,
+      design
+    });
 
     await execFileAsync(ffmpegPath, [
       '-hide_banner', '-loglevel', 'error', '-y',
