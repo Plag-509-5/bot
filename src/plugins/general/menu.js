@@ -294,6 +294,10 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}config setemoji
 > ・ ${p}config setprefix
 
+> 〢 𝐌𝐀𝐈𝐍𝐓𝐄𝐍𝐀𝐍𝐂𝐄 🔄
+
+> ・ ${p}update [check]
+
 ━━━━━━━━━━━━━━━━━━━━━━━━
                 🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉
 ━━━━━━━━━━━━━━━━━━━━━━━━

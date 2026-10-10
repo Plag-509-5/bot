@@ -326,6 +326,19 @@ L’audience est enregistrée **par session** dans MongoDB :
 - `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
 - Les publications sont envoyées à `status@broadcast` avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
 
+### Mise à jour depuis GitHub avec `.update`
+
+```text
+.update check
+.update
+```
+
+`.update check` compare le commit installé au dernier commit de la branche GitHub configurée et affiche les fichiers concernés sans les modifier. `.update` applique la mise à jour par fast-forward; `.update apply` est équivalent. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer la commande.
+
+Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. La branche `main` est utilisée par défaut; définis `BOT_UPDATE_BRANCH` pour en choisir une autre. La mise à jour refuse de continuer si des fichiers suivis ont des changements locaux ou si les branches ont divergé : elle ne fait jamais de `reset --hard` et ne remplace pas les fichiers locaux silencieusement. Les fichiers non suivis tels que `.env` ne sont pas visés.
+
+Après le fast-forward, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
+
 ---
 
 ## 📴 Présence et mode sans préfixe

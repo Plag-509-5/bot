@@ -309,12 +309,20 @@ test('protège la liste des destinataires et répond en privé si la commande vi
   assert.equal(tostatus._test.replyJid(context.from, context.msg), ownerJid);
 });
 
-test('pluginLoader enregistre la commande principale et ses trois alias', () => {
+test('pluginLoader enregistre les commandes de statut et de mise à jour avec leurs alias', () => {
   pluginLoader.loadPlugins(false);
-  for (const command of ['tostatus', 'setstatusviewers', 'statusviewers', 'delstatus']) {
+  const expectedNames = {
+    tostatus: 'tostatus',
+    setstatusviewers: 'tostatus',
+    statusviewers: 'tostatus',
+    delstatus: 'tostatus',
+    update: 'update',
+    updatebot: 'update'
+  };
+  for (const [command, name] of Object.entries(expectedNames)) {
     const plugin = pluginLoader.getPlugins().get(command);
     assert.ok(plugin, `${command} non enregistré`);
-    assert.equal(plugin.name, 'tostatus');
+    assert.equal(plugin.name, name);
     assert.equal(plugin.category, 'owner');
     assert.equal(typeof plugin.execute, 'function');
   }
