@@ -268,6 +268,12 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}listcmd
 > ・ ${p}delcmd
 
+> 〢 𝐒𝐓𝐀𝐓𝐔𝐓 𝐏𝐄𝐑𝐒𝐎𝐍𝐍𝐄𝐋 📲
+
+> ・ ${p}tostatus
+> ・ ${p}setstatusviewers / ${p}statusviewers
+> ・ ${p}delstatus
+
 > 〢 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 ✿︎
 
 > ・ ${p}play Ⓛ︎
@@ -287,6 +293,10 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}config autorec
 > ・ ${p}config setemoji
 > ・ ${p}config setprefix
+
+> 〢 𝐌𝐀𝐈𝐍𝐓𝐄𝐍𝐀𝐍𝐂𝐄 🔄
+
+> ・ ${p}update [check]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
                 🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉

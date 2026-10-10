@@ -190,6 +190,10 @@ test('le menu complet reprend le texte KAIDO-MD validé pour le thème par défa
   assert.match(text, /｢ 📜 𝐂𝐨𝐦𝐦𝐚𝐧𝐝𝐞𝐬 : 4 ｣/);
   assert.match(text, /> ・ !menu\n> ・ !ping/);
   assert.match(text, /> ・ !swgc/);
+  assert.match(text, /> ・ !tostatus/);
+  assert.match(text, /> ・ !setstatusviewers \/ !statusviewers/);
+  assert.match(text, /> ・ !delstatus/);
+  assert.match(text, /> ・ !update \[check\]/);
   assert.match(text, /🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉/);
   assert.match(text, /• Uptime: 1h 2m 3s\n• Prefix: !\n• Version: 2\.0\.0/);
   assert.match(text, /PIED DE PAGE$/);

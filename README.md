@@ -30,6 +30,7 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
+  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast` avec une audience réglable par session (`.setstatusviewers`) et `.delstatus` pour retirer la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
   - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** le propriétaire choisit le groupe cible en privé, puis publie texte/image/vidéo/audio via `groupStatusMessageV2` sans confirmation dans le chat du groupe. Les textes ont une palette sombre personnalisée et une police WhatsApp plus élégante; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
@@ -83,8 +84,13 @@ La méthode `sendGroupStatus()` de NYXCORE n’existe que sur les sockets produi
 par sa propre factory. Pour conserver les sessions actives du projet et éviter
 d’ouvrir une seconde connexion WhatsApp, le plugin installe un petit adaptateur
 `sendGroupStatus()` sur le socket Baileys existant : NYXCORE prépare le message,
-puis ce même socket assure le téléversement média et le relay. Les deux
-paquets sont donc déclarés volontairement. `package.json` force toujours
+puis ce même socket assure le téléversement média et le relay. Le relay officiel
+RC14 ne déballait pas `groupStatusMessageV2` avant de calculer `mediatype`; la
+trame média partait donc sans son type et WhatsApp pouvait l’ignorer sans que
+l’appel de relay échoue. Le correctif ciblé et idempotent s’applique à
+l’installation et avant `npm start`; il déplie l’enveloppe avant cette détection,
+comme le fait NYXCORE.
+Les deux paquets sont donc déclarés volontairement. `package.json` force
 `libsignal` sur le commit officiel via `overrides`.
 
 MongoDB est l'unique source de vérité :
@@ -295,6 +301,43 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
 
 Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
+
+### Statut personnel avec `.tostatus`
+
+Le propriétaire du bot ou de la session publie dans son statut WhatsApp personnel en utilisant **le socket Baileys/NYXCORE déjà connecté** : aucune deuxième connexion n’est ouverte.
+
+```text
+.tostatus Bonjour tout le monde
+```
+
+Pour un média, réponds à une photo, une vidéo ou un audio avec `.tostatus`; la caption du média est conservée et peut être remplacée par du texte ajouté à la commande. Les audios et notes vocales sont convertis en MP4 vertical animé, avec la carte visuelle « LE SEIGNEUR DES APPAREILS — PÈRE FONDATEUR DE TOUMAÏ MD ».
+
+L’audience est enregistrée **par session** dans MongoDB :
+
+```text
+.setstatusviewers 509XXXXXXXX, 509YYYYYYYY
+.statusviewers
+.setstatusviewers clear
+.delstatus
+```
+
+- Une liste personnalisée ne distribue le statut qu’aux numéros indiqués, plus le compte qui le publie.
+- Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
+- `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
+- Les publications sont envoyées à `status@broadcast` avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
+
+### Mise à jour depuis GitHub avec `.update`
+
+```text
+.update check
+.update
+```
+
+`.update check` compare le commit installé au dernier commit de la branche GitHub configurée et affiche les fichiers concernés sans les modifier. `.update` applique la mise à jour par fast-forward; `.update apply` est équivalent. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer la commande.
+
+Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. La branche `main` est utilisée par défaut; définis `BOT_UPDATE_BRANCH` pour en choisir une autre. La mise à jour refuse de continuer si des fichiers suivis ont des changements locaux ou si les branches ont divergé : elle ne fait jamais de `reset --hard` et ne remplace pas les fichiers locaux silencieusement. Les fichiers non suivis tels que `.env` ne sont pas visés.
+
+Après le fast-forward, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
 
 ---
 

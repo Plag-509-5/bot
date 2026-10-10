@@ -2,13 +2,6 @@
 
 const crypto = require('node:crypto');
 
-const GROUP_STATUS_MESSAGE_TYPES = [
-  'extendedTextMessage',
-  'imageMessage',
-  'videoMessage',
-  'audioMessage'
-];
-
 let nyxHelpersPromise = null;
 
 function loadNyxHelpers() {
@@ -20,24 +13,10 @@ function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
 }
 
-function markInnerMessageAsGroupStatus(message) {
-  const next = { ...(message || {}) };
-  const messageType = GROUP_STATUS_MESSAGE_TYPES.find(type => next[type]);
-  if (!messageType) return next;
-  next[messageType] = {
-    ...next[messageType],
-    contextInfo: {
-      ...(next[messageType].contextInfo || {}),
-      isGroupStatus: true
-    }
-  };
-  return next;
-}
-
 /**
- * Generate with NYXCORE's Baileys utilities, but keep the project's authenticated
- * session socket for media upload and relay. This lets the plugin use
- * sendGroupStatus() without opening a second WhatsApp connection.
+ * Publie un statut de groupe avec le socket Baileys déjà authentifié par la
+ * session MongoDB. Le wrapper est le même que celui utilisé par NYXCORE;
+ * surtout, les paquets média doivent rester identifiables par le relay Baileys.
  */
 async function groupStatus(socket, jid, content, options = {}) {
   if (!socket || typeof socket.relayMessage !== 'function') {
@@ -59,9 +38,6 @@ async function groupStatus(socket, jid, content, options = {}) {
     font: contentFont,
     ...payload
   } = content;
-  const { backgroundColor: optionBackgroundColor, font: optionFont, ...relayOptions } = options || {};
-  const backgroundColor = optionBackgroundColor ?? contentBackgroundColor;
-  const font = optionFont ?? contentFont;
   const upload = typeof socket.waUploadToServer === 'function'
     ? socket.waUploadToServer.bind(socket)
     : undefined;
@@ -71,48 +47,35 @@ async function groupStatus(socket, jid, content, options = {}) {
     throw new Error('Téléversement média indisponible sur ce socket WhatsApp.');
   }
 
-  const generated = await generateWAMessage(
-    jid,
-    {
-      ...payload,
-      contextInfo: {
-        ...(payload.contextInfo || {}),
-        isGroupStatus: true
-      }
-    },
-    {
-      logger: options?.logger || socket.logger,
-      userJid: socket.user.id,
-      upload,
-      backgroundColor,
-      font,
-      messageId: generateMessageIDV2(socket.user.id),
-      ...relayOptions
-    }
-  );
+  const generated = await generateWAMessage(jid, payload, {
+    logger: options?.logger || socket.logger,
+    userJid: socket.user.id,
+    upload,
+    backgroundColor: options?.backgroundColor ?? contentBackgroundColor,
+    font: options?.font ?? contentFont,
+    messageId: generateMessageIDV2(socket.user.id),
+    ...options
+  });
 
   if (!generated?.message || !generated?.key?.id) {
     throw new Error('NYXCORE n’a pas pu construire le statut de groupe.');
   }
 
-  const messageSecret = crypto.randomBytes(32);
-  const inside = markInnerMessageAsGroupStatus(generated.message);
+  // groupStatusMessageV2 transporte l’image/vidéo/audio original dans le corps
+  // chiffré. Les drapeaux `isGroupStatus` et le nœud XML `meta` ajoutés par
+  // l’ancienne version ne font pas partie de l’enveloppe NYXCORE et n’aident pas
+  // à classifier le média.
   const wrappedMessage = {
-    groupStatusMessageV2: { message: inside },
+    groupStatusMessageV2: { message: generated.message },
     messageContextInfo: {
-      ...(inside.messageContextInfo || {}),
-      messageSecret
+      ...(generated.message.messageContextInfo || {}),
+      messageSecret: crypto.randomBytes(32)
     }
   };
 
   await socket.relayMessage(jid, wrappedMessage, {
     messageId: generated.key.id,
-    ...relayOptions,
-    additionalNodes: [{
-      tag: 'meta',
-      attrs: { is_group_status: 'true' },
-      content: undefined
-    }]
+    useCachedGroupMetadata: options?.useCachedGroupMetadata
   });
   return { ...generated, message: wrappedMessage };
 }
@@ -171,6 +134,5 @@ module.exports = {
   groupStatus,
   installGroupStatusMethod,
   buildStatusContent,
-  isGroupJid,
-  markInnerMessageAsGroupStatus
+  isGroupJid
 };
