@@ -154,16 +154,16 @@ test('construit des statuts propres sans watermark pour texte, image, vidéo et 
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
 });
 
-test('wileys relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
+test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
   const uploads = [];
   const relayed = [];
   const socket = {
     user: { id: '50900000000@s.whatsapp.net' },
-    async waUploadToServer(encryptedStream, metadata) {
-      // Contrat wileys : `options.upload` reçoit un flux chiffré (Readable),
-      // plus un chemin de fichier temporaire comme dans les anciens forks.
-      assert.ok(encryptedStream, 'aucun flux chiffré transmis à waUploadToServer');
-      assert.equal(typeof encryptedStream.pipe, 'function', 'waUploadToServer doit recevoir un flux');
+    async waUploadToServer(encryptedFilePath, metadata) {
+      // Contrat du Baileys officiel : `options.upload` reçoit le chemin du
+      // fichier chiffré temporaire, qu'il supprime après le téléversement.
+      assert.equal(typeof encryptedFilePath, 'string');
+      assert.ok(fs.existsSync(encryptedFilePath), 'fichier chiffré temporaire absent');
       uploads.push(metadata.mediaType);
       return {
         mediaUrl: `https://upload.invalid/${metadata.mediaType}`,
@@ -237,12 +237,12 @@ test('wileys relaie image, vidéo, audio et texte avec les marqueurs de statut d
   await assert.rejects(groupStatus(socket, '123456@s.whatsapp.net', { text: 'non' }), /JID @g\.us/);
 });
 
-test('le baileys utilisé (wileys) supporte le wrapper V2 et les additionalNodes du relay', () => {
-  // `.swgc` (statut de groupe) dépend de deux capacités du fork Baileys :
-  //   1. relayMessage doit accepter `additionalNodes` et les ajouter à la stanza ;
-  //   2. generateWAMessageContent doit reconnaître `groupStatusMessageV2`.
+test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay', () => {
+  // `.swgc` dépend de deux capacités vérifiées dans le paquet officiel :
+  //   1. relayMessage accepte `additionalNodes` et les ajoute à la stanza ;
+  //   2. le schéma officiel contient `groupStatusMessageV2`.
   // Sans elles, le statut part sans le nœud `meta` et n'apparaît pas comme
-  // statut de groupe. Ce test échoue si on change de fork sans vérifier.
+  // statut de groupe.
   const baileysEntry = require.resolve('@whiskeysockets/baileys');
   const baileysDir = path.dirname(baileysEntry);
   const relaySource = fs.readFileSync(
@@ -264,15 +264,10 @@ test('le baileys utilisé (wileys) supporte le wrapper V2 et les additionalNodes
 
   const packageJson = require('../package.json');
   const baileysSpec = packageJson.dependencies['@whiskeysockets/baileys'];
-  assert.match(
-    String(baileysSpec),
-    /^npm:wileys/,
-    `le bot doit utiliser wileys, trouvé : ${baileysSpec}`
-  );
+  assert.equal(baileysSpec, '7.0.0-rc14');
   assert.equal(
     require('@whiskeysockets/baileys/package.json').name,
-    'wileys',
-    "l'alias @whiskeysockets/baileys ne résout pas vers wileys"
+    '@whiskeysockets/baileys'
   );
 });
 

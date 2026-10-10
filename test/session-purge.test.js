@@ -1,231 +1,132 @@
 'use strict';
 
-/**
- * Tests de la purge d'une session ratée.
- *
- * Contrat vérifié : après un appairage raté, il ne reste **rien** — ni sur
- * disque, ni dans MongoDB (creds, clés Signal, numéro). C'est la condition pour
- * que la demande de code suivante fonctionne au lieu d'afficher « Indisponible ».
- */
-
 const test = require('node:test');
-const assert = require('node:assert');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
+const assert = require('node:assert/strict');
+const { initAuthCreds } = require('@whiskeysockets/baileys');
 
-const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'kaido-purge-'));
-process.env.SESSIONS_DIR = sandbox;
-
-const store = require('../src/auth/session-store');
 const { createSessionPurger } = require('../src/auth/session-purge');
 const { createMongoAuthBackend } = require('../src/auth/mongo-auth-backend');
+const { createFakeDb } = require('./helpers/fake-mongo');
 
-function validCreds(meId = '50947440869@s.whatsapp.net') {
-  return {
-    noiseKey: { private: 'cHJpdmU=', public: 'cHVibGlj' },
-    signedIdentityKey: { private: 'aWRlbnRpdHk=' },
-    signedPreKey: { keyPair: { private: 'c3ByaXY=' }, signature: 'c2ln', keyId: 1 },
-    registrationId: 137,
-    me: { id: meId },
-    registered: true
-  };
+function creds(number) {
+  const value = initAuthCreds();
+  value.registered = true;
+  value.me = { id: `${number}@s.whatsapp.net` };
+  return value;
 }
 
-/** Collections MongoDB mémoire (mêmes opérations que le vrai backend). */
-function fakeMongo() {
-  const sessions = new Map();
-  const keys = new Map();
-  const numbers = new Map();
-  const calls = [];
-  const k = (n, t, i) => `${n}|${t}|${i}`;
-  return {
-    sessions,
-    keys,
-    numbers,
-    calls,
-    backend: createMongoAuthBackend({
-      initMongo: async () => { calls.push('initMongo'); },
-      getDb: () => ({
-        collection(name) {
-          const map = name === 'sessions' ? sessions : keys;
-          return {
-            async createIndex() { return 'ok'; },
-            async findOne(filter) {
-              return map.get(filter.number) || (name === 'keys' ? null : null);
-            },
-            find(filter) {
-              const found = Array.from(map.values()).filter((d) => d.number === filter.number);
-              return { async toArray() { return found; } };
-            },
-            async updateOne(filter, update) {
-              const doc = { ...(map.get(filter.number) || filter) };
-              Object.assign(doc, update.$set || {});
-              for (const key of Object.keys(update.$unset || {})) delete doc[key];
-              map.set(filter.number, doc);
-              return { matchedCount: 1 };
-            },
-            async deleteOne(filter) {
-              const had = map.delete(filter.number);
-              return { deletedCount: had ? 1 : 0 };
-            },
-            async deleteMany(filter) {
-              let n = 0;
-              for (const [key, doc] of Array.from(map.entries())) {
-                if (doc.number === filter.number) { map.delete(key); n += 1; }
-              }
-              return { deletedCount: n };
-            },
-            async bulkWrite(operations) {
-              for (const op of operations) {
-                if (op.updateOne) {
-                  const { number, type, id } = op.updateOne.filter;
-                  map.set(k(number, type, id), { number, type, id, ...op.updateOne.update.$set });
-                } else if (op.deleteOne) {
-                  const { number, type, id } = op.deleteOne.filter;
-                  map.delete(k(number, type, id));
-                }
-              }
-              return { ok: 1 };
-            }
-          };
-        }
-      })
-    }),
-    async removeSession(number) { calls.push(`removeSession:${number}`); sessions.delete(number); },
-    async removeNumber(number) { calls.push(`removeNumber:${number}`); numbers.delete(number); }
-  };
-}
-
-/** Construit une session ratée complète : disque + toutes les collections. */
-async function seedFailedSession(number, existingMongo = null) {
-  const mongo = existingMongo || fakeMongo();
-  const dir = store.sessionDir(number);
-
-  await store.writeJsonAtomic(store.credsPath(dir), validCreds(`${number}@s.whatsapp.net`));
-  await store.writeKeyToDisk(dir, 'pre-key', '1', { privateKey: 'aGk=' });
-  await store.writeKeyToDisk(dir, 'session', `${number}:3@s.whatsapp.net`, { ratchet: 'abc' });
-
-  await mongo.backend.saveCreds(number, validCreds(`${number}@s.whatsapp.net`));
-  await mongo.backend.saveKeys(number, [
-    { ref: 'pre-key/1', value: { privateKey: 'aGk=' } },
-    { ref: `session/${number}:3@s.whatsapp.net`, value: { ratchet: 'abc' } }
-  ]);
-  mongo.numbers.set(number, { number });
-
-  // Ancien dossier temporaire, tel que les versions précédentes le créaient.
-  const tmp = path.join(os.tmpdir(), `session_${number}`);
-  fs.mkdirSync(tmp, { recursive: true });
-  fs.writeFileSync(path.join(tmp, 'creds.json'), '{}');
-
-  return { mongo, dir, tmp };
-}
-
-function makePurger(mongo) {
-  return createSessionPurger({
-    authBackend: mongo.backend,
-    removeSession: mongo.removeSession,
-    removeNumber: mongo.removeNumber,
-    logger: { warn() {}, error() {}, info() {} }
+function fixture() {
+  const db = createFakeDb();
+  const backend = createMongoAuthBackend({
+    initMongo: async () => {},
+    getDb: () => db
   });
+  const removeNumber = async (number) => {
+    await db.collection('numbers').deleteOne({ number });
+  };
+  return {
+    db,
+    backend,
+    purger: createSessionPurger({
+      authBackend: backend,
+      removeNumber,
+      logger: { warn() {} }
+    })
+  };
 }
 
-test('après purge, il ne reste rien sur disque', async () => {
-  const number = '50910000001';
-  const { mongo, dir, tmp } = await seedFailedSession(number);
-  assert.equal(fs.existsSync(dir), true, 'précondition : le dossier existe');
+async function seed(ctx, number) {
+  await ctx.backend.saveCreds(number, creds(number));
+  await ctx.backend.saveKeys(number, [
+    { ref: 'pre-key/1', value: { private: Buffer.from('a') } },
+    { ref: `session/${number}:3@s.whatsapp.net`, value: { ratchet: Buffer.from('b') } }
+  ]);
+  await ctx.db.collection('numbers').updateOne(
+    { number },
+    { $set: { number } },
+    { upsert: true }
+  );
+}
 
-  await makePurger(mongo).purge(number, { reason: 'test' });
+test('la purge retire creds, clés Signal et numéro uniquement de MongoDB', async () => {
+  const ctx = fixture();
+  const target = '50910000001';
+  const other = '50910000002';
+  await seed(ctx, target);
+  await seed(ctx, other);
 
-  assert.equal(fs.existsSync(dir), false, 'sessions/<numéro> doit avoir disparu');
-  assert.equal(fs.existsSync(tmp), false, 'l’ancien dossier tmp doit avoir disparu');
-});
-
-test('après purge, MongoDB ne contient plus ni creds, ni clés, ni numéro', async () => {
-  const number = '50910000002';
-  const { mongo } = await seedFailedSession(number);
-  assert.notEqual(await mongo.backend.load(number), null, 'précondition : la session existe en base');
-
-  await makePurger(mongo).purge(number, { reason: 'test' });
-
-  assert.equal(await mongo.backend.load(number), null, 'creds et clés doivent avoir disparu');
-  assert.equal(mongo.sessions.has(number), false, 'collection sessions non purgée');
-  assert.equal(mongo.numbers.has(number), false, 'collection numbers non purgée');
-  const restantes = Array.from(mongo.keys.values()).filter((d) => d.number === number);
-  assert.equal(restantes.length, 0, 'des clés Signal subsistent dans session_keys');
-});
-
-test('la purge liste les traces effacées pour le journal', async () => {
-  const number = '50910000003';
-  const { mongo } = await seedFailedSession(number);
-
-  const result = await makePurger(mongo).purge(number, { reason: 'génération du code impossible' });
+  const result = await ctx.purger.purge(target, { reason: 'test' });
 
   assert.equal(result.ok, true);
-  assert.equal(result.number, number);
-  assert.ok(result.traces.includes(`sessions/${number}`), `traces : ${result.traces.join(', ')}`);
-  assert.ok(result.traces.includes('mongo:sessions+session_keys'));
-  assert.ok(result.traces.includes('mongo:numbers'));
+  assert.deepEqual(result.errors, []);
+  assert.ok(result.traces.includes('mongodb:sessions+session_keys'));
+  assert.ok(result.traces.includes('mongodb:numbers'));
+  assert.equal(await ctx.backend.load(target), null);
+  assert.equal(await ctx.backend.exists(other), true);
+  assert.ok(ctx.db.collection('numbers').docs.some((doc) => doc.number === other));
 });
 
-test('l’état d’auth est jeté (discard) et non sauvegardé (close)', async () => {
-  const number = '50910000004';
-  const { mongo } = await seedFailedSession(number);
-
-  let discarded = 0;
-  let closed = 0;
+test('discard est attendu avant la suppression pour empêcher une résurrection', async () => {
+  const events = [];
+  const purger = createSessionPurger({
+    authBackend: {
+      async remove() { events.push('remove'); }
+    },
+    removeNumber: async () => { events.push('number'); },
+    logger: { warn() {} }
+  });
   const auth = {
-    discard() { discarded += 1; },
-    close() { closed += 1; return Promise.resolve(); }
+    async discard() {
+      await new Promise((resolve) => setImmediate(resolve));
+      events.push('discard');
+    }
   };
 
-  await makePurger(mongo).purge(number, { auth, reason: 'test' });
-
-  assert.equal(discarded, 1, 'discard doit être appelé');
-  assert.equal(closed, 0, 'close ne doit PAS être appelé : il réécrirait les creds');
+  const result = await purger.purge('50910000003', { auth, reason: 'test' });
+  assert.equal(result.ok, true);
+  assert.equal(events[0], 'discard');
+  assert.deepEqual(events, ['discard', 'remove', 'number']);
 });
 
-test('une purge ne touche pas les autres sessions', async () => {
-  const cible = '50910000005';
-  const autre = '50910000006';
-  // Même base pour les deux : on vérifie que la purge est bien ciblée.
-  const { mongo } = await seedFailedSession(cible);
-  await seedFailedSession(autre, mongo);
+test('une panne MongoDB rend la purge explicitement incomplète', async () => {
+  const warnings = [];
+  const purger = createSessionPurger({
+    authBackend: { async remove() { throw new Error('base hors ligne'); } },
+    removeNumber: async () => { throw new Error('base hors ligne'); },
+    logger: { warn(...args) { warnings.push(args); } }
+  });
 
-  await makePurger(mongo).purge(cible, { reason: 'test' });
-
-  assert.equal(fs.existsSync(store.sessionDir(cible)), false);
-  assert.equal(fs.existsSync(store.sessionDir(autre)), true, 'l’autre session ne doit pas être touchée');
-  assert.notEqual(await mongo.backend.load(autre), null);
-  assert.equal(mongo.numbers.has(autre), true);
+  const result = await purger.purge('50910000004', { reason: 'test' });
+  assert.equal(result.ok, false);
+  assert.equal(result.errors.length, 2);
+  assert.match(result.errors.join(' '), /base hors ligne/);
+  assert.equal(warnings.length, 2);
 });
 
-test('un numéro invalide est refusé sans rien supprimer', async () => {
-  const mongo = fakeMongo();
-  const result = await makePurger(mongo).purge('   ', { reason: 'test' });
+test('un backend absent ne peut pas produire un faux succès', async () => {
+  const purger = createSessionPurger({
+    removeNumber: async () => {},
+    logger: { warn() {} }
+  });
+  const result = await purger.purge('50910000005');
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.includes('backend MongoDB absent'));
+});
+
+test('un numéro invalide est refusé sans appeler MongoDB', async () => {
+  let called = false;
+  const purger = createSessionPurger({
+    authBackend: { async remove() { called = true; } },
+    logger: { warn() {} }
+  });
+  const result = await purger.purge('   ');
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'numéro invalide');
-  assert.deepEqual(result.traces, []);
+  assert.equal(called, false);
 });
 
-test('une base MongoDB injoignable n’empêche pas de nettoyer le disque', async () => {
-  const number = '50910000007';
-  const { dir } = await seedFailedSession(number);
-
-  const purger = createSessionPurger({
-    authBackend: { async remove() { throw new Error('mongo hors ligne'); } },
-    removeSession: async () => { throw new Error('mongo hors ligne'); },
-    removeNumber: async () => { throw new Error('mongo hors ligne'); },
-    logger: { warn() {}, error() {}, info() {} }
-  });
-
-  const result = await purger.purge(number, { reason: 'test' });
-
-  assert.equal(result.ok, true);
-  assert.equal(fs.existsSync(dir), false, 'le disque doit être nettoyé même sans MongoDB');
-});
-
-test('purger une session déjà absente ne provoque aucune erreur', async () => {
-  const mongo = fakeMongo();
-  await assert.doesNotReject(makePurger(mongo).purge('50910000008', { reason: 'test' }));
+test('purger une session déjà absente reste idempotent', async () => {
+  const ctx = fixture();
+  await assert.doesNotReject(ctx.purger.purge('50910000006'));
+  assert.equal((await ctx.purger.purge('50910000006')).ok, true);
 });

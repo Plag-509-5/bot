@@ -12,7 +12,6 @@ const crypto = require('crypto');
 const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
-const { MongoClient } = require('mongodb');
 const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPluginsList } = require('./pluginLoader');
 const {
   resolveSessionPrefix,
@@ -61,7 +60,11 @@ const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd')
 const { findReactionCommand, initReactionDb } = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
-const { setupTranslationWrapper, saveSessionLanguage } = require('../features/translation');
+const {
+  configureTranslationStorage,
+  setupTranslationWrapper,
+  saveSessionLanguage
+} = require('../features/translation');
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
 const { getGroupAdminsInfo, jidToNumber } = require('../lib/normalize');
@@ -90,19 +93,17 @@ const {
   initAuthCreds,
   delay,
   getContentType,
-  makeCacheableSignalKeyStore,
   Browsers,
   downloadContentFromMessage,
   DisconnectReason
 } = require('@whiskeysockets/baileys');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
-// -------- Session persistante --------
-// useMultiFileAuthState est remplacé par un état d'authentification qui écrit de
-// façon atomique et sauvegarde creds + TOUTES les clés Signal (disque + MongoDB).
-// C'est le correctif de la « clé corrompue » : voir src/auth/persistent-auth.js.
-const { createPersistentAuthState, AuthCorruptedError } = require('../auth/persistent-auth');
+// -------- Sessions MongoDB uniquement --------
+// Aucun dossier d'authentification local : creds et toutes les clés Signal sont
+// persistés dans MongoDB avec le codec BufferJSON officiel.
+const { createMongoAuthState, MongoAuthCorruptedError } = require('../auth/mongo-auth-state');
 const { createMongoAuthBackend } = require('../auth/mongo-auth-backend');
-const sessionStore = require('../auth/session-store');
+const { createMongoConnection } = require('../db/mongo-connection');
 const { createReconnectScheduler } = require('../auth/reconnect');
 const { createPairingGuard } = require('../auth/pairing-guard');
 const { createSessionPurger } = require('../auth/session-purge');
@@ -191,98 +192,108 @@ function primaryOwnerNumber() {
 
 // ---------------- MONGO SETUP ----------------
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://test2_db_user:cSq3iGhurIFh9xpp@clusterrender.v8sosxk.mongodb.net/?appName=Clusterrender';
-const MONGO_DB = process.env.MONGO_DB || 'MUGIWARA_NO_PLAG'
-let mongoClient, mongoDB;
+// MONGO_URI est obligatoire. Aucun identifiant par défaut et aucun stockage
+// local de secours ne sont autorisés pour les sessions WhatsApp.
+const mongoConnection = createMongoConnection();
+let mongoDB;
+let mongoCollectionsPromise = null;
 let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
 
 async function initMongo() {
-  try {
-    if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected && mongoClient.topology.isConnected()) return;
-  } catch(e){}
-  mongoClient = new MongoClient(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
-  await mongoClient.connect();
-  mongoDB = mongoClient.db(MONGO_DB);
+  mongoDB = await mongoConnection.connect();
+  if (!mongoCollectionsPromise) {
+    mongoCollectionsPromise = (async () => {
+      sessionsCol = mongoDB.collection('sessions');
+      numbersCol = mongoDB.collection('numbers');
+      adminsCol = mongoDB.collection('admins');
+      newsletterCol = mongoDB.collection('newsletter_list');
+      configsCol = mongoDB.collection('configs');
+      newsletterReactsCol = mongoDB.collection('newsletter_reacts');
 
-  sessionsCol = mongoDB.collection('sessions');
-  numbersCol = mongoDB.collection('numbers');
-  adminsCol = mongoDB.collection('admins');
-  newsletterCol = mongoDB.collection('newsletter_list');
-  configsCol = mongoDB.collection('configs');
-  newsletterReactsCol = mongoDB.collection('newsletter_reacts');
-
-  await sessionsCol.createIndex({ number: 1 }, { unique: true });
-  await numbersCol.createIndex({ number: 1 }, { unique: true });
-  await newsletterCol.createIndex({ jid: 1 }, { unique: true });
-  await newsletterReactsCol.createIndex({ jid: 1 }, { unique: true });
-  await configsCol.createIndex({ number: 1 }, { unique: true });
-  await initStickerDb(mongoDB).catch(() => {});
-  await initReactionDb(mongoDB).catch(() => {});
-  console.log('✅ Mongo initialized and collections ready');
+      await Promise.all([
+        sessionsCol.createIndex({ number: 1 }, { unique: true }),
+        numbersCol.createIndex({ number: 1 }, { unique: true }),
+        newsletterCol.createIndex({ jid: 1 }, { unique: true }),
+        newsletterReactsCol.createIndex({ jid: 1 }, { unique: true }),
+        configsCol.createIndex({ number: 1 }, { unique: true })
+      ]);
+      await Promise.all([
+        initStickerDb(mongoDB),
+        initReactionDb(mongoDB)
+      ]);
+      console.log('✅ MongoDB connecté — collections et index prêts');
+    })().catch((error) => {
+      mongoCollectionsPromise = null;
+      throw error;
+    });
+  }
+  await mongoCollectionsPromise;
+  return mongoDB;
 }
 
 // ---------------- Persistance des sessions (creds + clés Signal) ----------------
 
-// Miroir MongoDB de l'état d'authentification : collection `sessions` pour les
-// creds et `session_keys` pour chaque clé Signal. Auparavant, seules les creds
-// étaient sauvegardées — les clés restaient sur un disque jetable.
 const authBackend = createMongoAuthBackend({
   initMongo,
   getDb: () => mongoDB
 });
+configureTranslationStorage({
+  initMongo,
+  getDb: () => mongoDB
+});
 
-// État d'authentification actif par numéro (permet flush/close à l'arrêt).
+// État d'authentification actif par numéro (cache mémoire d'exécution seulement).
 const authStates = new Map();
 
 function authStateFor(number) {
   return authStates.get(String(number).replace(/[^0-9]/g, '')) || null;
 }
 
-// Effacement complet d'une session ratée : disque + MongoDB (creds, clés Signal,
-// numéro). Voir src/auth/session-purge.js pour le détail.
+// Une session ratée est effacée exclusivement de MongoDB.
 const sessionPurger = createSessionPurger({
   authBackend,
-  removeSession: (n) => removeSessionFromMongo(n),
   removeNumber: (n) => removeNumberFromMongo(n)
 });
 
 // ---------------- Mongo helpers ----------------
-// NB : la sauvegarde des creds ne passe plus par ici mais par `authBackend`
-// (src/auth/mongo-auth-backend.js), qui persiste creds ET clés Signal.
-
-async function removeSessionFromMongo(number) {
-  try {
-    await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await sessionsCol.deleteOne({ number: sanitized });
-    console.log(`Removed session from Mongo for ${sanitized}`);
-  } catch (e) { console.error('removeSessionToMongo error:', e); }
-}
 
 async function addNumberToMongo(number) {
-  try {
-    await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await numbersCol.updateOne({ number: sanitized }, { $set: { number: sanitized } }, { upsert: true });
-    console.log(`Added number ${sanitized} to Mongo numbers`);
-  } catch (e) { console.error('addNumberToMongo', e); }
+  await initMongo();
+  const sanitized = number.replace(/[^0-9]/g, '');
+  await numbersCol.updateOne(
+    { number: sanitized },
+    { $set: { number: sanitized, updatedAt: new Date() } },
+    { upsert: true }
+  );
+  console.log(`Added number ${sanitized} to Mongo numbers`);
 }
 
 async function removeNumberFromMongo(number) {
-  try {
-    await initMongo();
-    const sanitized = number.replace(/[^0-9]/g, '');
-    await numbersCol.deleteOne({ number: sanitized });
-    console.log(`Removed number ${sanitized} from Mongo numbers`);
-  } catch (e) { console.error('removeNumberFromMongo', e); }
+  await initMongo();
+  const sanitized = number.replace(/[^0-9]/g, '');
+  await numbersCol.deleteOne({ number: sanitized });
+  console.log(`Removed number ${sanitized} from Mongo numbers`);
 }
 
 async function getAllNumbersFromMongo() {
-  try {
-    await initMongo();
-    const docs = await numbersCol.find({}).toArray();
-    return docs.map(d => d.number);
-  } catch (e) { console.error('getAllNumbersFromMongo', e); return []; }
+  await initMongo();
+  const [numberDocs, sessionDocs] = await Promise.all([
+    numbersCol.find({}, { projection: { number: 1 } }).toArray(),
+    sessionsCol.find({}, { projection: { number: 1, registered: 1, creds: 1, data: 1 } }).toArray()
+  ]);
+  const numbers = new Set(numberDocs.map((doc) => doc.number));
+
+  // Filet anti-crash : si le processus s'est arrêté juste après que Baileys a
+  // enregistré les creds mais avant l'upsert dans `numbers`, la session reste
+  // restaurable depuis son document auth MongoDB.
+  for (const doc of sessionDocs) {
+    let registered = doc.registered === true || doc.creds?.registered === true;
+    if (!registered && typeof doc.data === 'string') {
+      try { registered = JSON.parse(doc.data).registered === true; } catch (_) {}
+    }
+    if (registered && doc.number) numbers.add(doc.number);
+  }
+  return Array.from(numbers);
 }
 
 async function loadAdminsFromMongo(forceRefresh = false) {
@@ -512,9 +523,7 @@ async function stopRestartSchedule() {
   );
 }
 
-// Assure-toi que initMongo() initialise `mongoDB` (ex: mongoDB = client.db(process.env.MONGO_DB))
-
-(async () => {
+async function restoreRestartSchedule() {
   const doc = await getRestartSchedule();
   if (doc && doc.active && doc.minutes > 0) {
     global.restartTimer = setInterval(() => {
@@ -524,7 +533,7 @@ async function stopRestartSchedule() {
     global.restartInterval = doc.minutes;
     console.log(`✅ Schedule restart restauré: toutes les ${doc.minutes} minutes`);
   }
-})();
+}
 
 /**
  * Crée les index recommandés pour la collection status_infractions.
@@ -2990,7 +2999,7 @@ case 'style': {
   break;
 }
 // ============================================================
-// APK — Recherche avec carrousel interactif (Baileys/Wileys)
+// APK — Recherche avec carrousel interactif (Baileys officiel)
 // ============================================================
 case 'apk':
 case 'app':
@@ -6992,7 +7001,7 @@ case 'deleteme': {
     // (logout), plus aucune confirmation ne peut partir.
     await socket.sendMessage(sender, {
       image: { url: config.RCD_IMAGE_PATH },
-      caption: formatMessage('🗑️ SESSION DELETED', '✅ Your session has been successfully deleted from MongoDB and local storage.', BOT_NAME_FANCY)
+      caption: formatMessage('🗑️ SESSION DELETED', '✅ Your session has been successfully deleted from MongoDB.', BOT_NAME_FANCY)
     }, { quoted: msg });
 
     // Démontage complet : runtime, socket, dossier persistant, creds + clés Mongo.
@@ -10389,21 +10398,17 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
       try { socketInstance.ws?.close(); } catch (e) {}
     }
 
-    // 3) État d'authentification : on le ferme puis on supprime le dossier
-    //    persistant (sessions/<numéro>), plus l'ancien dossier tmp hérité des
-    //    versions précédentes.
+    // 3) On bloque les nouvelles écritures et on attend celles déjà parties.
+    //    Il n'existe aucun dossier de session local.
     const auth = authStates.get(sanitized);
-    if (auth) {
-      try { await auth.close(); } catch (e) {}
-      authStates.delete(sanitized);
-    }
-    try { await sessionStore.removeAuthDir(sessionStore.sessionDir(sanitized)); } catch (e) {}
-    try { fs.removeSync(path.join(os.tmpdir(), `session_${sanitized}`)); } catch (e) {}
+    authStates.delete(sanitized);
+    if (auth) await auth.discard();
 
-    // 4) MongoDB : creds ET clés Signal.
-    try { await authBackend.remove(sanitized); } catch (e) { console.warn('authBackend.remove:', e?.message || e); }
-    try { await removeSessionFromMongo(sanitized); } catch (e) {}
-    try { await removeNumberFromMongo(sanitized); } catch (e) {}
+    // 4) Source de vérité unique : creds, clés Signal et numéro dans MongoDB.
+    await Promise.all([
+      authBackend.remove(sanitized),
+      removeNumberFromMongo(sanitized)
+    ]);
 
     if (notifyOwner) {
       try {
@@ -10418,16 +10423,11 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
 }
 
 /**
- * Efface TOUTES les traces d'un appairage raté : runtime, disque et MongoDB.
+ * Efface toutes les traces d'un appairage raté : runtime et MongoDB.
  *
- * Sans ça, un pairing échoué laissait derrière lui un dossier `sessions/<numéro>`,
- * un document `sessions` en base (écrit par `creds.update`), un socket fantôme
- * dans `activeSockets` et le verrou d'appairage posé. La demande suivante
- * retombait sur l'un de ces restes et répondait sans code → « Indisponible ».
- *
- * Contrairement à `deleteSessionAndCleanup` (logout d'une session qui a
- * fonctionné), on ne notifie personne et on ne fait pas de logout WhatsApp :
- * la session n'a jamais existé côté serveur.
+ * Contrairement à `deleteSessionAndCleanup` (logout d'une session valide), on
+ * ne notifie personne et on ne fait pas de logout WhatsApp : la session n'a
+ * jamais été enregistrée côté serveur.
  */
 async function purgeFailedSession(number, { socket = null, reason = 'appairage échoué' } = {}) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
@@ -10445,13 +10445,19 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
     try { socket.ws?.close(); } catch (e) {}
   }
 
-  // 2) Persistant : état d'auth jeté, disque et MongoDB effacés.
+  // 2) Persistant : état mémoire jeté, documents MongoDB effacés.
   const auth = authStates.get(sanitized) || null;
   authStates.delete(sanitized);
   const result = await sessionPurger.purge(sanitized, { auth, reason });
 
   const all = ['runtime', ...result.traces];
-  console.warn(`[SESSION ${sanitized}] purge après ${reason} — traces effacées : ${all.join(', ')}`);
+  if (result.ok) {
+    console.warn(`[SESSION ${sanitized}] purge après ${reason} — traces effacées : ${all.join(', ')}`);
+  } else {
+    console.error(
+      `[SESSION ${sanitized}] purge incomplète après ${reason} : ${result.errors.join(' ; ')}`
+    );
+  }
   return result.ok;
 }
 
@@ -10528,12 +10534,12 @@ function setupAutoRestart(socket, number) {
   });
 }
 
-// ---------------- EmpirePair (pairing, session persistante, miroir Mongo) ----------------
+// ---------------- EmpirePair (pairing, sessions MongoDB uniquement) ----------------
 
 async function EmpirePair(number, res, options = {}) {
   // forceFresh : demande explicite d'un nouveau code (dashboard). On démolit
   // alors l'appairage en cours et on purge les restes au lieu de refuser.
-  const { forceFresh = false, source = 'interne' } = options;
+  const { forceFresh = false } = options;
   const sanitizedNumber = String(number).replace(/[^0-9]/g, '');
   if (!sanitizedNumber) throw new Error('Numéro de session invalide');
 
@@ -10550,78 +10556,109 @@ async function EmpirePair(number, res, options = {}) {
   }
 
   // --- Appairage déjà en cours. ---
-  if (pairingGuard.isLocked(sanitizedNumber)) {
-    if (!forceFresh) {
-      // Réponse explicite : le dashboard doit pouvoir l'afficher au lieu de
-      // retomber sur « Indisponible » faute de champ `code`.
-      if (res && !res.headersSent) {
-        res.send({
-          status: 'appairage_en_cours',
-          number: sanitizedNumber,
-          message: 'Un code est déjà en attente pour ce numéro. Saisis-le sur ton téléphone, ou force un nouveau code.'
+  if (pairingGuard.isLocked(sanitizedNumber) && !forceFresh) {
+    if (res && !res.headersSent) {
+      res.send({
+        status: 'appairage_en_cours',
+        number: sanitizedNumber,
+        message: 'Un code est déjà en attente pour ce numéro. Saisis-le sur ton téléphone, ou force un nouveau code.'
+      });
+    }
+    return;
+  }
+
+  // Un nouveau code forcé repart de zéro dans MongoDB, qu'un verrou runtime
+  // existe encore ou non. La purge est faite avant de reprendre le verrou.
+  if (forceFresh) {
+    const purged = await purgeFailedSession(sanitizedNumber, {
+      socket: pairingSockets.get(sanitizedNumber) || null,
+      reason: 'nouvelle demande de code (force)'
+    });
+    if (!purged) {
+      if (res && !res.headersSent && typeof res.status === 'function') {
+        res.status(503).send({
+          error: 'mongodb_purge_failed',
+          message: 'MongoDB n’a pas pu supprimer l’ancienne session. Aucun nouveau code n’a été créé.'
         });
       }
       return;
     }
-    // « Recommencer tout de suite » : on démolit l'essai précédent et on efface
-    // toutes ses traces avant de repartir de zéro.
-    const pending = pairingSockets.get(sanitizedNumber) || null;
-    await purgeFailedSession(sanitizedNumber, { socket: pending, reason: 'nouvelle demande de code (force)' });
   }
 
   pairingGuard.reacquire(sanitizedNumber);
-  await initMongo().catch(()=>{});
-
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
 
-  // --- Une demande explicite de code ne doit jamais réutiliser une session morte. ---
-  // Si des creds traînent (appairage abandonné, session corrompue), on les purge
-  // AVANT de créer l'état : sinon `creds.registered` peut valoir true, le bloc de
-  // demande de code est sauté, et aucune réponse n'est jamais envoyée.
-  if (forceFresh) {
-    const leftoverAuth = authStates.get(sanitizedNumber);
-    const avaitSession = Boolean(leftoverAuth) || fs.existsSync(sessionStore.sessionDir(sanitizedNumber));
-    if (avaitSession) {
-      await purgeFailedSession(sanitizedNumber, {
-        socket: pairingSockets.get(sanitizedNumber) || null,
-        reason: 'session résiduelle avant nouvel appairage'
+  try {
+    await initMongo();
+  } catch (err) {
+    pairingGuard.release(sanitizedNumber);
+    console.error(`[SESSION ${sanitizedNumber}] MongoDB indisponible :`, err.message || err);
+    if (res && !res.headersSent && typeof res.status === 'function') {
+      res.status(503).send({
+        error: 'mongodb_indisponible',
+        message: 'Connexion MongoDB obligatoire indisponible. Vérifie MONGO_URI puis réessaie.'
       });
+    }
+    return;
+  }
+
+  // Fermer et sauvegarder l'ancien état AVANT de relire MongoDB. Faire
+  // l'inverse chargerait un instantané obsolète puis écraserait la base avec le
+  // ratchet plus récent de l'ancien socket.
+  const previousAuth = authStates.get(sanitizedNumber);
+  if (previousAuth) {
+    try {
+      await previousAuth.close();
+      authStates.delete(sanitizedNumber);
+    } catch (err) {
+      pairingGuard.release(sanitizedNumber);
+      console.error(`[SESSION ${sanitizedNumber}] vidage MongoDB avant reconnexion :`, err?.message || err);
+      if (res && !res.headersSent && typeof res.status === 'function') {
+        res.status(503).send({
+          error: 'mongodb_indisponible',
+          message: 'Impossible de sauvegarder l’état précédent avant la reconnexion.'
+        });
+      }
+      return;
     }
   }
 
-  // État d'authentification persistant : dossier ./sessions/<numéro> (jamais le
-  // tmp, qui est vidé au redémarrage) + miroir MongoDB des creds ET des clés
-  // Signal. Écritures atomiques : un kill en pleine écriture ne peut plus
-  // produire un creds.json tronqué.
+  // MongoDB est l'unique source de vérité des creds et des clés Signal.
   let auth;
   try {
-    auth = await createPersistentAuthState(sanitizedNumber, {
+    auth = await createMongoAuthState(sanitizedNumber, {
       backend: authBackend,
       logger,
       initCreds: initAuthCreds
     });
   } catch (err) {
-    if (err instanceof AuthCorruptedError) {
+    if (err instanceof MongoAuthCorruptedError) {
       console.error(`[SESSION ${sanitizedNumber}] ${err.message}`);
+      const purged = await purgeFailedSession(sanitizedNumber, { reason: 'creds MongoDB invalides' });
+      if (res && !res.headersSent && typeof res.status === 'function') {
+        res.status(purged ? 409 : 503).send({
+          error: 'session_invalide',
+          message: purged
+            ? `${err.message} Les données invalides ont été supprimées ; relance l’appairage.`
+            : `${err.message} La purge MongoDB a échoué.`
+        });
+      }
     } else {
-      console.error(`[SESSION ${sanitizedNumber}] état d'authentification indisponible :`, err.message || err);
-    }
-    // Purge : des creds illisibles ne doivent pas bloquer le prochain essai.
-    await purgeFailedSession(sanitizedNumber, { reason: 'creds invalides' });
-    if (res && !res.headersSent && typeof res.status === 'function') {
-      res.status(500).send({ error: 'session_invalide', message: err.message });
+      pairingGuard.release(sanitizedNumber);
+      console.error(`[SESSION ${sanitizedNumber}] état MongoDB indisponible :`, err.message || err);
+      if (res && !res.headersSent && typeof res.status === 'function') {
+        res.status(503).send({
+          error: 'mongodb_indisponible',
+          message: err.message || String(err)
+        });
+      }
     }
     return;
   }
-  const { state, saveCreds } = auth;
-  // L'ancien état (s'il existe) est vidé puis remplacé : une seule source de
-  // vérité par numéro, donc plus de ratchet Signal qui avance en double.
-  const previousAuth = authStates.get(sanitizedNumber);
-  if (previousAuth && previousAuth !== auth) {
-    try { await previousAuth.flush(); } catch (e) {}
-  }
+  const { state } = auth;
   authStates.set(sanitizedNumber, auth);
   const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
+  let socket = null;
 
  try {
     // On ferme proprement un éventuel socket résiduel du même numéro AVANT d'en
@@ -10633,8 +10670,10 @@ async function EmpirePair(number, res, options = {}) {
       activeSockets.delete(sanitizedNumber);
     }
 
-    const socket = makeWASocket({
-      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+    socket = makeWASocket({
+      // mongo-auth-state possède déjà un cache mémoire write-through. Ajouter
+      // le cache Baileys par-dessus validerait une clé avant l'acquittement DB.
+      auth: { creds: state.creds, keys: state.keys },
       printQRInTerminal: false,
       logger,
       markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
@@ -10645,6 +10684,14 @@ async function EmpirePair(number, res, options = {}) {
 
 socketCreationTime.set(sanitizedNumber, Date.now());
 socket.downloadMediaMessage = (m, filename) => downloadMediaMessage(m, filename)
+// Branché immédiatement, avant requestPairingCode : le code d'appairage modifie
+// les creds et aucune mise à jour ne doit se perdre avant MongoDB.
+socket.ev.on('creds.update', () => {
+  void auth.saveCreds().catch((error) => {
+    console.error(`[AUTH ${sanitizedNumber}] sauvegarde MongoDB échouée :`, error?.message || error);
+    try { socket.ws?.close(); } catch (_) {}
+  });
+});
 // Garde-fou d'envoi : installé EN PREMIER pour que tous les `socket.sendMessage`
 // du bot (y compris ceux décorés par le thème) vérifient la connexion réelle.
 installSafeSend(socket);
@@ -10669,6 +10716,9 @@ handleMessageRevocation(socket, sanitizedNumber);
         try {
           await delay(1500);
           code = await socket.requestPairingCode(sanitizedNumber);
+          // Ne jamais remettre le code au navigateur avant que les creds qui
+          // lui correspondent soient acquittés par MongoDB.
+          await auth.saveCreds();
           break;
         } catch (error) {
           lastError = error;
@@ -10687,14 +10737,18 @@ handleMessageRevocation(socket, sanitizedNumber);
           res.send({ status: 'code_genere', code, pairingCode: code, number: sanitizedNumber });
         }
       } else {
-        // Échec définitif : on efface TOUTES les traces — runtime, disque et
-        // MongoDB — pour que la demande suivante reparte de zéro au lieu de
-        // retomber sur « Indisponible ».
-        await purgeFailedSession(sanitizedNumber, { socket, reason: 'génération du code impossible' });
+        // Échec définitif : on efface le runtime et les documents MongoDB pour
+        // que la prochaine demande reparte réellement de zéro.
+        const purged = await purgeFailedSession(
+          sanitizedNumber,
+          { socket, reason: 'génération du code impossible' }
+        );
         if (res && !res.headersSent && typeof res.status === 'function') {
-          res.status(502).send({
-            error: 'code_indisponible',
-            message: `Impossible de générer le code pour ${sanitizedNumber}. Toutes les traces de la tentative ont été effacées : tu peux réessayer immédiatement.`,
+          res.status(purged ? 502 : 503).send({
+            error: purged ? 'code_indisponible' : 'mongodb_purge_failed',
+            message: purged
+              ? `Impossible de générer le code pour ${sanitizedNumber}. La tentative a été supprimée de MongoDB : tu peux réessayer immédiatement.`
+              : `Impossible de générer le code pour ${sanitizedNumber}, puis de purger la tentative dans MongoDB. Vérifie la base avant de réessayer.`,
             detail: lastError?.message || String(lastError || 'raison inconnue')
           });
         }
@@ -10712,20 +10766,6 @@ handleMessageRevocation(socket, sanitizedNumber);
       }
     }
 
-    // Persistance des creds : déléguée à l'état d'authentification.
-    //
-    // L'ancien code relisait creds.json puis appelait
-    //   saveCredsToMongo(n, creds, state.keys)
-    // or `state.keys` est un objet de FONCTIONS ({ get, set }) : JSON.stringify
-    // en faisait `{}`. Le champ `keys` de MongoDB était donc toujours vide et
-    // les clés Signal n'étaient jamais sauvegardées. C'est la cause directe de
-    // la session « corrompue » après redémarrage.
-    //
-    // Les mises à jour peuvent être très fréquentes : `persistSoon` regroupe les
-    // écritures (disque atomique + MongoDB) sur un court délai.
-    socket.ev.on('creds.update', () => { auth.persistSoon(); });
-
-
     socket.ev.on('connection.update', async (update) => {
       const { connection } = update;
       if (connection === 'open') {
@@ -10736,6 +10776,11 @@ handleMessageRevocation(socket, sanitizedNumber);
         reconnectScheduler.reset(sanitizedNumber);
         lastConnectionActivity.set(sanitizedNumber, Date.now());
         try {
+          // Rendre la session restaurable avant les notifications, délais ou
+          // autres fonctionnalités non critiques du handler d'ouverture.
+          await auth.saveCreds();
+          await addNumberToMongo(sanitizedNumber);
+
           const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
           await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
           await delay(3000);
@@ -10824,10 +10869,6 @@ Le bot est maintenant connecté et fonctionnel.`,
             console.error('Failed during connect-message edit sequence:', e);
           }
 
-          // send admin + owner notifications as before, with session overrides
-          //await sendAdminConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
-         // await sendOwnerConnectMessage(socket, sanitizedNumber, groupResult, userConfig);
-          await addNumberToMongo(sanitizedNumber);
           await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
 
         } catch (e) {
@@ -10864,16 +10905,31 @@ Le bot est maintenant connecté et fonctionnel.`,
   } catch (error) {
     console.error('Pairing error:', error);
     socketCreationTime.delete(sanitizedNumber);
-    // Purge complète : sans ça, la tentative ratée laisse un dossier, un
-    // document Mongo et un verrou qui bloquent l'essai suivant.
-    await purgeFailedSession(sanitizedNumber, {
-      socket: pairingSockets.get(sanitizedNumber) || null,
-      reason: `erreur d'appairage (${error?.message || error})`
-    });
+    try { socket?.ws?.close(); } catch (_) {}
+
+    const registered = Boolean(auth?.state?.creds?.registered);
+    let purged = false;
+    if (registered) {
+      // Une erreur de socket ou de handler ne doit jamais détruire une session
+      // déjà valide. MongoDB reste intact pour la prochaine reconnexion.
+      pairingGuard.release(sanitizedNumber);
+      authStates.delete(sanitizedNumber);
+      try { await auth.close(); } catch (_) {}
+    } else {
+      purged = await purgeFailedSession(sanitizedNumber, {
+        socket: pairingSockets.get(sanitizedNumber) || socket,
+        reason: `erreur d'appairage (${error?.message || error})`
+      });
+    }
+
     if (res && !res.headersSent && typeof res.status === 'function') {
       res.status(503).send({
-        error: 'appairage_echoue',
-        message: `L'appairage a échoué pour ${sanitizedNumber}. Toutes les traces ont été effacées : tu peux réessayer immédiatement.`,
+        error: registered ? 'reconnexion_echouee' : 'appairage_echoue',
+        message: registered
+          ? `La reconnexion de ${sanitizedNumber} a échoué, mais sa session MongoDB a été conservée.`
+          : purged
+            ? `L'appairage a échoué pour ${sanitizedNumber}. La tentative MongoDB a été supprimée : tu peux réessayer.`
+            : `L'appairage a échoué pour ${sanitizedNumber} et la purge MongoDB est incomplète.`,
         detail: error?.message || String(error || 'raison inconnue')
       });
     }
@@ -11146,7 +11202,12 @@ router.get('/api/session/health', async (req, res) => {
         derniereActivite: lastConnectionActivity.get(number) || null
       });
     }
-    res.json({ ok: true, sessions, dossierSessions: sessionStore.SESSIONS_ROOT });
+    res.json({
+      ok: true,
+      stockageSessions: 'mongodb',
+      mongodbConnecte: mongoConnection.isConnected(),
+      sessions
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message || err });
   }
@@ -11158,10 +11219,13 @@ router.post('/api/session/delete', async (req, res) => {
     const { number } = req.body;
     if (!number) return res.status(400).json({ ok: false, error: 'number required' });
     const sanitized = ('' + number).replace(/[^0-9]/g, '');
-    // Même chemin de démontage que les commandes WhatsApp : socket, dossier
-    // persistant, creds et clés Signal dans MongoDB.
+    // Même chemin de démontage que les commandes WhatsApp : socket, creds et
+    // clés Signal dans MongoDB, sans dossier local.
     const running = activeSockets.get(sanitized) || null;
-    await deleteSessionAndCleanup(sanitized, running, { notifyOwner: false });
+    const removed = await deleteSessionAndCleanup(sanitized, running, { notifyOwner: false });
+    if (!removed) {
+      return res.status(503).json({ ok: false, error: `MongoDB n’a pas supprimé la session ${sanitized}` });
+    }
     res.json({ ok: true, message: `Session ${sanitized} removed` });
   } catch (err) {
     console.error('API /api/session/delete error', err);
@@ -11190,15 +11254,7 @@ router.get('/api/admins', async (req, res) => {
 
 // ---------------- cleanup + process events ----------------
 
-/**
- * Fermeture propre.
- *
- * L'ancien `process.on('exit')` supprimait `session_<numéro>` à CHAQUE arrêt du
- * processus. Combiné au fait que les clés Signal n'étaient jamais sauvegardées
- * dans MongoDB, chaque redémarrage (déploiement, OOM, pm2) repartait avec une
- * identité valide mais zéro clé : session « corrompue », messages bloqués en
- * attente. On ne supprime donc plus rien ici — on ferme et on sauvegarde.
- */
+/** Fermeture propre des sockets ; les sessions restent dans MongoDB. */
 process.on('exit', () => {
   activeSockets.forEach((socket, number) => {
     try { socket.ws.close(); } catch (e) {}
@@ -11211,14 +11267,15 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[SHUTDOWN] ${signal} — sauvegarde des sessions avant arrêt…`);
-  // `exit` ne peut pas faire d'asynchrone : le vidage se fait ici, sur SIGTERM
-  // (Render, Koyeb, Docker, pm2) et SIGINT.
-  await Promise.allSettled(
-    Array.from(authStates.values()).map((auth) => auth.close().catch(() => {}))
-  );
+  console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
   activeSockets.forEach((socket) => { try { socket.ws?.close(); } catch (e) {} });
-  console.log('[SHUTDOWN] sessions sauvegardées.');
+  await Promise.allSettled(
+    Array.from(authStates.values()).map((auth) => auth.close())
+  );
+  await mongoConnection.close().catch((error) => {
+    console.error('[SHUTDOWN] fermeture MongoDB :', error?.message || error);
+  });
+  console.log('[SHUTDOWN] sessions MongoDB synchronisées.');
   process.exit(0);
 }
 process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
@@ -11233,30 +11290,15 @@ process.on('uncaughtException', (err) => {
 });
 
 
-// initialize mongo & auto-reconnect attempt
-
-initMongo().catch(err => console.warn('Mongo init failed at startup', err));
-
-/**
- * Restauration des sessions au démarrage.
- *
- * Sources fusionnées : les numéros connus de MongoDB ET les dossiers présents
- * dans `sessions/` (utile si MongoDB est momentanément injoignable — le disque
- * persistant suffit alors à redémarrer le bot).
- */
+// Initialisation MongoDB et restauration des seules sessions présentes en base.
 async function restoreSessionsOnBoot() {
-  const numbers = new Set();
-  try {
-    const fromMongo = await getAllNumbersFromMongo();
-    for (const n of fromMongo || []) numbers.add(String(n).replace(/[^0-9]/g, ''));
-  } catch (e) { console.warn('getAllNumbersFromMongo (boot):', e?.message || e); }
-  try {
-    const onDisk = await sessionStore.listLocalSessions();
-    for (const n of onDisk) numbers.add(n);
-  } catch (e) { console.warn('listLocalSessions (boot):', e?.message || e); }
-  numbers.delete('');
+  const numbers = new Set(
+    (await getAllNumbersFromMongo())
+      .map((number) => String(number).replace(/[^0-9]/g, ''))
+      .filter(Boolean)
+  );
 
-  console.log(`[BOOT] ${numbers.size} session(s) à restaurer.`);
+  console.log(`[BOOT] ${numbers.size} session(s) MongoDB à restaurer.`);
   for (const n of numbers) {
     if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
     const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
@@ -11265,6 +11307,18 @@ async function restoreSessionsOnBoot() {
   }
 }
 
-void restoreSessionsOnBoot();
+async function bootstrapMongoSessions() {
+  try {
+    await initMongo();
+    await restoreRestartSchedule();
+    await restoreSessionsOnBoot();
+  } catch (error) {
+    // Le serveur HTTP reste joignable pour afficher le diagnostic, mais aucun
+    // socket WhatsApp ne démarre sans la source de vérité MongoDB.
+    console.error('[BOOT] MongoDB obligatoire indisponible :', error?.message || error);
+  }
+}
+
+void bootstrapMongoSessions();
 
 module.exports = router;

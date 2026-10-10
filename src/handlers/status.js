@@ -31,7 +31,7 @@ function markInnerMessageAsGroupStatus(message) {
 }
 
 /**
- * xzcbailz expose déjà les primitives nécessaires aux statuts de groupe. Le
+ * Baileys officiel expose les primitives nécessaires aux statuts de groupe. Le
  * contenu média est d'abord préparé/téléversé par generateWAMessageContent,
  * puis relayé au JID du groupe avec les deux marqueurs attendus par WhatsApp :
  * contextInfo.isGroupStatus et <meta is_group_status="true"/>.

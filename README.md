@@ -42,116 +42,89 @@
 
 ## 📁 Structure du Projet
 
-Seuls les fichiers indispensables au démarrage restent à la racine : tout le
-reste est rangé par responsabilité.
-
-```
-├── index.js                  # 🚀 Point d'entrée : serveur Express + montage du routeur
-├── package.json              # 📦 Dépendances et scripts
-├── .env.example              # 🔐 Variables d'environnement documentées
-├── .npmrc                    # ⚙️ legacy-peer-deps (conflit jimp imposé par wileys)
-├── .gitignore / LICENSE / README.md
-│
-├── config/
-│   ├── app.config.js         # ⚙️ Configuration générale lue depuis l'environnement
-│   └── data/                 # 🗂  Données JSON (cjid, commandes sticker/réaction)
-│
+```text
+├── index.js                       # Serveur Express
+├── package.json                   # Baileys officiel + scripts
+├── .env.example                   # Configuration documentée
 ├── src/
-│   ├── core/
-│   │   ├── pair.js           # 🤖 Moteur Baileys : sockets, commandes, routeur API
-│   │   └── pluginLoader.js   # 🔌 Chargeur + watcher de plugins
-│   ├── auth/                 # 🔐 Persistance des sessions (voir section dédiée)
-│   │   ├── session-store.js      # Écriture atomique, instantanés, quarantaine
-│   │   ├── persistent-auth.js    # État d'auth Baileys persistant (disque + Mongo)
-│   │   ├── mongo-auth-backend.js # Miroir MongoDB des creds ET des clés Signal
-│   │   ├── reconnect.js          # Ordonnanceur de reconnexion unique par session
-│   │   ├── pairing-guard.js      # Verrou d'appairage à libération explicite
-│   │   └── session-purge.js      # Effacement disque + MongoDB d'une session ratée
-│   ├── lib/                  # 🧰 Utilitaires (msg, normalize, s-utils, youtube, safe-send)
-│   ├── handlers/             # 🎯 Gestionnaires métier (antilink, statut, bienvenue)
-│   ├── features/             # ✨ Modules secondaires (tictactoe, traduction, setcmd)
-│   ├── services/             # 🛠  Services transverses (thème, présence, antidelete, …)
-│   └── plugins/              # 📦 Commandes modulaires (surveillées en temps réel)
-│       ├── general/  tools/  ai/  download/  group/  owner/
-│
-├── dashboard/
-│   ├── static/               # 🌐 Pages HTML du tableau de bord (servies sous /dashboard)
-│   ├── pages/                # 📄 Pages publiques (pairing, accueil, suppression)
-│   └── assets/
-│       └── copy-code.js      # 📋 Copie du code d'appairage (servi sur /assets/)
-│
+│   ├── core/pair.js               # Sockets, pairing et API
+│   ├── db/mongo-connection.js     # Connexion MongoDB unique + ping
+│   ├── auth/
+│   │   ├── auth-utils.js          # Validation des creds et numéros
+│   │   ├── mongo-auth-state.js    # Auth Baileys 100 % MongoDB
+│   │   ├── mongo-auth-backend.js  # Codec BufferJSON + collections auth
+│   │   ├── reconnect.js           # Reconnexion avec backoff
+│   │   ├── pairing-guard.js       # Verrou d'appairage
+│   │   └── session-purge.js       # Purge MongoDB ciblée
+│   ├── handlers/ features/ services/ lib/
+│   └── plugins/                   # Commandes rechargées à chaud
 ├── scripts/
-│   └── check-syntax.js       # ✅ `npm run test:syntax` sur tous les fichiers .js
-│
-├── sessions/                 # 🔐 Créé à l'exécution — creds + clés Signal (JAMAIS committé)
-└── test/                     # 🧪 Suite de tests (`npm test`)
+│   ├── check-mongodb.js           # `npm run mongo:check`
+│   └── check-syntax.js
+├── dashboard/
+└── test/
 ```
+
+Il n'existe plus de répertoire `sessions/` utilisé à l'exécution. Les fichiers
+temporaires créés pour traiter des médias ne contiennent jamais l'état
+d'authentification WhatsApp.
 
 ---
 
-## 🔐 Sessions : pourquoi les clés ne se corrompent plus
+## 🔐 Sessions exclusivement dans MongoDB
 
-Trois défauts se combinaient pour produire des sessions mortes et des réponses
-invisibles :
+Le bot utilise le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
+`7.0.0-rc14`), sans alias npm et sans fork Wileys.
 
-| Problème | Conséquence | Correctif |
-| --- | --- | --- |
-| Les sessions vivaient dans `os.tmpdir()` et étaient **supprimées par `process.on('exit')`** | Toute redeployment repartait de zéro | Sessions dans `sessions/<numéro>`, plus jamais supprimées à l'arrêt |
-| Seules les **creds** partaient dans MongoDB ; le champ `keys` recevait `state.keys`, un objet de fonctions sérialisé en `{}` | Les clés Signal (pre-key, session, sender-key) étaient perdues → ratchet désynchronisé | Collection `session_keys` : chaque clé est stockée et rechargée individuellement |
-| `creds.json` écrit de façon **non atomique** | Un kill en pleine écriture laissait un JSON tronqué → « clé corrompue » | Écriture tmp + `fsync` + `rename` ; creds invalides mis en quarantaine |
-| **Deux** gestionnaires `connection.update` reconnectaient chacun de leur côté | Deux sockets sur la même identité, chacun avançant son ratchet | Un seul ordonnanceur, idempotent, avec backoff et nombre maximal de tentatives |
+MongoDB est l'unique source de vérité :
 
-À cela s'ajoute l'envoi fiable (`src/lib/safe-send.js`) : `socket.sendMessage`
-vérifie que la websocket est réellement ouverte, attend la reconnexion si
-besoin, réessaie, puis **lève une erreur explicite** au lieu de faire croire que
-la réponse est partie. C'est ce qui élimine les réponses « en attente » que
-l'utilisateur ne recevait jamais.
+| Collection | Contenu |
+| --- | --- |
+| `sessions` | Une entrée de creds par numéro, encodée avec le `BufferJSON` officiel de Baileys |
+| `session_keys` | Une entrée par clé Signal (`pre-key`, `session`, `sender-key`, `app-state-sync-key`, etc.) |
+| `numbers` | Les numéros dont l'appairage a réellement abouti et qui doivent être restaurés au démarrage |
+
+Les creds et clés sont écrits en **write-through** : une mutation n'est validée
+en mémoire qu'après acquittement de MongoDB. Si la base est indisponible, le bot
+refuse de créer un code d'appairage au lieu de basculer silencieusement vers un
+fichier local. Au démarrage, seules les sessions listées dans MongoDB sont
+restaurées.
+
+Le codec BufferJSON conserve exactement les `Buffer`/`Uint8Array` attendus par
+Signal. Les anciens documents contenant directement les champs `creds` et
+`value` sont lus puis migrés automatiquement au premier chargement. En revanche,
+une ancienne session qui ne possède pas ses clés Signal dans `session_keys` doit
+être appairée une nouvelle fois.
+
+Pour valider la connexion, les droits et les index avant de démarrer :
+
+```bash
+npm run mongo:check
+```
+
+La commande effectue un vrai `ping` et crée/vérifie les index uniques utilisés
+par les sessions sans afficher l'URI ni le mot de passe.
 
 **Diagnostic en direct** : `GET /api/session/health` (dashboard authentifié)
-renvoie pour chaque session la source de l'état d'auth, le nombre de clés
-Signal, les écritures en attente, l'état de la websocket et les compteurs
-d'envoi réussis/échoués.
-
-> ⚠️ **Migration** : les sessions créées avant ce correctif n'ont aucune clé
-> Signal en base. Un **nouvel appairage** (`.pair` ou dashboard) est nécessaire
-> une seule fois ; ensuite les clés survivent aux redémarrages.
+indique `stockageSessions: "mongodb"`, l'état de la connexion, le nombre de clés
+Signal, les écritures en attente et l'état de chaque websocket.
 
 ---
 
-## 🔁 Appairage raté : « code indisponible »
+## 🔁 Appairage et purge fiable
 
-Un appairage qui échouait laissait des restes qui **bloquent définitivement** la
-demande suivante :
-
-| Reste | Effet sur la demande suivante |
-| --- | --- |
-| Verrou `connectingSessions` relâché seulement par un minuteur de 90 s | Réponse `{ status: 'already_connected_or_connecting' }`, **sans champ `code`** |
-| Socket d'appairage mort ajouté à `activeSockets` | Réponse `{ status: 'already_connected' }`, **sans champ `code`** |
-| `sessions/<numéro>/creds.json` conservé | `creds.registered` vrai → le bloc de demande de code est sauté → **aucune réponse envoyée** |
-| Document `sessions` en base | Le numéro est restauré à chaque démarrage pour générer un code que personne ne saisira |
-
-Le dashboard, ne trouvant ni `code` ni `pairingCode`, affichait alors
-`Indisponible` — de façon permanente.
-
-### Correctif
-
-- **`src/auth/pairing-guard.js`** — verrou à **libération explicite**. Le TTL ne
-  sert plus que de filet si le processus meurt en plein appairage.
-- **`src/auth/session-purge.js`** — effacement de toutes les traces persistantes :
-  dossier `sessions/<numéro>`, ancien dossier temporaire, collection `sessions`
-  (creds), collection `session_keys` (clés Signal) et collection `numbers`.
-  L'état d'authentification est **jeté** (`discard()`) et non sauvegardé
-  (`close()`), sans quoi la purge réécrirait les creds qu'elle vient d'effacer.
-- **Les sockets d'appairage sont séparés des sessions connectées** : un socket en
-  attente de code n'est plus pris pour une session active.
-- **Chaque chemin d'échec purge** : creds invalides, code impossible à générer,
-  erreur d'appairage, connexion fermée avant enregistrement.
-- **Un appairage abandonné n'est plus reconnecté en boucle** : il est purgé.
-- **Toujours une réponse HTTP explicite** : `502 code_indisponible` avec la vraie
-  raison, `session_existante`, `already_connected`, `appairage_en_cours`.
-- **Le dashboard** affiche le message réel, propose **« Réessayer maintenant »**
-  après un échec et **« Forcer un nouveau code »** si un appairage est déjà en
-  attente (`/code?number=…&force=1`).
+- Un socket en attente de code reste séparé des sockets actifs.
+- Un verrou par numéro empêche deux pairings ou deux ratchets concurrents.
+- Un appairage abandonné supprime les creds, les clés Signal et le numéro dans
+  MongoDB ; aucune trace locale n'est créée.
+- La purge attend d'abord les écritures déjà parties avant de supprimer les
+  documents, afin qu'une écriture tardive ne ressuscite pas la session.
+- Une erreur MongoDB renvoie explicitement `503 mongodb_indisponible` ou
+  `mongodb_purge_failed` ; le dashboard ne présente jamais un faux succès.
+- `force=1` détruit proprement l'ancienne tentative avant de demander un nouveau
+  code.
+- Un problème de reconnexion ne supprime jamais une session déjà enregistrée ;
+  seules les tentatives non enregistrées sont purgées.
 
 ---
 
@@ -188,15 +161,15 @@ n'écrivait plus le code dans un attribut et copiait donc parfois le libellé
 ## ⚙️ Installation & Démarrage
 
 ### 1. Prérequis
-- **Node.js** >= 18.x
+- **Node.js** >= 22.12 (interop CommonJS avec le paquet ESM de Baileys 7)
 - **FFmpeg** (pour la conversion audio/vidéo et stickers)
-- **MongoDB** (cluster local ou MongoDB Atlas)
+- **MongoDB** (cluster local ou MongoDB Atlas) accessible en permanence
 
 ### 2. Cloner le dépôt et installer les dépendances
 ```bash
-git clone https://github.com/Plag-509-5/gitposttt.git
-cd gitposttt
-npm install --legacy-peer-deps
+git clone https://github.com/Plag-509-5/bot.git
+cd bot
+npm install
 ```
 
 ### 3. Configuration de l'environnement
@@ -212,7 +185,9 @@ OWNER_NUMBER=50947440869
 PREFIX=.
 # Obligatoire : accès au dashboard par mot de passe uniquement
 ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
+# Obligatoire : unique stockage des sessions WhatsApp
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
+MONGO_DB=MUGIWARA_NO_PLAG
 
 # Requis uniquement pour importer un pack avec .tgs
 # Créez gratuitement un bot avec @BotFather puis collez son token ici.
@@ -237,10 +212,14 @@ CATBOX_USER_HASH=
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
 
-### 4. Lancer le Bot
+### 4. Tester MongoDB puis lancer le bot
 ```bash
+npm run mongo:check
 npm start
 ```
+
+N'essaie pas d'appairer un numéro tant que `mongo:check` n'affiche pas
+`MongoDB accessible`. Il n'existe volontairement aucun mode session locale.
 
 Le serveur démarrera sur `http://localhost:3000` :
 - **Page de pairing :** `http://localhost:3000/pair`
@@ -265,7 +244,7 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 2. Réponds avec le numéro du groupe affiché.
 3. Envoie `.swgc ton texte` ou réponds à une image, vidéo ou note audio avec `.swgc`.
 
-Le bot conserve le socket et le fork `xzcbailz` existants. Pour chaque publication, le média est préparé et téléversé avant d’être enveloppé dans `groupStatusMessageV2`; le message interne reçoit `contextInfo.isGroupStatus = true` et `relayMessage()` ajoute la métadonnée stanza `is_group_status="true"`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Le bot utilise les primitives du paquet Baileys officiel. Pour chaque publication, le média est préparé et téléversé avant d’être enveloppé dans `groupStatusMessageV2`; le message interne reçoit `contextInfo.isGroupStatus = true` et `relayMessage()` ajoute la métadonnée stanza `is_group_status="true"`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
 
 ---
 

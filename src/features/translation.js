@@ -1,102 +1,81 @@
-const { MongoClient } = require('mongodb');
+'use strict';
 
-// Configuration de la connexion MongoDB
-const MONGO_URI = process.env.MONGODB_URI || "mongodb+srv://MUGIWARA:adminplag@kaidomd.yev7rzt.mongodb.net/?appName=Kaidomd";
-const DB_NAME = "MUGIWARA_NO_PLAG"; // Modifiez si votre base de données a un autre nom
-const COLLECTION_NAME = "session_languages";
+const COLLECTION_NAME = 'session_languages';
 
-/**
- * Sauvegarde la langue d'une session dans MongoDB
- */
+let initMongoProvider = null;
+let getDbProvider = null;
+
+/** Réutilise la connexion MongoDB centrale du bot (aucun second pool/client). */
+function configureTranslationStorage({ initMongo, getDb } = {}) {
+  initMongoProvider = typeof initMongo === 'function' ? initMongo : null;
+  getDbProvider = typeof getDb === 'function' ? getDb : null;
+}
+
+async function translationCollection() {
+  if (!initMongoProvider || !getDbProvider) {
+    throw new Error('Stockage de traduction MongoDB non configuré');
+  }
+  await initMongoProvider();
+  const db = getDbProvider();
+  if (!db) throw new Error('MongoDB indisponible pour les langues de session');
+  return db.collection(COLLECTION_NAME);
+}
+
+/** Sauvegarde la langue d'une session dans le MongoDB central. */
 async function saveSessionLanguage(sessionId, langCode) {
-  let client;
-  try {
-    client = new MongoClient(MONGO_URI);
-    await client.connect();
-    const db = client.db(DB_NAME);
-    const collection = db.collection(COLLECTION_NAME);
-    
-    await collection.updateOne(
-      { sessionId: sessionId.toString() },
-      { $set: { lang: langCode.toLowerCase().trim(), updatedAt: new Date() } },
-      { upsert: true }
-    );
-  } catch (err) {
-    console.error("[MONGO LANG SAVE ERROR]", err);
-    throw err;
-  } finally {
-    if (client) await client.close();
-  }
+  const collection = await translationCollection();
+  await collection.updateOne(
+    { sessionId: String(sessionId) },
+    { $set: { lang: String(langCode).toLowerCase().trim(), updatedAt: new Date() } },
+    { upsert: true }
+  );
 }
 
-/**
- * Récupère la langue d'une session depuis MongoDB
- */
+/** Récupère la langue d'une session depuis MongoDB. */
 async function getSessionLanguage(sessionId) {
-  let client;
   try {
-    client = new MongoClient(MONGO_URI);
-    await client.connect();
-    const db = client.db(DB_NAME);
-    const collection = db.collection(COLLECTION_NAME);
-    
-    const doc = await collection.findOne({ sessionId: sessionId.toString() });
-    return doc ? doc.lang : 'fr'; // 'fr' par défaut si non configuré
-  } catch (err) {
-    console.error("[MONGO LANG GET ERROR]", err);
-    return 'fr'; // Fallback sur le français en cas d'erreur
-  } finally {
-    if (client) await client.close();
+    const collection = await translationCollection();
+    const doc = await collection.findOne({ sessionId: String(sessionId) });
+    return doc ? doc.lang : 'fr';
+  } catch (error) {
+    console.error('[MONGO LANG GET ERROR]', error?.message || error);
+    return 'fr';
   }
 }
 
-/**
- * Injecte le wrapper de traduction sur l'envoi de messages du socket
- */
+/** Injecte le wrapper de traduction sur l'envoi de messages du socket. */
 async function setupTranslationWrapper(socket, number) {
   if (!socket || !socket.sendMessage) {
     console.error("[TRANSLATION WRAPPER] L'instance socket est invalide.");
     return;
   }
 
-  // Sauvegarde de la méthode originale de Baileys
   const originalSendMessage = socket.sendMessage.bind(socket);
-
-  // Surcharge/Interception de sendMessage
   socket.sendMessage = async (jid, content, options = {}) => {
     try {
       const { translate } = require('@vitalets/google-translate-api');
       const sessionId = number || socket.user?.id?.split(':')[0];
-      
-      // Récupération asynchrone de la langue ciblée
       const targetLang = await getSessionLanguage(sessionId);
 
-      // On ne traduit que si la langue demandée n'est pas le français
       if (targetLang !== 'fr') {
-        
-        // 1. Traduction du texte brut (content.text)
-        if (content && typeof content.text === 'string' && content.text.trim().length > 0) {
+        if (content && typeof content.text === 'string' && content.text.trim()) {
           const translated = await translate(content.text, { to: targetLang, autoCorrect: true });
           if (translated?.text) content.text = translated.text;
         }
-        
-        // 2. Traduction de la légende de médias (content.caption)
-        if (content && typeof content.caption === 'string' && content.caption.trim().length > 0) {
+        if (content && typeof content.caption === 'string' && content.caption.trim()) {
           const translated = await translate(content.caption, { to: targetLang, autoCorrect: true });
           if (translated?.text) content.caption = translated.text;
         }
       }
-    } catch (transErr) {
-      console.error('[AUTOMATIC TRANSLATION ERROR]:', transErr.message || transErr);
+    } catch (error) {
+      console.error('[AUTOMATIC TRANSLATION ERROR]:', error?.message || error);
     }
-
-    // Exécution de l'envoi original Baileys
-    return await originalSendMessage(jid, content, options);
+    return originalSendMessage(jid, content, options);
   };
 }
 
-// Exportation des fonctions pour les utiliser dans pair.js
 module.exports = {
+  configureTranslationStorage,
   saveSessionLanguage,
   getSessionLanguage,
   setupTranslationWrapper
