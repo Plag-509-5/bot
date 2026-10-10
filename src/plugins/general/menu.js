@@ -223,7 +223,7 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}hidetag / ${p}h
 > ・ ${p}mute
 > ・ ${p}unmute
-> ・ ${p}swgc
+> ・ ${p}swgc / ${p}gcstatus (statut de groupe privé)
 > ・ ${p}setgpp
 > ・ ${p}listadmin
 > ・ ${p}creategroup

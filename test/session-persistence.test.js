@@ -51,20 +51,19 @@ test('le Baileys officiel est épinglé directement, sans alias ni fork', () => 
   assert.equal(require('@whiskeysockets/baileys/package.json').name, '@whiskeysockets/baileys');
   assert.equal(require('@whiskeysockets/baileys/package.json').version, '7.0.0-rc14');
 
-  // `wileys` est une exception volontaire, limitée aux helpers de construction
-  // des statuts de groupe (.swgc). Le reste des forks reste interdit.
+  // Le plugin de statut de groupe utilise lui aussi ce même Baileys officiel.
+  // Aucun fork ni paquet de helpers WhatsApp alternatif n’est requis.
   for (const forbidden of [
     '@rexxhayanasi/elaina-baileys',
     '@ryuu-reinzz/baileys',
     'baileyz',
-    'baileys'
+    'baileys',
+    'wileys'
   ]) {
     assert.equal(packageJson.dependencies[forbidden], undefined, `fork interdit : ${forbidden}`);
   }
   assert.doesNotMatch(packageJson.dependencies['@whiskeysockets/baileys'], /^npm:/);
-  assert.equal(packageJson.dependencies.wileys, '0.7.8', 'wileys doit être épinglé en version exacte');
-
-  // libsignal doit rester celui de Baileys officiel, même si wileys le déclare.
+  // libsignal doit toujours être remplacé par le commit officiel de Baileys.
   assert.equal(
     packageJson.overrides?.libsignal,
     'github:whiskeysockets/libsignal-node#bcea72df9ec34d9d9140ab30619cf479c7c144c7'

@@ -1652,10 +1652,12 @@ function setupCommandHandlers(socket, number) {
         activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
         await wakeForCommand(socket, msg, cfg);
         if (selection.status === 'selected') {
+          const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
           await socket.sendMessage(remoteJid, {
             text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
-              `Tu peux maintenant utiliser ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc <texte> ` +
-              `ou répondre à un média avec ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+              `Tu peux utiliser ${selectedPrefix}swgc <texte>[, couleur] ` +
+              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou audio.\n` +
+              'Couleurs : violet, bleu nuit, cyan, rose, or ou #rrggbb.'
           }, { quoted: msg });
         } else if (selection.status === 'invalid') {
           await socket.sendMessage(remoteJid, {
@@ -8629,7 +8631,7 @@ case 'menu': {
 > ・ .hidetag /.h
 > ・ .mute
 > ・ .unmute
-> ・ .swgc
+> ・ .swgc / .gcstatus
 > ・ .setgpp
 > ・ .listadmin
 > ・ .creategroup
@@ -8728,7 +8730,7 @@ ${footer}
           `.add, .kick, .creategroup\n` +
           `.save, .tovn, .vv\n` +
           `.play, .bible, .code\n` +
-          `.upch, .swgc, .img\n` +
+          `.upch, .swgc / .gcstatus, .img\n` +
           `\nUtilise .help [commande] pour plus d'info`
       }, { quoted: msg });
     } catch (e) {}
@@ -8737,7 +8739,7 @@ ${footer}
 }
 
 
-// `.swgc` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
+// `.swgc` / `.gcstatus` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
 // avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
 // le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
@@ -8791,7 +8793,7 @@ case 'help': {
 ・ .tagall               → Mentionne tous les membres du groupe.
 ・ .mute                 → Restreint l'envoi aux admins (admins).
 ・ .unmute               → Réactive l'envoi pour tous.
-・ .swgc                 → Publie un status de groupe (reply média ou texte).
+・ .swgc / .gcstatus     → Publie en privé un statut de groupe (texte, média ou audio stylisé).
 ・ .listadmin            → Liste les admins du groupe.
 ・ .creategroup          → Crée un nouveau groupe via le bot.
 ・ .listactive           → Liste les membres actifs.

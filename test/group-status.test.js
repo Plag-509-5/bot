@@ -7,8 +7,13 @@ const path = require('node:path');
 const selector = require('../src/services/group-status-selector');
 const {
   unwrapMessage,
-  buildGroupStatusPayload
+  buildGroupStatusPayload,
+  DEFAULT_TEXT_STATUS_FONT,
+  STATUS_BACKGROUND_PALETTE,
+  parseStatusColor,
+  splitTextAndColor
 } = require('../src/services/group-status-content');
+const audioStatus = require('../src/services/group-status-audio');
 const swgc = require('../src/plugins/group/swgc');
 const { groupStatus, isGroupJid } = require('../src/handlers/status');
 
@@ -57,6 +62,9 @@ function privateFixture() {
       sessionNumber: '50900000000',
       args: [],
       prefix: '.',
+      isOwner: true,
+      isSessionOwner: false,
+      isSudo: false,
       quotedMsg: null
     }
   };
@@ -71,6 +79,8 @@ test('liste seulement les groupes dont l’utilisateur fait partie et les trie',
   assert.match(list, /1\. Amis/);
   assert.match(list, /2\. Zèbres/);
   assert.match(list, /Réponds simplement avec le numéro/);
+  assert.match(list, /MUGIWARA NO PLAG/);
+  assert.match(list, /gcstatus/);
 });
 
 test('reconnaît les identités PN/LID et leurs champs alternatifs', () => {
@@ -112,13 +122,39 @@ test('expire proprement une sélection qui attend trop longtemps', () => {
   assert.equal(selector.getSelectedGroup('5091', 'user'), null);
 });
 
-test('construit des statuts propres sans watermark pour texte, image, vidéo et audio', async () => {
+test('les textes utilisent la nouvelle police et la palette sombre personnalisée', async () => {
+  assert.equal(DEFAULT_TEXT_STATUS_FONT, 2);
+  assert.ok(STATUS_BACKGROUND_PALETTE.length >= 5);
+  assert.equal(parseStatusColor('VIOLET'), '#5537A8');
+  assert.equal(parseStatusColor('nuit'), '#12002B');
+  assert.equal(parseStatusColor('bleu nuit'), '#14213D');
+  assert.equal(parseStatusColor('or'), '#8A6416');
+  assert.equal(parseStatusColor('doré'), '#8A6416');
+  assert.equal(parseStatusColor('#ff8800'), '#FF8800');
+  assert.equal(parseStatusColor('constructor'), null);
+  assert.equal(parseStatusColor('couleur inconnue'), null);
+  assert.deepEqual(splitTextAndColor('Salut tout le monde, violet'), {
+    text: 'Salut tout le monde',
+    color: '#5537A8',
+    colorName: 'violet'
+  });
+  assert.deepEqual(splitTextAndColor('Bonjour, avec une virgule'), {
+    text: 'Bonjour, avec une virgule',
+    color: null,
+    colorName: ''
+  });
+
+  const text = await buildGroupStatusPayload({ textInput: 'Bonjour propre, violet', random: () => 0 });
+  assert.deepEqual(text.payload, { text: 'Bonjour propre', backgroundColor: '#5537A8', font: 2 });
+  const defaultText = await buildGroupStatusPayload({ textInput: 'Bonjour propre', random: () => 0 });
+  assert.equal(defaultText.payload.backgroundColor, STATUS_BACKGROUND_PALETTE[0]);
+  assert.equal(defaultText.payload.font, 2);
+});
+
+test('construit les statuts image/vidéo et transforme les audios en vidéo de marque', async () => {
   const downloadContent = async function * download(media) {
     yield Buffer.from(media.bytes);
   };
-  const text = await buildGroupStatusPayload({ textInput: 'Bonjour propre', random: () => 0 });
-  assert.deepEqual(text.payload, { text: 'Bonjour propre', backgroundColor: '#000000', font: 3 });
-
   const image = await buildGroupStatusPayload({
     quotedMessage: { viewOnceMessage: { message: { imageMessage: { bytes: 'img', caption: 'originale' } } } },
     textInput: 'nouvelle légende',
@@ -144,14 +180,49 @@ test('construit des statuts propres sans watermark pour texte, image, vidéo et 
   assert.equal(video.payload.video.toString(), 'vid');
   assert.equal(video.payload.caption, 'vidéo');
 
+  let conversionOptions;
   const audio = await buildGroupStatusPayload({
-    quotedMessage: { audioMessage: { bytes: 'aud', mimetype: 'audio/ogg', ptt: true } },
-    downloadContent
+    quotedMessage: { audioMessage: { bytes: 'aud', mimetype: 'audio/ogg', ptt: true, seconds: 41, caption: 'note audio' } },
+    downloadContent,
+    audioToStatusVideo: async (buffer, options) => {
+      assert.equal(buffer.toString(), 'aud');
+      conversionOptions = options;
+      return Buffer.from('mp4-video');
+    }
   });
-  assert.equal(audio.payload.audio.toString(), 'aud');
-  assert.equal(audio.payload.ptt, true);
-  assert.doesNotMatch(JSON.stringify([text, image, video, audio]), /posted by|Kaido-MD/i);
+  assert.equal(audio.type, 'audio');
+  assert.equal(audio.payload.video.toString(), 'mp4-video');
+  assert.equal(audio.payload.mimetype, 'video/mp4');
+  assert.equal(audio.payload.caption, 'note audio');
+  assert.deepEqual(conversionOptions, { durationSeconds: 41 });
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
+});
+
+test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
+  const paths = {
+    title: '/tmp/title.txt',
+    subtitle: '/tmp/subtitle.txt',
+    tags: '/tmp/tags.txt',
+    current: '/tmp/current.txt',
+    total: '/tmp/total.txt'
+  };
+  const graph = audioStatus.buildAudioStatusFilterGraph({
+    fontPath: '/app/assets/fonts/Poppins-SemiBold.ttf',
+    textPaths: paths,
+    durationSeconds: 65
+  });
+
+  assert.equal(audioStatus.BRANDING.title, 'MUGIWARA NO PLAG');
+  assert.equal(audioStatus.BRANDING.subtitle, 'DEVELOPER DE KAIDO MD');
+  assert.match(graph, /showwaves=s=640x300/);
+  assert.match(graph, /drawtext=fontfile=\/app\/assets\/fonts\/Poppins-SemiBold\.ttf/);
+  assert.match(graph, /0x0B0D19/);
+  assert.match(graph, /alpha='min\(1,max\(0,/);
+  assert.match(graph, /600\*t\/65\.00/);
+  assert.ok(fs.existsSync(audioStatus.FONT_CANDIDATES[0]));
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'assets', 'fonts', 'OFL-Poppins.txt')));
+  assert.equal(audioStatus.formatTime(65), '01:05');
+  assert.equal(audioStatus.formatTime(3665), '1:01:05');
 });
 
 test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs de statut de groupe', async () => {
@@ -197,8 +268,8 @@ test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs d
     }],
     ['text', {
       text: 'Bonjour groupe',
-      backgroundColor: '#000000',
-      font: 3
+      backgroundColor: '#5537A8',
+      font: 2
     }]
   ];
 
@@ -223,8 +294,8 @@ test('Baileys officiel relaie image, vidéo, audio et texte avec les marqueurs d
     if (payload.caption) assert.equal(media.caption, payload.caption);
     if (type === 'text') {
       assert.equal(media.text, payload.text);
-      assert.equal(media.font, 3);
-      assert.equal(media.backgroundArgb, 0xff000000);
+      assert.equal(media.font, 2);
+      assert.equal(media.backgroundArgb, 0xff5537a8);
     } else {
       assert.ok(media.fileLength, `${type} n’a pas été téléversé`);
     }
@@ -272,13 +343,52 @@ test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay
 });
 
 test('les confirmations swgc restent concises pour chaque type', () => {
-  const labels = { image: 'image', video: 'video', audio: 'audio', text: 'texte' };
+  const labels = { image: 'image', video: 'vidéo', audio: 'audio stylisé en vidéo', text: 'texte' };
   for (const [type, label] of Object.entries(labels)) {
     assert.equal(
       swgc._test.groupStatusConfirmation(type, 'Amis'),
       `Statut ${label} posté sur : Amis`
     );
   }
+  assert.ok(swgc.alias.includes('gcstatus'));
+});
+
+test('le statut de groupe reste réservé au propriétaire et refuse en privé', async () => {
+  resetSelections();
+  const fixture = privateFixture();
+  const unauthorized = {
+    ...fixture.context,
+    isOwner: false,
+    isSessionOwner: false,
+    isSudo: false,
+    args: ['publication interdite']
+  };
+  const published = [];
+  await swgc._test.executeSwgc(unauthorized, {
+    async publishGroupStatus(_socket, jid, payload) { published.push({ jid, payload }); }
+  });
+
+  assert.equal(published.length, 0);
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0].jid, fixture.context.from);
+  assert.match(fixture.sent[0].content.text, /réservée au propriétaire/i);
+  assert.equal(fixture.sent.some(event => event.jid.endsWith('@g.us')), false);
+
+  const groupFixture = privateFixture();
+  await swgc._test.executeSwgc({
+    ...groupFixture.context,
+    isOwner: false,
+    from: '111@g.us',
+    sender: '50911111111@s.whatsapp.net',
+    args: ['publication interdite'],
+    msg: {
+      key: { remoteJid: '111@g.us', participant: '50911111111@s.whatsapp.net' },
+      message: {}
+    }
+  });
+  assert.equal(groupFixture.sent.length, 1);
+  assert.equal(groupFixture.sent[0].jid, '50911111111@s.whatsapp.net');
+  assert.equal(groupFixture.sent.some(event => event.jid.endsWith('@g.us')), false);
 });
 
 test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le groupe', async () => {
@@ -340,7 +450,7 @@ test('le handler intercepte la réponse numérique et l’ancien case swgc bruya
   assert.doesNotMatch(statusSource, /socket\.sendMessage\(jid/);
 });
 
-test('wileys construit le statut, le média passe par un fichier temporaire supprimé après envoi', async () => {
+test('Baileys construit le statut et nettoie le média temporaire après téléversement', async () => {
   const uploadedPaths = [];
   const relayed = [];
   const socket = {
@@ -374,10 +484,12 @@ test('wileys construit le statut, le média passe par un fichier temporaire supp
   assert.ok(relayed[0].message.groupStatusMessageV2?.message?.imageMessage, 'imageMessage absent');
 });
 
-test('le statut de groupe est construit par wileys et relayé par le socket officiel', () => {
+test('le plugin utilise les helpers de génération et le relay du Baileys du projet', () => {
   const statusSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'status.js'), 'utf8');
-  assert.match(statusSource, /require\("wileys"\)/);
-  assert.doesNotMatch(statusSource, /require\("@whiskeysockets\/baileys"\)/);
+  assert.match(statusSource, /require\("@whiskeysockets\/baileys"\)/);
+  assert.match(statusSource, /generateWAMessageContent/);
+  assert.match(statusSource, /generateWAMessageFromContent/);
   assert.match(statusSource, /socket\.relayMessage\(jid/);
-  assert.equal(require('../package.json').dependencies.wileys, '0.7.8');
+  assert.doesNotMatch(statusSource, /wileys/);
+  assert.equal(require('../package.json').dependencies.wileys, undefined);
 });

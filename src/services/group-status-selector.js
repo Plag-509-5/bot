@@ -140,7 +140,10 @@ function renderGroupSelectionList(groups, prefix = '.') {
     ...groups.map((group, index) => `${index + 1}. ${cleanGroupName(group.subject)}${group.size ? ` — ${group.size} membres` : ''}`),
     '',
     'Réponds simplement avec le numéro du groupe.',
-    `Après la sélection : ${prefix}swgc <texte> ou réponds à un média avec ${prefix}swgc.`
+    `Après la sélection : ${prefix}swgc <texte>[, couleur] ou réponds à un média avec ${prefix}swgc.`,
+    `Couleurs : nuit, noir, blanc, rouge, vert, bleu, jaune, violet, orange, rose, gris, cyan, turquoise, bleu nuit, or/doré ou #rrggbb. Alias : ${prefix}gcstatus.`,
+    '',
+    'MUGIWARA NO PLAG • developer de Kaido MD'
   ];
   return lines.join('\n');
 }

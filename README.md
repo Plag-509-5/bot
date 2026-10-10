@@ -30,7 +30,7 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
-  - **Statuts de groupe (`.swgc`) :** en privé, affiche les groupes communs, mémorise la cible choisie par numéro, puis publie textes/images/vidéos/audios via `groupStatusMessageV2` sans envoyer de confirmation dans la conversation du groupe.
+  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** le propriétaire choisit le groupe cible en privé, puis publie texte/image/vidéo/audio via `groupStatusMessageV2` sans confirmation dans le chat du groupe. Les textes ont une palette sombre personnalisée et une police WhatsApp plus élégante; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -73,13 +73,12 @@ d'authentification WhatsApp.
 
 ## 🔐 Sessions exclusivement dans MongoDB
 
-Le bot utilise le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
-`7.0.0-rc14`), sans alias npm. Une seule exception, décidée pour `.swgc` : le
-paquet **`wileys`** (version épinglée `0.7.8`) fournit les helpers de
-construction des statuts de groupe (`generateWAMessageContent` /
-`generateWAMessageFromContent`). L'envoi reste assuré par le socket Baileys
-officiel (`relayMessage`). Pour que le chiffrement Signal reste celui de Baileys,
-`package.json` force `libsignal` sur le commit officiel via `overrides`.
+Le bot utilise uniquement le paquet officiel **`@whiskeysockets/baileys`**
+(version épinglée `7.0.0-rc14`), sans alias ni fork. `.swgc` utilise ses helpers
+`generateWAMessageContent` / `generateWAMessageFromContent`, son téléversement
+média, puis le socket de la session (`relayMessage`) pour publier les statuts de
+groupe. Pour que le chiffrement Signal reste celui de Baileys, `package.json`
+force `libsignal` sur le commit officiel via `overrides`.
 
 MongoDB est l'unique source de vérité :
 
@@ -279,13 +278,16 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
-### Statut de groupe privé avec `.swgc`
+### Statut de groupe privé avec `.swgc` / `.gcstatus`
 
-1. Envoie `.swgc` au bot en conversation privée.
-2. Réponds avec le numéro du groupe affiché.
-3. Envoie `.swgc ton texte` ou réponds à une image, vidéo ou note audio avec `.swgc`.
+1. Le propriétaire du bot envoie `.swgc` (ou `.gcstatus`) au bot en conversation privée.
+2. Il répond avec le numéro du groupe affiché; le choix expire après cinq minutes.
+3. Il publie avec `.swgc ton texte, violet` (ou `.gcstatus`) ou répond à une image, vidéo ou note audio avec la commande.
+4. Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Le bot utilise les primitives du paquet Baileys officiel. Pour chaque publication, le média est préparé et téléversé avant d’être enveloppé dans `groupStatusMessageV2`; le message interne reçoit `contextInfo.isGroupStatus = true` et `relayMessage()` ajoute la métadonnée stanza `is_group_status="true"`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le projet utilise toujours les primitives Baileys officielles et relaie le statut dans `groupStatusMessageV2`; il ne dépend pas de `@nyxcore/nyxcoresocket`. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+
+Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
 
 ---
 
