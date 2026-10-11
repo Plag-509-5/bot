@@ -1797,8 +1797,11 @@ function setupCommandHandlers(socket, number) {
     }
 
     const tttFrom = remoteJid;
+    const normalizedBotJid = socket.user?.id
+      ? (jidNormalizedUser(socket.user.id) || socket.user.id)
+      : '';
     const tttSender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
 
     const isTttMove = await handleTicTacToeMove(socket, msg, tttFrom, tttSender, body);
@@ -1824,7 +1827,7 @@ function setupCommandHandlers(socket, number) {
     const from = remoteJid;
     const sender = from;
     const nowsender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
     const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
     const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
@@ -2074,7 +2077,7 @@ case 'tictactoe': {
 
 case 'delttt':
 case 'removettt': {
-  const deleted = deleteGame(from);
+  const deleted = deleteGame(socket, from);
   if (deleted) {
     await socket.sendMessage(from, { text: `🛑 *La partie de Morpion rétro a été annulée avec succès.*` }, { quoted: msg });
   } else {

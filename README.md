@@ -37,7 +37,7 @@
   - Capture d'écran de pages web en direct (`.ssweb`).
   - Téléversement de fichiers vers lien direct avec fallback automatique Uguu/Catbox/0x0.st/TmpFiles (`.tourl`).
   - Générateur de polices stylisées (`.fancy`).
-  - Jeux interactifs : Morpion rétro (`.ttt`, `.delttt`).
+  - Jeu de morpion multijoueur (`.ttt @joueur`, ou `.ttt` en répondant à un message) : les joueurs répondent avec le numéro d’une case (1–9); tours, mentions, victoires, défaites et matchs nuls sont gérés automatiquement. `.delttt` annule la partie.
 
 ---
 
