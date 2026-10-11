@@ -110,6 +110,8 @@ const {
   createPairingLifecycle,
   waitForPairingReady
 } = require('../auth/pairing-lifecycle');
+const { issuePairingCode } = require('../auth/pairing-code');
+const { createPairingCodeUrl } = require('../services/pairing-code-url');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
   createBaileysVersionResolver,
@@ -721,6 +723,12 @@ const PAIRING_READY_TIMEOUT_MS = Math.max(
 const WA_VERSION_FETCH_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.WA_VERSION_FETCH_TIMEOUT_MS) || 12000
+);
+// La route /code peut attendre le handshake Baileys, la version live et MongoDB.
+// Le client de la commande .code doit laisser finir cette même requête locale.
+const PAIRING_CODE_HTTP_TIMEOUT_MS = Math.max(
+  60000,
+  Number(process.env.PAIRING_CODE_HTTP_TIMEOUT_MS) || 120000
 );
 // Tuple canonique : le flux pairing-code valide plus strictement les libellés
 // navigateur/OS que le QR. `Ubuntu + Chrome` est reconnu par Baileys/WhatsApp.
@@ -6943,16 +6951,14 @@ case 'code': {
       fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
     }
 
-    const url = `https://kaidomd-byplag.mooo.com/code?number=${encodeURIComponent(cleanNumber)}`;
+    const url = createPairingCodeUrl(cleanNumber);
     const response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
         'Accept': 'application/json'
       },
-      timeout: 30000
+      timeout: PAIRING_CODE_HTTP_TIMEOUT_MS
     });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 
     const bodyText = await response.text();
     let result;
@@ -6961,10 +6967,16 @@ case 'code': {
     } catch {
       const codeMatch = bodyText.match(/"code"\s*:\s*"([^"]+)"/) || bodyText.match(/'code'\s*:\s*'([^']+)'/);
       if (codeMatch) result = { code: codeMatch[1] };
+      else if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       else throw new Error("Réponse invalide du serveur");
     }
 
-    if (!result || !result.code) throw new Error("Aucun code reçu du serveur");
+    if (!response.ok) {
+      throw new Error(result?.message || result?.error || `HTTP ${response.status}: ${response.statusText}`);
+    }
+    if (!result || !result.code) {
+      throw new Error(result?.message || result?.error || "Aucun code reçu du serveur");
+    }
 
     const code = result.code.trim();
 
@@ -10802,9 +10814,9 @@ socket.ev.on('creds.update', () => {
 // Branché avant tout await : il doit voir pair-success puis le close 515, même
 // si l'initialisation d'un handler métier prend du temps.
 const pairingLifecycle = setupAutoRestart(socket, sanitizedNumber, auth);
-// Le stanza pair-device peut arriver pendant l'initialisation des wrappers :
-// on s'abonne donc tout de suite, puis on attend le résultat juste avant la
-// demande de code. La promesse convertit son rejet pour éviter tout unhandled.
+// Le handshake Baileys peut terminer pendant l'initialisation des handlers :
+// on s'abonne tout de suite, puis la demande de code attend le premier stanza
+// déchiffré (ou update.qr) sans imposer le parcours QR.
 const pairingReadyResult = socket.authState.creds.registered
   ? null
   : waitForPairingReady(socket, { timeoutMs: PAIRING_READY_TIMEOUT_MS }).then(
@@ -10846,20 +10858,18 @@ handleMessageRevocation(socket, sanitizedNumber);
       let code = null;
       let lastError = null;
       try {
-        const ready = await pairingReadyResult;
-        if (!ready?.ok) throw ready?.error || new Error('WhatsApp non prêt pour l’appairage');
-        pairingLifecycle.markPairingReady();
-        pairingLifecycle.markCodeRequested();
-
         // Une seule demande par socket. Réessayer automatiquement ici peut
         // écraser creds.pairingCode alors que le téléphone traite encore la
         // première réponse (voir le cycle delayed primary_hello de Baileys).
-        code = await socket.requestPairingCode(sanitizedNumber);
-        // Ne jamais remettre le code au navigateur avant que les creds qui lui
-        // correspondent soient acquittées par MongoDB.
-        await auth.saveCreds();
-        await auth.flush();
-        pairingLifecycle.markCodeIssued();
+        code = await issuePairingCode({
+          socket,
+          number: sanitizedNumber,
+          auth,
+          readiness: pairingReadyResult,
+          onReady: () => pairingLifecycle.markPairingReady(),
+          onRequest: () => pairingLifecycle.markCodeRequested(),
+          onIssued: () => pairingLifecycle.markCodeIssued()
+        });
       } catch (error) {
         lastError = error;
         console.warn(
