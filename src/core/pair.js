@@ -65,6 +65,7 @@ const {
   setupTranslationWrapper,
   saveSessionLanguage
 } = require('../features/translation');
+const { configureGitHubUpdateSettings } = require('../services/github-update-settings');
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
 const { getGroupAdminsInfo, jidToNumber } = require('../lib/normalize');
@@ -248,6 +249,10 @@ const authBackend = createMongoAuthBackend({
   getDb: () => mongoDB
 });
 configureTranslationStorage({
+  initMongo,
+  getDb: () => mongoDB
+});
+configureGitHubUpdateSettings({
   initMongo,
   getDb: () => mongoDB
 });

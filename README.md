@@ -324,18 +324,28 @@ L’audience est enregistrée **par session** dans MongoDB :
 - Une liste personnalisée ne distribue le statut qu’aux numéros indiqués, plus le compte qui le publie.
 - Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
 - `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
-- Les publications sont envoyées à `status@broadcast` avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
+- Les publications sont envoyées à `status@broadcast` en mode broadcast avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
 
 ### Mise à jour depuis GitHub avec `.update`
 
 ```text
 .update check
-.update
+.update repos
+.update repo Plag-509-5/bot
+.update branches
+.update branch main
+.update status
+.update apply
+.update reset
 ```
 
-`.update check` compare le commit installé au dernier commit de la branche GitHub configurée et affiche les fichiers concernés sans les modifier. `.update` applique la mise à jour par fast-forward; `.update apply` est équivalent. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer la commande.
+`.update check` compare le commit installé au dépôt et à la branche sélectionnés, affiche les fichiers concernés et les branches disponibles sans modifier le clone. `.update` et `.update apply` appliquent le fast-forward. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer ces commandes.
 
-Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. La branche `main` est utilisée par défaut; définis `BOT_UPDATE_BRANCH` pour en choisir une autre. La mise à jour refuse de continuer si des fichiers suivis ont des changements locaux ou si les branches ont divergé : elle ne fait jamais de `reset --hard` et ne remplace pas les fichiers locaux silencieusement. Les fichiers non suivis tels que `.env` ne sont pas visés.
+Configure `BOT_UPDATE_GITHUB_TOKEN` dans `.env` pour que le bot liste les dépôts accessibles (`.update repos`) et lise les dépôts privés. Utilise un token à privilèges minimaux, limité aux dépôts nécessaires et avec les permissions GitHub de métadonnées et de contenu en lecture. Le token n’est ni enregistré dans MongoDB ni affiché par le bot; ne l’envoie jamais dans WhatsApp. Les branches et dépôts publics peuvent être consultés sans token, sous réserve des limites d’API GitHub.
+
+`.update repo <owner/repo>` vérifie l’accès au dépôt et sélectionne sa branche par défaut. `.update branches` liste ses branches; `.update branch <nom>` en choisit une. La sélection est partagée par le bot et persistée dans MongoDB. En l’absence de sélection enregistrée, `BOT_UPDATE_REPO` et `BOT_UPDATE_BRANCH` dans `.env` servent de valeurs par défaut; sans dépôt configuré, le remote Git `origin` est utilisé et la branche par défaut est `main`. `.update reset` efface la sélection persistée.
+
+Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. La mise à jour refuse de continuer si des fichiers suivis ont des changements locaux, si les historiques n’ont pas de base commune ou si les branches ont divergé : elle ne fait jamais de `reset --hard` et ne remplace pas les fichiers locaux silencieusement. Les fichiers non suivis tels que `.env` ne sont pas visés. Le dépôt/branche choisi doit donc pouvoir avancer le commit installé par fast-forward.
 
 Après le fast-forward, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
 

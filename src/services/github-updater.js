@@ -7,6 +7,10 @@ const { promisify } = require('node:util');
 const execFileAsync = promisify(execFile);
 const DEFAULT_UPDATE_BRANCH = 'main';
 const GIT_COMMAND_TIMEOUT_MS = 90_000;
+const GITHUB_API_TIMEOUT_MS = 15_000;
+const GITHUB_API_PAGE_SIZE = 100;
+const GITHUB_API_MAX_PAGES = 10;
+const GITHUB_API_BASE_URL = 'https://api.github.com';
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 function validateBranchName(value = DEFAULT_UPDATE_BRANCH) {
@@ -27,6 +31,8 @@ function parseGitHubRepository(remoteUrl) {
   const value = String(remoteUrl || '').trim();
   let repositoryPath = '';
 
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value)) return value;
+
   const sshMatch = value.match(/^(?:git@github\.com:|ssh:\/\/git@github\.com\/)(.+)$/i);
   if (sshMatch) {
     repositoryPath = sshMatch[1];
@@ -45,6 +51,124 @@ function parseGitHubRepository(remoteUrl) {
     .replace(/^\/+|\/+$/g, '');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repositoryPath)) return null;
   return repositoryPath;
+}
+
+function validateGitHubRepository(value) {
+  const repository = parseGitHubRepository(value);
+  if (!repository || repository.split('/').some(part => part === '.' || part === '..')) {
+    throw new Error('Dépôt GitHub invalide. Format attendu : propriétaire/dépôt.');
+  }
+  return repository;
+}
+
+function getGitHubToken(env = process.env) {
+  return String(env.BOT_UPDATE_GITHUB_TOKEN || env.GITHUB_TOKEN || '').trim();
+}
+
+function getGitAuthEnvironment(token, baseEnv = process.env) {
+  if (!token) return undefined;
+  const env = { ...baseEnv };
+  const parsedCount = Number(env.GIT_CONFIG_COUNT || 0);
+  const count = Number.isInteger(parsedCount) && parsedCount >= 0 ? parsedCount : 0;
+  env.GIT_CONFIG_COUNT = String(count + 1);
+  env[`GIT_CONFIG_KEY_${count}`] = 'http.https://github.com/.extraheader';
+  env[`GIT_CONFIG_VALUE_${count}`] = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
+  return env;
+}
+
+function redactApiMessage(value, token) {
+  let message = String(value || 'réponse inconnue');
+  if (token) message = message.split(token).join('[token masqué]');
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 300);
+}
+
+async function githubApiRequest(url, { token = getGitHubToken(), fetchImpl = globalThis.fetch } = {}) {
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('Fetch HTTP indisponible pour interroger GitHub.');
+  }
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'Kaido-MD-GitHub-Updater',
+    'X-GitHub-Api-Version': '2022-11-28'
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      headers,
+      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS)
+    });
+  } catch (error) {
+    throw new Error(`Connexion à l’API GitHub impossible : ${redactApiMessage(error?.message, token)}`);
+  }
+
+  let payload;
+  try { payload = await response.json(); }
+  catch { payload = null; }
+  if (!response.ok) {
+    const detail = redactApiMessage(payload?.message || response.statusText || 'requête refusée', token);
+    throw new Error(`API GitHub (${response.status}) : ${detail}`);
+  }
+  return payload;
+}
+
+function apiRepositoryPath(repository, suffix = '') {
+  const [owner, name] = validateGitHubRepository(repository).split('/');
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}${suffix}`;
+}
+
+async function getGitHubRepositoryInfo({ repository, token = getGitHubToken(), fetchImpl } = {}) {
+  const payload = await githubApiRequest(
+    `${GITHUB_API_BASE_URL}${apiRepositoryPath(repository)}`,
+    { token, fetchImpl }
+  );
+  return {
+    fullName: String(payload?.full_name || repository),
+    private: Boolean(payload?.private),
+    defaultBranch: String(payload?.default_branch || DEFAULT_UPDATE_BRANCH),
+    archived: Boolean(payload?.archived),
+    htmlUrl: String(payload?.html_url || '')
+  };
+}
+
+async function listGitHubRepositories({ token = getGitHubToken(), fetchImpl } = {}) {
+  if (!token) {
+    throw new Error('Configure BOT_UPDATE_GITHUB_TOKEN dans .env pour lister les dépôts autorisés.');
+  }
+  const repositories = [];
+  for (let page = 1; page <= GITHUB_API_MAX_PAGES; page += 1) {
+    const url = new URL('/user/repos', GITHUB_API_BASE_URL);
+    url.searchParams.set('affiliation', 'owner,collaborator,organization_member');
+    url.searchParams.set('sort', 'updated');
+    url.searchParams.set('per_page', String(GITHUB_API_PAGE_SIZE));
+    url.searchParams.set('page', String(page));
+    const payload = await githubApiRequest(url.toString(), { token, fetchImpl });
+    if (!Array.isArray(payload)) throw new Error('GitHub a renvoyé une liste de dépôts invalide.');
+    repositories.push(...payload.map(repository => ({
+      fullName: String(repository.full_name || ''),
+      private: Boolean(repository.private),
+      defaultBranch: String(repository.default_branch || DEFAULT_UPDATE_BRANCH),
+      archived: Boolean(repository.archived),
+      description: String(repository.description || '')
+    })).filter(repository => repository.fullName));
+    if (payload.length < GITHUB_API_PAGE_SIZE) break;
+  }
+  return repositories;
+}
+
+async function listGitHubBranches({ repository, token = getGitHubToken(), fetchImpl } = {}) {
+  const branches = [];
+  for (let page = 1; page <= GITHUB_API_MAX_PAGES; page += 1) {
+    const url = new URL(`${apiRepositoryPath(repository, '/branches')}`, GITHUB_API_BASE_URL);
+    url.searchParams.set('per_page', String(GITHUB_API_PAGE_SIZE));
+    url.searchParams.set('page', String(page));
+    const payload = await githubApiRequest(url.toString(), { token, fetchImpl });
+    if (!Array.isArray(payload)) throw new Error('GitHub a renvoyé une liste de branches invalide.');
+    branches.push(...payload.map(branch => String(branch?.name || '')).filter(Boolean));
+    if (payload.length < GITHUB_API_PAGE_SIZE) break;
+  }
+  return [...new Set(branches)];
 }
 
 function parseAheadBehind(output) {
@@ -78,14 +202,15 @@ function redactCredentials(value) {
     .slice(0, 700);
 }
 
-async function runGit(args, cwd, { timeout = GIT_COMMAND_TIMEOUT_MS } = {}) {
+async function runGit(args, cwd, { timeout = GIT_COMMAND_TIMEOUT_MS, token } = {}) {
   try {
     const result = await execFileAsync('git', args, {
       cwd,
       encoding: 'utf8',
       timeout,
       maxBuffer: MAX_GIT_OUTPUT_BYTES,
-      windowsHide: true
+      windowsHide: true,
+      env: getGitAuthEnvironment(token)
     });
     return {
       stdout: String(result.stdout || ''),
@@ -105,6 +230,28 @@ async function gitOutput(run, args, cwd, options) {
   return String(result?.stdout || '').trim();
 }
 
+async function getOriginRepository({
+  cwd = path.resolve(__dirname, '../..'),
+  run = runGit
+} = {}) {
+  const root = await gitOutput(run, ['rev-parse', '--show-toplevel'], cwd);
+  if (!root) throw new Error('Ce dossier ne semble pas être un dépôt Git.');
+  const remoteUrl = await gitOutput(run, ['remote', 'get-url', 'origin'], root);
+  const repository = parseGitHubRepository(remoteUrl);
+  if (!repository) {
+    throw new Error('Le remote `origin` doit pointer vers un dépôt GitHub pour utiliser .update.');
+  }
+  return { root, repository, remoteUrl };
+}
+
+function makeUpdateTargetRef(repository, branch, originRepository) {
+  const updateBranch = validateBranchName(branch);
+  const targetRepository = validateGitHubRepository(repository);
+  return targetRepository.toLowerCase() === String(originRepository || '').toLowerCase()
+    ? `refs/remotes/origin/${updateBranch}`
+    : `refs/remotes/bot-update/${targetRepository}/${updateBranch}`;
+}
+
 function listTrackedChanges(statusOutput) {
   return String(statusOutput || '')
     .split(/\r?\n/)
@@ -114,17 +261,17 @@ function listTrackedChanges(statusOutput) {
 async function checkForUpdates({
   cwd = path.resolve(__dirname, '../..'),
   branch = process.env.BOT_UPDATE_BRANCH || DEFAULT_UPDATE_BRANCH,
+  repository,
+  token = getGitHubToken(),
   run = runGit
 } = {}) {
   const updateBranch = validateBranchName(branch);
-  const root = await gitOutput(run, ['rev-parse', '--show-toplevel'], cwd);
-  if (!root) throw new Error('Ce dossier ne semble pas être un dépôt Git.');
-
-  const remoteUrl = await gitOutput(run, ['remote', 'get-url', 'origin'], root);
-  const repository = parseGitHubRepository(remoteUrl);
-  if (!repository) {
-    throw new Error('Le remote `origin` doit pointer vers un dépôt GitHub pour utiliser .update.');
-  }
+  const origin = await getOriginRepository({ cwd, run });
+  const root = origin.root;
+  const originRepository = origin.repository;
+  const targetRepository = repository
+    ? validateGitHubRepository(repository)
+    : originRepository;
 
   const currentBranch = await gitOutput(run, ['branch', '--show-current'], root);
   if (!currentBranch) {
@@ -145,16 +292,20 @@ async function checkForUpdates({
     throw new Error('Impossible d’identifier le commit actuellement installé.');
   }
 
-  const targetRef = `refs/remotes/origin/${updateBranch}`;
+  const targetRef = makeUpdateTargetRef(targetRepository, updateBranch, originRepository);
   const refspec = `+refs/heads/${updateBranch}:${targetRef}`;
+  const sameAsOrigin = targetRepository.toLowerCase() === originRepository.toLowerCase();
+  const source = sameAsOrigin ? 'origin' : `https://github.com/${targetRepository}.git`;
   const shallowRepository = await gitOutput(run, ['rev-parse', '--is-shallow-repository'], root);
   if (shallowRepository === 'true') {
-    await run(['fetch', '--quiet', '--no-tags', '--unshallow', 'origin', refspec], root, {
-      timeout: 5 * 60_000
+    await run(['fetch', '--quiet', '--no-tags', '--unshallow', source, refspec], root, {
+      timeout: 5 * 60_000,
+      token
     });
   } else {
-    await run(['fetch', '--quiet', '--no-tags', 'origin', refspec], root, {
-      timeout: GIT_COMMAND_TIMEOUT_MS
+    await run(['fetch', '--quiet', '--no-tags', source, refspec], root, {
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+      token
     });
   }
 
@@ -192,7 +343,9 @@ async function checkForUpdates({
   const commitSummary = summary.join('\t').replace(/[\r\n]+/g, ' ').slice(0, 140);
 
   return {
-    repository,
+    repository: targetRepository,
+    originRepository,
+    targetRef,
     root,
     branch: updateBranch,
     currentBranch,
@@ -227,7 +380,7 @@ async function applyUpdate(plan, { run = runGit } = {}) {
     throw new Error('Mise à jour annulée : des fichiers suivis ont été modifiés depuis la comparaison.');
   }
 
-  const targetRef = `refs/remotes/origin/${plan.branch}`;
+  const targetRef = plan.targetRef || `refs/remotes/origin/${validateBranchName(plan.branch)}`;
   const targetSha = await gitOutput(run, ['rev-parse', targetRef], plan.root);
   if (targetSha !== plan.targetSha) {
     throw new Error('GitHub a avancé depuis la comparaison. Relance .update check pour récupérer la nouvelle version.');
@@ -247,8 +400,21 @@ async function applyUpdate(plan, { run = runGit } = {}) {
 module.exports = {
   DEFAULT_UPDATE_BRANCH,
   GIT_COMMAND_TIMEOUT_MS,
+  GITHUB_API_TIMEOUT_MS,
+  GITHUB_API_PAGE_SIZE,
+  GITHUB_API_MAX_PAGES,
+  GITHUB_API_BASE_URL,
   validateBranchName,
   parseGitHubRepository,
+  validateGitHubRepository,
+  getGitHubToken,
+  getGitAuthEnvironment,
+  githubApiRequest,
+  getGitHubRepositoryInfo,
+  listGitHubRepositories,
+  listGitHubBranches,
+  getOriginRepository,
+  makeUpdateTargetRef,
   parseAheadBehind,
   parseChangedFiles,
   redactCredentials,

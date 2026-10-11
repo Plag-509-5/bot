@@ -57,6 +57,20 @@ function updatePlan(overrides = {}) {
   };
 }
 
+function pluginDependencies(overrides = {}) {
+  return {
+    getSettings: async () => ({}),
+    setSettings: async () => ({}),
+    clearSettings: async () => ({}),
+    getOriginRepository: async () => ({ repository: 'Plag-509-5/bot' }),
+    getRepositoryInfo: async ({ repository }) => ({ fullName: repository, defaultBranch: 'main', archived: false }),
+    listRepositories: async () => [],
+    listBranches: async () => ['main', 'develop', 'release/v2'],
+    getToken: () => '',
+    ...overrides
+  };
+}
+
 test('valide les branches et reconnaît les formats GitHub HTTPS et SSH', () => {
   assert.equal(updater.validateBranchName('release/v2'), 'release/v2');
   assert.throws(() => updater.validateBranchName('../main'), /invalide/);
@@ -64,6 +78,9 @@ test('valide les branches et reconnaît les formats GitHub HTTPS et SSH', () => 
   assert.equal(updater.parseGitHubRepository('https://github.com/Plag-509-5/bot.git'), 'Plag-509-5/bot');
   assert.equal(updater.parseGitHubRepository('git@github.com:Plag-509-5/bot.git'), 'Plag-509-5/bot');
   assert.equal(updater.parseGitHubRepository('ssh://git@github.com/Plag-509-5/bot.git'), 'Plag-509-5/bot');
+  assert.equal(updater.parseGitHubRepository('Plag-509-5/bot'), 'Plag-509-5/bot');
+  assert.equal(updater.validateGitHubRepository('Plag-509-5/bot'), 'Plag-509-5/bot');
+  assert.throws(() => updater.validateGitHubRepository('../bot'), /Dépôt GitHub invalide/);
   assert.equal(updater.parseGitHubRepository('https://gitlab.com/Plag-509-5/bot.git'), null);
   assert.equal(updater.parseGitHubRepository('https://github.com/owner/repo/tree/main'), null);
 });
@@ -82,6 +99,81 @@ test('parse les commits ahead/behind et les fichiers ajoutés, modifiés, suppri
     { status: 'D', label: 'SUPPRESSION', path: 'old.js' },
     { status: 'R100', label: 'MODIF', path: 'old-name.js → new-name.js' }
   ]);
+});
+
+test('liste les dépôts et branches GitHub avec le token sans révéler sa valeur', async () => {
+  const token = 'ghp_secret-test-value';
+  const requests = [];
+  const fetchImpl = async (url, options) => {
+    requests.push({ url: String(url), options });
+    const parsedUrl = new URL(url);
+    let body;
+    if (parsedUrl.pathname === '/user/repos') {
+      body = [{
+        full_name: 'Plag-509-5/private-bot',
+        private: true,
+        default_branch: 'stable',
+        archived: false,
+        description: 'Private updater target'
+      }];
+    } else if (parsedUrl.pathname.endsWith('/branches')) {
+      body = [{ name: 'main' }, { name: 'release/v2' }];
+    } else {
+      body = {
+        full_name: 'Plag-509-5/private-bot',
+        private: true,
+        default_branch: 'stable',
+        archived: false,
+        html_url: 'https://github.com/Plag-509-5/private-bot'
+      };
+    }
+    return { ok: true, status: 200, json: async () => body };
+  };
+
+  const repositories = await updater.listGitHubRepositories({ token, fetchImpl });
+  assert.deepEqual(repositories, [{
+    fullName: 'Plag-509-5/private-bot',
+    private: true,
+    defaultBranch: 'stable',
+    archived: false,
+    description: 'Private updater target'
+  }]);
+  const branches = await updater.listGitHubBranches({
+    repository: 'Plag-509-5/private-bot', token, fetchImpl
+  });
+  assert.deepEqual(branches, ['main', 'release/v2']);
+  const info = await updater.getGitHubRepositoryInfo({
+    repository: 'Plag-509-5/private-bot', token, fetchImpl
+  });
+  assert.equal(info.defaultBranch, 'stable');
+  assert.equal(info.private, true);
+  assert.equal(requests.length, 3);
+  assert.ok(requests.every(request => request.options.headers.Authorization === `Bearer ${token}`));
+  assert.ok(requests[0].url.includes('affiliation=owner%2Ccollaborator%2Corganization_member'));
+
+  const environment = updater.getGitAuthEnvironment(token, { PATH: '/usr/bin', GIT_CONFIG_COUNT: '1' });
+  assert.equal(environment.GIT_CONFIG_COUNT, '2');
+  assert.equal(environment.GIT_CONFIG_KEY_1, 'http.https://github.com/.extraheader');
+  assert.match(environment.GIT_CONFIG_VALUE_1, /^AUTHORIZATION: basic /);
+  assert.equal(environment.GIT_CONFIG_VALUE_1.includes(token), false);
+});
+
+test('masque un token dans les erreurs de l’API GitHub', async () => {
+  const token = 'secret-in-error';
+  await assert.rejects(updater.listGitHubBranches({
+    repository: 'Plag-509-5/private-bot',
+    token,
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+      json: async () => ({ message: `bad credential ${token}` })
+    })
+  }), error => {
+    assert.match(error.message, /token masqué/);
+    assert.equal(error.message.includes(token), false);
+    return true;
+  });
 });
 
 test('compare le HEAD local au dernier commit GitHub sans accepter de changements locaux suivis', async () => {
@@ -131,6 +223,45 @@ test('compare le HEAD local au dernier commit GitHub sans accepter de changement
   await assert.rejects(updater.checkForUpdates({ cwd: '/srv/kaido', run: dirtyRun }), /changements locaux/);
 });
 
+test('peut comparer une branche d’un dépôt sélectionné et authentifier git fetch sans URL tokenisée', async () => {
+  const calls = [];
+  const targetRef = 'refs/remotes/bot-update/Plag-509-5/upstream/release/v2';
+  const token = 'ghp_fetch-secret';
+  const run = async (args, cwd, options) => {
+    calls.push({ args, cwd, options });
+    const command = args.join(' ');
+    if (command === 'rev-parse --show-toplevel') return { stdout: '/srv/kaido' };
+    if (command === 'remote get-url origin') return { stdout: 'https://github.com/Plag-509-5/bot.git' };
+    if (command === 'branch --show-current') return { stdout: 'main' };
+    if (command === 'status --porcelain --untracked-files=no') return { stdout: '' };
+    if (command === 'rev-parse HEAD') return { stdout: currentSha };
+    if (command === 'rev-parse --is-shallow-repository') return { stdout: 'false' };
+    if (args[0] === 'fetch') return { stdout: '' };
+    if (command === `rev-parse ${targetRef}`) return { stdout: targetSha };
+    if (args[0] === 'merge-base') return { stdout: baseSha };
+    if (args[0] === 'rev-list') return { stdout: '0\t1' };
+    if (args[0] === 'diff') return { stdout: 'M\tREADME.md' };
+    if (args[0] === 'show') return { stdout: '2222222\tupstream update' };
+    throw new Error(`commande inattendue: ${command}`);
+  };
+
+  const plan = await updater.checkForUpdates({
+    cwd: '/srv/kaido',
+    repository: 'Plag-509-5/upstream',
+    branch: 'release/v2',
+    token,
+    run
+  });
+  const fetchCall = calls.find(call => call.args[0] === 'fetch');
+  assert.ok(fetchCall.args.includes('https://github.com/Plag-509-5/upstream.git'));
+  assert.ok(fetchCall.args.includes(`+refs/heads/release/v2:${targetRef}`));
+  assert.equal(fetchCall.options.token, token);
+  assert.equal(fetchCall.args.some(argument => argument.includes(token)), false);
+  assert.equal(plan.repository, 'Plag-509-5/upstream');
+  assert.equal(plan.targetRef, targetRef);
+  assert.equal(plan.canFastForward, true);
+});
+
 test('applique seulement un fast-forward confirmé, sans écraser un changement apparu entre-temps', async () => {
   const plan = updatePlan();
   const calls = [];
@@ -158,22 +289,23 @@ test('applique seulement un fast-forward confirmé, sans écraser un changement 
 test('`.update check` liste les changements sans appliquer et `.update` applique puis conseille le redémarrage', async () => {
   const checked = commandContext({ args: ['check'] });
   let applied = false;
-  await updatePlugin._test.executeUpdate(checked.context, {
-    checkForUpdates: async ({ branch }) => {
+  await updatePlugin._test.executeUpdate(checked.context, pluginDependencies({
+    checkForUpdates: async ({ branch, repository }) => {
       assert.equal(branch, 'main');
+      assert.equal(repository, 'Plag-509-5/bot');
       return updatePlan({ files: [
         { status: 'M', label: 'MODIF', path: 'README.md' },
         { status: 'M', label: 'MODIF', path: 'package.json' }
       ] });
     },
     applyUpdate: async () => { applied = true; return { updatedSha: targetSha }; }
-  });
+  }));
   assert.equal(applied, false);
   assert.match(checked.sent.at(-1).content.text, /README\.md/);
   assert.match(checked.sent.at(-1).content.text, /Pour appliquer/);
 
   const applying = commandContext();
-  await updatePlugin._test.executeUpdate(applying.context, {
+  await updatePlugin._test.executeUpdate(applying.context, pluginDependencies({
     checkForUpdates: async () => updatePlan({
       files: [{ status: 'M', label: 'MODIF', path: 'package.json' }]
     }),
@@ -182,7 +314,7 @@ test('`.update check` liste les changements sans appliquer et `.update` applique
       assert.equal(plan.targetSha, targetSha);
       return { updatedSha: targetSha };
     }
-  });
+  }));
   assert.equal(applied, true);
   assert.match(applying.sent.at(-1).content.text, /Redémarre le bot/);
   assert.match(applying.sent.at(-1).content.text, /npm install/);
@@ -206,9 +338,9 @@ test('`.update` est limité au propriétaire et répond en privé lorsqu’il es
     },
     args: ['check']
   });
-  await updatePlugin._test.executeUpdate(group.context, {
+  await updatePlugin._test.executeUpdate(group.context, pluginDependencies({
     checkForUpdates: async () => updatePlan({ hasUpdate: false, behind: 0, files: [] })
-  });
+  }));
   assert.ok(group.sent.every(event => event.jid === ownerJid));
   assert.equal(updatePlugin._test.getReplyJid(group.context), ownerJid);
 });

@@ -123,6 +123,7 @@ test('publie un statut texte avec statusJidList, option de fond et journal de su
   ].sort());
   assert.equal(statusSend.options.backgroundColor, '#000000');
   assert.equal(statusSend.options.font, 0);
+  assert.equal(statusSend.options.broadcast, true);
   assert.equal(statusLog.getLatest('50900000000').key.id, 'status-1');
   assert.match(sent.at(-1).content.text, /Statut 📝 Texte publié/);
   assert.match(sent.at(-1).content.text, /\.delstatus/);

@@ -281,7 +281,7 @@ async function executeToStatus(context, dependencies = {}) {
       label = '📝 Texte';
     }
 
-    const messageOptions = { statusJidList };
+    const messageOptions = { statusJidList, broadcast: true };
     if (content.text) {
       messageOptions.backgroundColor = '#000000';
       messageOptions.font = 0;
