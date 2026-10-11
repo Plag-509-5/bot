@@ -325,6 +325,21 @@ L’audience est enregistrée **par session** dans MongoDB :
 - Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
 - `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
 - Les publications sont envoyées à `status@broadcast` en mode broadcast avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
+- `.save`, en répondant à un statut ou à un média éphémère, transfère le contenu dans le chat « Vous » du compte WhatsApp connecté.
+
+### Transfert automatique des réponses aux statuts avec `.send`
+
+Le propriétaire ou un opérateur de session peut activer le système, puis ajouter un ou plusieurs mots-clés. Les mots-clés s’ajoutent à la liste existante et sont enregistrés par session dans MongoDB.
+
+```text
+.send on
+.send set voye
+.send set envoie
+.send status
+.send off
+```
+
+Quand une personne répond au statut personnel du compte du bot avec l’un des mots-clés, le bot transfère ce statut original dans le chat privé de cette personne. Le système ne traite pas les réponses aux statuts d’autres comptes. `.send off` désactive le transfert sans supprimer les mots-clés; `.send remove <mot>` en retire un et `.send clear` efface la liste.
 
 ### Mise à jour depuis GitHub avec `.update`
 

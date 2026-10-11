@@ -119,6 +119,7 @@ const {
   formatWaVersion
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
+const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -149,7 +150,9 @@ const DEFAULT_SESSION_CONFIG = {
   ANTI_TAG_MODE: true,
   MODE: 'public',
   THEME: 'onigashima',
-  SUDO_USERS: []
+  SUDO_USERS: [],
+  STATUS_REPLY_FORWARD_ENABLED: false,
+  STATUS_REPLY_KEYWORDS: []
 };
 
 // En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
@@ -1060,6 +1063,15 @@ async function registerGroupParticipantListener(socket) {
 // ---------------- status + revocation + resizing ----------------
 
 async function setupStatusHandlers(socket, sanitizedNumber) {
+  const statusReplyForwarder = createStatusReplyForwarder({
+    socket,
+    loadSessionConfig: () => loadSessionConfigMerged(sanitizedNumber)
+  });
+  socket.ev.on('messages.upsert', event => {
+    void statusReplyForwarder.handleUpsert(event)
+      .catch(error => console.error('[STATUS REPLY FORWARDER ERROR]', error?.message || error));
+  });
+
   socket.ev.on('messages.upsert', async ({ messages }) => {
     const message = messages[0];
     if (!message?.key || message.key.remoteJid !== 'status@broadcast' || !message.key.participant) return;

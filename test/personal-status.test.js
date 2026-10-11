@@ -318,7 +318,9 @@ test('pluginLoader enregistre les commandes de statut et de mise à jour avec le
     statusviewers: 'tostatus',
     delstatus: 'tostatus',
     update: 'update',
-    updatebot: 'update'
+    updatebot: 'update',
+    send: 'send',
+    sendstatus: 'send'
   };
   for (const [command, name] of Object.entries(expectedNames)) {
     const plugin = pluginLoader.getPlugins().get(command);
