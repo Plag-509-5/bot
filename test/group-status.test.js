@@ -122,6 +122,14 @@ test('expire proprement une sélection qui attend trop longtemps', () => {
   assert.equal(selector.getSelectedGroup('5091', 'user'), null);
 });
 
+test('les alias swgc sont publics uniquement lorsqu’ils sont lancés dans un groupe', () => {
+  for (const command of ['swgc', 'gcstatus', 'groupstatus', 'statusgroup']) {
+    assert.equal(selector.isPublicGroupStatusCommand('111@g.us', command), true);
+  }
+  assert.equal(selector.isPublicGroupStatusCommand('50911111111@s.whatsapp.net', 'swgc'), false);
+  assert.equal(selector.isPublicGroupStatusCommand('111@g.us', 'tostatus'), false);
+});
+
 test('les textes utilisent la nouvelle police et la palette sombre personnalisée', async () => {
   assert.equal(DEFAULT_TEXT_STATUS_FONT, 2);
   assert.ok(STATUS_BACKGROUND_PALETTE.length >= 5);
@@ -219,6 +227,15 @@ test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
   assert.match(graph, /0x0B0D19/);
   assert.match(graph, /alpha='min\(1,max\(0,/);
   assert.match(graph, /600\*t\/65\.00/);
+  const personalGraph = audioStatus.buildAudioStatusFilterGraph({
+    fontPath: '/app/assets/fonts/Poppins-SemiBold.ttf',
+    textPaths: paths,
+    durationSeconds: 65,
+    design: { background: '0x0B1020', cyan: '0x25D366' }
+  });
+  assert.match(personalGraph, /0x0B1020/);
+  assert.match(personalGraph, /colors=0x25D366/);
+  assert.match(graph, /colors=0x58E1E8/, 'le branding KAIDO reste la valeur par défaut des statuts de groupe');
   assert.ok(fs.existsSync(audioStatus.FONT_CANDIDATES[0]));
   assert.ok(fs.existsSync(path.join(__dirname, '..', 'assets', 'fonts', 'OFL-Poppins.txt')));
   assert.equal(audioStatus.formatTime(65), '01:05');
@@ -287,14 +304,10 @@ test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les 
     assert.equal(decoded.messageContextInfo?.messageSecret?.length, 32);
     assert.equal(call.jid, '123456@g.us');
     assert.ok(media, `${messageType} absent de groupStatusMessageV2`);
-    assert.equal(media.contextInfo?.isGroupStatus, true);
     assert.ok(call.message.messageContextInfo?.messageSecret);
     assert.equal(call.message.messageContextInfo.messageSecret.length, 32);
-    assert.deepEqual(call.options.additionalNodes, [{
-      tag: 'meta',
-      attrs: { is_group_status: 'true' },
-      content: undefined
-    }]);
+    assert.equal(call.options.messageId, result.key.id);
+    assert.equal(call.options.additionalNodes, undefined);
     if (payload.mimetype) assert.equal(media.mimetype, payload.mimetype);
     if (payload.caption) assert.equal(media.caption, payload.caption);
     if (type === 'text') {
@@ -313,12 +326,7 @@ test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les 
   await assert.rejects(groupStatus(socket, '123456@s.whatsapp.net', { text: 'non' }), /JID @g\.us/);
 });
 
-test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay', () => {
-  // `.swgc` dépend de deux capacités vérifiées dans le paquet officiel :
-  //   1. relayMessage accepte `additionalNodes` et les ajoute à la stanza ;
-  //   2. le schéma officiel contient `groupStatusMessageV2`.
-  // Sans elles, le statut part sans le nœud `meta` et n'apparaît pas comme
-  // statut de groupe.
+test('Baileys classe correctement les médias après déballage du statut de groupe V2', () => {
   const baileysEntry = require.resolve('@whiskeysockets/baileys');
   const baileysDir = path.dirname(baileysEntry);
   const relaySource = fs.readFileSync(
@@ -329,22 +337,42 @@ test('le Baileys officiel supporte le wrapper V2 et les additionalNodes du relay
     path.join(baileysDir, 'Utils', 'messages.js'),
     'utf8'
   );
+  const { patchRelaySource } = require('../scripts/patch-baileys-group-status-media');
 
-  assert.match(relaySource, /additionalNodes/, 'relayMessage ne déclare plus additionalNodes');
+  assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
   assert.match(
     relaySource,
-    /stanza\.content\.push\(\.\.\.additionalNodes\)/,
-    'les additionalNodes ne sont plus injectés dans la stanza'
+    /const getMediaType = \(message\) => \{\s+message = normalizeMessageContent\(message\) \|\| message;/,
+    'le relay ne détecte pas le type du média à travers groupStatusMessageV2'
   );
-  assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
+  assert.deepEqual(patchRelaySource(relaySource), { source: relaySource, changed: false });
 
   const packageJson = require('../package.json');
-  const baileysSpec = packageJson.dependencies['@whiskeysockets/baileys'];
-  assert.equal(baileysSpec, '7.0.0-rc14');
+  assert.equal(packageJson.dependencies['@whiskeysockets/baileys'], '7.0.0-rc14');
+  assert.equal(packageJson.scripts.postinstall, 'node scripts/patch-baileys-group-status-media.js');
+  assert.equal(packageJson.scripts.prestart, 'node scripts/patch-baileys-group-status-media.js');
   assert.equal(
     require('@whiskeysockets/baileys/package.json').name,
     '@whiskeysockets/baileys'
   );
+});
+
+test('le postinstall corrige le relay rc14 une seule fois', () => {
+  const { patchRelaySource } = require('../scripts/patch-baileys-group-status-media');
+  const source = [
+    'const getMediaType = (message) => {',
+    '        if (message.imageMessage) {',
+    "            return 'image';",
+    '        }',
+    '    };'
+  ].join('\n');
+
+  const first = patchRelaySource(source);
+  assert.equal(first.changed, true);
+  assert.match(first.source, /message = normalizeMessageContent\(message\) \|\| message;/);
+  const second = patchRelaySource(first.source);
+  assert.equal(second.changed, false);
+  assert.equal(second.source, first.source);
 });
 
 test('les confirmations swgc restent concises pour chaque type', () => {
@@ -358,42 +386,51 @@ test('les confirmations swgc restent concises pour chaque type', () => {
   assert.ok(swgc.alias.includes('gcstatus'));
 });
 
-test('le statut de groupe reste réservé au propriétaire et refuse en privé', async () => {
+test('mode privé réservé au propriétaire; depuis un groupe tous les membres publient et reçoivent la réponse dans le groupe', async () => {
   resetSelections();
-  const fixture = privateFixture();
+  const privateFixtureValue = privateFixture();
   const unauthorized = {
-    ...fixture.context,
+    ...privateFixtureValue.context,
     isOwner: false,
     isSessionOwner: false,
     isSudo: false,
-    args: ['publication interdite']
+    args: ['publication privée interdite']
   };
-  const published = [];
+  const privatePublications = [];
   await swgc._test.executeSwgc(unauthorized, {
-    async publishGroupStatus(_socket, jid, payload) { published.push({ jid, payload }); }
+    async publishGroupStatus(_socket, jid, payload) { privatePublications.push({ jid, payload }); }
   });
 
-  assert.equal(published.length, 0);
-  assert.equal(fixture.sent.length, 1);
-  assert.equal(fixture.sent[0].jid, fixture.context.from);
-  assert.match(fixture.sent[0].content.text, /réservée au propriétaire/i);
-  assert.equal(fixture.sent.some(event => event.jid.endsWith('@g.us')), false);
+  assert.equal(privatePublications.length, 0);
+  assert.equal(privateFixtureValue.sent.length, 1);
+  assert.equal(privateFixtureValue.sent[0].jid, privateFixtureValue.context.from);
+  assert.match(privateFixtureValue.sent[0].content.text, /réservée au propriétaire/i);
 
   const groupFixture = privateFixture();
-  await swgc._test.executeSwgc({
+  const published = [];
+  const groupContext = {
     ...groupFixture.context,
     isOwner: false,
+    isSessionOwner: false,
+    isSudo: false,
     from: '111@g.us',
     sender: '50911111111@s.whatsapp.net',
-    args: ['publication interdite'],
+    args: ['publication publique'],
     msg: {
       key: { remoteJid: '111@g.us', participant: '50911111111@s.whatsapp.net' },
       message: {}
     }
+  };
+  await swgc._test.executeSwgc(groupContext, {
+    async publishGroupStatus(socket, jid, payload) { published.push({ socket, jid, payload }); }
   });
+
+  assert.equal(published.length, 1);
+  assert.equal(published[0].jid, '111@g.us');
+  assert.equal(published[0].payload.text, 'publication publique');
   assert.equal(groupFixture.sent.length, 1);
-  assert.equal(groupFixture.sent[0].jid, '50911111111@s.whatsapp.net');
-  assert.equal(groupFixture.sent.some(event => event.jid.endsWith('@g.us')), false);
+  assert.equal(groupFixture.sent[0].jid, '111@g.us');
+  assert.match(groupFixture.sent[0].content.text, /Statut texte posté sur : ce groupe/);
 });
 
 test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le groupe', async () => {
@@ -421,7 +458,7 @@ test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le 
   assert.equal(fixture.sent.at(-1).content.text, 'Statut texte posté sur : Amis');
 });
 
-test('même depuis un groupe, swgc ne répond jamais dans la conversation du groupe', async () => {
+test('une commande lancée dans un groupe publie et confirme dans le même groupe', async () => {
   resetSelections();
   const fixture = privateFixture();
   const published = [];
@@ -437,21 +474,178 @@ test('même depuis un groupe, swgc ne répond jamais dans la conversation du gro
     async publishGroupStatus(socket, jid, payload) { published.push({ jid, payload }); }
   });
   assert.equal(published[0].jid, '111@g.us');
-  assert.equal(fixture.sent.some(event => event.jid === '111@g.us'), false);
-  assert.equal(fixture.sent.at(-1).jid, '50911111111@s.whatsapp.net');
+  assert.equal(fixture.sent.some(event => event.jid === '50911111111@s.whatsapp.net'), false);
+  assert.equal(fixture.sent.at(-1).jid, '111@g.us');
+  assert.match(fixture.sent.at(-1).content.text, /Statut texte posté sur/);
+});
+
+test('swgc trouve un média cité dans le contexte de message et répond dans le groupe', async () => {
+  resetSelections();
+  const fixture = privateFixture();
+  const published = [];
+  const context = {
+    ...fixture.context,
+    from: '111@g.us',
+    sender: '50911111111@s.whatsapp.net',
+    args: [],
+    msg: {
+      key: { remoteJid: '111@g.us', participant: '50911111111@s.whatsapp.net' },
+      message: {
+        extendedTextMessage: {
+          text: '.swgc',
+          contextInfo: { quotedMessage: { imageMessage: { caption: 'image citée', mimetype: 'image/png' } } }
+        }
+      }
+    }
+  };
+  await swgc._test.executeSwgc(context, {
+    async *downloadContent(media, type) {
+      assert.equal(type, 'image');
+      assert.equal(media.caption, 'image citée');
+      yield Buffer.from('image buffer');
+    },
+    async publishGroupStatus(socket, jid, payload) { published.push({ jid, payload }); }
+  });
+
+  assert.equal(published[0].jid, '111@g.us');
+  assert.equal(published[0].payload.image.toString(), 'image buffer');
+  assert.equal(fixture.sent.at(-1).jid, '111@g.us');
+  assert.match(fixture.sent.at(-1).content.text, /Statut image posté/);
+});
+
+test('swgc publie image, vidéo et audio dans un groupe admin-only quand le bot et l’auteur sont admins', async () => {
+  resetSelections();
+  const botJid = '50900000000:1@s.whatsapp.net';
+  const memberJid = '50911111111@s.whatsapp.net';
+  const metadata = {
+    id: '111@g.us',
+    subject: 'Groupe fermé',
+    announce: true,
+    participants: [
+      { id: '50900000000@s.whatsapp.net', admin: 'admin' },
+      { id: memberJid, admin: 'admin' }
+    ]
+  };
+  const relayed = [];
+  const uploaded = [];
+  const sent = [];
+  const socket = {
+    user: { id: botJid },
+    async groupMetadata(jid) {
+      assert.equal(jid, metadata.id);
+      return metadata;
+    },
+    async waUploadToServer(filePath, options = {}) {
+      assert.ok(fs.existsSync(filePath), 'fichier média temporaire absent pendant le téléversement');
+      uploaded.push({ filePath, mediaType: options.mediaType });
+      return { mediaUrl: `https://upload.invalid/${options.mediaType}`, directPath: `/closed/${options.mediaType}` };
+    },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+    },
+    async sendMessage(jid, content, options) {
+      sent.push({ jid, content, options });
+      return { key: { id: `reply-${sent.length}` } };
+    }
+  };
+  const cases = [
+    { type: 'image', key: 'imageMessage', media: { mimetype: 'image/png', caption: 'photo du groupe' } },
+    { type: 'video', key: 'videoMessage', media: { mimetype: 'video/mp4', caption: 'vidéo du groupe' } },
+    { type: 'audio', key: 'audioMessage', media: { mimetype: 'audio/ogg', seconds: 3, caption: 'audio du groupe' } }
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    const context = {
+      socket,
+      from: metadata.id,
+      sender: memberJid,
+      senderNumber: '50911111111',
+      sessionNumber: '50900000000',
+      prefix: '.',
+      args: [],
+      isOwner: false,
+      isSessionOwner: false,
+      isSudo: false,
+      msg: {
+        key: { remoteJid: metadata.id, participant: memberJid, id: `closed-${index}` },
+        message: {
+          extendedTextMessage: {
+            text: '.swgc',
+            contextInfo: { quotedMessage: { [item.key]: item.media } }
+          }
+        }
+      }
+    };
+    await swgc._test.executeSwgc(context, {
+      async *downloadContent(_media, mediaType) {
+        assert.equal(mediaType, item.type);
+        yield Buffer.from(`${item.type}-source`);
+      },
+      async audioToStatusVideo(audio) {
+        assert.equal(audio.toString(), 'audio-source');
+        return Buffer.from('audio-converted-to-video');
+      }
+    });
+  }
+
+  assert.equal(relayed.length, 3);
+  assert.ok(relayed.every(event => event.options.useCachedGroupMetadata === false), 'le relay d’un groupe fermé doit utiliser des métadonnées fraîches');
+  assert.equal(uploaded.length, 3);
+  assert.deepEqual(uploaded.map(item => item.mediaType), ['image', 'video', 'video']);
+  assert.ok(relayed[0].message.groupStatusMessageV2.message.imageMessage);
+  assert.equal(relayed[0].message.groupStatusMessageV2.message.imageMessage.caption, 'photo du groupe');
+  assert.ok(relayed[1].message.groupStatusMessageV2.message.videoMessage);
+  assert.equal(relayed[1].message.groupStatusMessageV2.message.videoMessage.caption, 'vidéo du groupe');
+  assert.ok(relayed[2].message.groupStatusMessageV2.message.videoMessage);
+  assert.equal(relayed[2].message.groupStatusMessageV2.message.videoMessage.caption, 'audio du groupe');
+  assert.equal(sent.length, 3);
+  assert.ok(sent.every(event => event.jid === metadata.id), 'les confirmations doivent rester dans le groupe fermé');
+  assert.ok(sent.every(event => /posté sur : ce groupe/.test(event.content.text)));
+});
+
+test('swgc refuse un groupe admin-only si le compte du bot n’en est pas administrateur', async () => {
+  const fixture = privateFixture();
+  const groupJid = '111@g.us';
+  let publications = 0;
+  fixture.socket.user.id = '50900000000@s.whatsapp.net';
+  fixture.socket.groupMetadata = async () => ({
+    id: groupJid,
+    announce: true,
+    participants: [
+      { id: '50900000000@s.whatsapp.net', admin: null },
+      { id: '50911111111@s.whatsapp.net', admin: 'admin' }
+    ]
+  });
+  const context = {
+    ...fixture.context,
+    from: groupJid,
+    args: ['test fermé'],
+    msg: { key: { remoteJid: groupJid, participant: '50911111111@s.whatsapp.net' }, message: {} }
+  };
+  await swgc._test.executeSwgc(context, {
+    async publishGroupStatus() { publications += 1; }
+  });
+
+  assert.equal(publications, 0);
+  assert.equal(fixture.sent.at(-1).jid, groupJid);
+  assert.match(fixture.sent.at(-1).content.text, /admin-only/i);
+  assert.match(fixture.sent.at(-1).content.text, /administrateur/i);
 });
 
 test('le handler intercepte la réponse numérique et l’ancien case swgc bruyant a disparu', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
   assert.match(source, /resolveGroupSelection\(sessionId, selectionActor, normalizedBody\)/);
+  assert.match(source, /isPublicGroupStatusCommand\(from, command\)/);
   assert.doesNotMatch(source, /case 'swgc':/);
   const pluginSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'plugins', 'group', 'swgc.js'), 'utf8');
-  assert.doesNotMatch(pluginSource, /sendMessage\(target\.jid|sendMessage\(from/);
+  assert.match(pluginSource, /socket\.sendMessage\(from/);
+  assert.match(pluginSource, /sendContextReply\(context/);
+  assert.doesNotMatch(pluginSource, /privateJid/);
   const statusSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'handlers', 'status.js'), 'utf8');
   assert.match(statusSource, /groupStatusMessageV2/);
-  assert.match(statusSource, /isGroupStatus:\s*true/);
-  assert.match(statusSource, /is_group_status:\s*["']true["']/);
   assert.match(statusSource, /socket\.relayMessage\(jid/);
+  assert.doesNotMatch(statusSource, /isGroupStatus\s*:/);
+  assert.doesNotMatch(statusSource, /is_group_status\s*:/);
   assert.doesNotMatch(statusSource, /socket\.sendMessage\(jid/);
 });
 

@@ -19,7 +19,7 @@
 - **🛡️ Sécurité & Modération de Groupe :**
   - **Anti-Link :** Suppression automatique des liens externes indésirables.
   - **Anti-Delete :** modes privé/groupe/tout, prise en charge des chats LID, récupération directe des médias et identification du véritable suppresseur avec le nom de la conversation.
-  - **Anti-Status Mention :** Avertissement et expulsion en cas de spam de mentions.
+  - **Anti-Status Mention :** désactivé par défaut; lorsqu’il est activé, les avertissements sont présentés dans le style Kaido MD et les sanctions suivent le mode configuré.
   - **Bienvenue / Au revoir :** Messages personnalisés pour les nouveaux membres.
 - **📥 Téléchargeurs Multimédia :**
   - YouTube (MP3 & Vidéo MP4 HD)
@@ -30,13 +30,14 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
-  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** le propriétaire choisit le groupe cible en privé, puis publie texte/image/vidéo/audio via `groupStatusMessageV2` sans confirmation dans le chat du groupe. Les textes ont une palette sombre personnalisée et une police WhatsApp plus élégante; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
+  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast`; gère l’audience par session avec `.setstatusviewers`, `.tostatus new group`, `.tostatus add` et `.tostatus export`. `.delstatus` retire la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
+  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** en privé, le propriétaire choisit le groupe cible; dans un groupe ouvert, tous les membres peuvent publier directement sur son statut et reçoivent la confirmation dans ce groupe. Dans un groupe admin-only, le compte du bot doit être administrateur. Les textes ont une palette sombre personnalisée; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
   - Téléversement de fichiers vers lien direct avec fallback automatique Uguu/Catbox/0x0.st/TmpFiles (`.tourl`).
   - Générateur de polices stylisées (`.fancy`).
-  - Jeux interactifs : Morpion rétro (`.ttt`, `.delttt`).
+  - Jeu de morpion multijoueur (`.ttt @joueur`, ou `.ttt` en répondant à un message) : les joueurs répondent avec le numéro d’une case (1–9); tours, mentions, victoires, défaites et matchs nuls sont gérés automatiquement. `.delttt` annule la partie.
 
 ---
 
@@ -75,16 +76,21 @@ d'authentification WhatsApp.
 
 Les sessions, l’authentification MongoDB et les sockets principaux du bot
 utilisent le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
-`7.0.0-rc14`), sans alias ni fork. Le plugin `.swgc` / `.gcstatus` utilise aussi
-**`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour ses helpers de téléchargement et de
-génération des messages de statut.
+`7.0.0-rc14`), sans alias ni fork. Les plugins `.swgc` / `.gcstatus` et
+`.tostatus` utilisent aussi **`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour les
+helpers de téléchargement/génération des statuts.
 
 La méthode `sendGroupStatus()` de NYXCORE n’existe que sur les sockets produits
 par sa propre factory. Pour conserver les sessions actives du projet et éviter
 d’ouvrir une seconde connexion WhatsApp, le plugin installe un petit adaptateur
 `sendGroupStatus()` sur le socket Baileys existant : NYXCORE prépare le message,
-puis ce même socket assure le téléversement média et le relay. Les deux
-paquets sont donc déclarés volontairement. `package.json` force toujours
+puis ce même socket assure le téléversement média et le relay. Le relay officiel
+RC14 ne déballait pas `groupStatusMessageV2` avant de calculer `mediatype`; la
+trame média partait donc sans son type et WhatsApp pouvait l’ignorer sans que
+l’appel de relay échoue. Le correctif ciblé et idempotent s’applique à
+l’installation et avant `npm start`; il déplie l’enveloppe avant cette détection,
+comme le fait NYXCORE.
+Les deux paquets sont donc déclarés volontairement. `package.json` force
 `libsignal` sur le commit officiel via `overrides`.
 
 MongoDB est l'unique source de vérité :
@@ -285,16 +291,84 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
-### Statut de groupe privé avec `.swgc` / `.gcstatus`
+### Statut de groupe avec `.swgc` / `.gcstatus`
 
-1. Le propriétaire du bot envoie `.swgc` (ou `.gcstatus`) au bot en conversation privée.
-2. Il répond avec le numéro du groupe affiché; le choix expire après cinq minutes.
-3. Il publie avec `.swgc ton texte, violet` (ou `.gcstatus`) ou répond à une image, vidéo ou note audio avec la commande.
-4. Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
+- **En privé :** le propriétaire envoie `.swgc` au bot, choisit le groupe dans la liste, puis publie avec `.swgc ton texte, violet` ou en répondant à une image, une vidéo ou une note audio. La sélection expire après cinq minutes; les listes, erreurs et confirmations restent dans le chat privé.
+- **Depuis un groupe :** tout membre autorisé à écrire dans le groupe envoie `.swgc ton texte, violet` (ou répond à un média avec `.swgc`). Le statut est publié sur le statut de ce même groupe, et les confirmations/erreurs répondent dans le groupe, jamais en privé. Ce mode reste autorisé pour `.swgc` et ses alias même si la session est en `MODE=private`.
+- **Groupe fermé (`announce` / admin-only) :** le compte WhatsApp connecté au bot doit être administrateur du groupe pour publier le statut. Si le bot n’est pas admin, WhatsApp bloque le relay; `.swgc` l’indique au lieu de prétendre que la publication a réussi. Les membres qui ne peuvent pas écrire dans le groupe ne peuvent pas y envoyer la commande; un propriétaire peut utiliser le sélecteur privé.
+- Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée.
 
 Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
+
+### Statut personnel avec `.tostatus`
+
+Le propriétaire du bot ou de la session publie dans son statut WhatsApp personnel en utilisant **le socket Baileys/NYXCORE déjà connecté** : aucune deuxième connexion n’est ouverte.
+
+```text
+.tostatus Bonjour tout le monde
+```
+
+Pour un média, réponds à une photo, une vidéo ou un audio avec `.tostatus`; la caption du média est conservée et peut être remplacée par du texte ajouté à la commande. Les audios et notes vocales sont convertis en MP4 vertical animé, avec la carte visuelle « LE SEIGNEUR DES APPAREILS — PÈRE FONDATEUR DE TOUMAÏ MD ».
+
+L’audience est enregistrée **par session** dans MongoDB :
+
+```text
+.setstatusviewers 509XXXXXXXX, 509YYYYYYYY
+.tostatus new group
+.tostatus add
+.tostatus export
+.statusviewers
+.setstatusviewers clear
+.delstatus
+```
+
+- `.tostatus new group` affiche les groupes communs avec le nombre de membres. Réponds avec un numéro : les numéros résolus du groupe s’ajoutent à l’audience déjà enregistrée, sans remplacer les groupes ou imports précédents. Les doublons sont ignorés. Les participants Baileys identifiés par LID sont convertis en numéro via le mapping disponible; les LID non résolus ne sont pas enregistrés et sont signalés.
+- `.tostatus add`, en répondant à un message avec une liste de numéros, un fichier `.txt` ou une vCard / `.vcf`, ajoute les numéros détectés à la même audience. Le texte peut aussi être passé après `add`. Les fichiers importés sont limités à 1 Mio.
+- `.tostatus export` envoie un fichier `.txt` avec les numéros de l’audience triés numériquement, un par ligne.
+- Une liste personnalisée ne distribue le statut qu’aux numéros indiqués, plus le compte qui le publie.
+- Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
+- `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
+- NYXCORE construit le `WAMessage`, puis `relayMessage` du socket Baileys déjà connecté le publie à `status@broadcast` avec son `statusJidList`; le relay vérifie d’abord que la session WhatsApp est prête. Le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
+- `.save`, en répondant à un statut ou à un média éphémère, transfère le contenu dans le chat « Vous » du compte WhatsApp connecté.
+
+### Transfert automatique des réponses aux statuts avec `.send`
+
+Le propriétaire ou un opérateur de session peut activer le système, puis ajouter un ou plusieurs mots-clés. Les mots-clés s’ajoutent à la liste existante et sont enregistrés par session dans MongoDB.
+
+```text
+.send on
+.send set voye
+.send set envoie
+.send status
+.send off
+```
+
+Quand une personne répond au statut personnel du compte du bot avec l’un des mots-clés, le bot transfère ce statut original dans le chat privé de cette personne. Le système ne traite pas les réponses aux statuts d’autres comptes. `.send off` désactive le transfert sans supprimer les mots-clés; `.send remove <mot>` en retire un et `.send clear` efface la liste.
+
+### Mise à jour depuis GitHub avec `.update`
+
+```text
+.update check
+.update repos
+.update repo Plag-509-5/bot
+.update branches
+.update branch main
+.update status
+.update apply
+.update reset
+```
+
+`.update check` compare le commit installé au dépôt et à la branche sélectionnés, affiche les fichiers concernés et les branches disponibles sans modifier le clone. `.update` (application par défaut) et `.update apply` appliquent automatiquement le fast-forward en ne remplaçant que les fichiers touchés par les commits GitHub. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer ces commandes.
+
+Configure `BOT_UPDATE_GITHUB_TOKEN` dans `.env` pour que le bot liste les dépôts accessibles (`.update repos`) et lise les dépôts privés. Utilise un token à privilèges minimaux, limité aux dépôts nécessaires et avec les permissions GitHub de métadonnées et de contenu en lecture. Le token n’est ni enregistré dans MongoDB ni affiché par le bot; ne l’envoie jamais dans WhatsApp. Les branches et dépôts publics peuvent être consultés sans token, sous réserve des limites d’API GitHub.
+
+`.update repo <owner/repo>` vérifie l’accès au dépôt et sélectionne sa branche par défaut. `.update branches` liste ses branches; `.update branch <nom>` en choisit une. La sélection est partagée par le bot et persistée dans MongoDB. En l’absence de sélection enregistrée, `BOT_UPDATE_REPO` et `BOT_UPDATE_BRANCH` dans `.env` servent de valeurs par défaut; sans dépôt configuré, le remote Git `origin` est utilisé et la branche par défaut est `main`. `.update reset` efface la sélection persistée.
+
+Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. L’application calcule le diff entre le commit installé et la cible, puis restaure uniquement les chemins ajoutés, modifiés, supprimés ou renommés dans ce diff avant d’avancer le pointeur Git en fast-forward. Un changement local sur un fichier également modifié par GitHub est remplacé; les changements locaux hors du diff et les fichiers non suivis tels que `.env` sont conservés. La commande affiche ces cas et ne fait jamais de `reset --hard`. Elle s’arrête si les historiques n’ont pas de base commune ou si les branches ont divergé.
+
+Après la mise à jour, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
 
 ---
 

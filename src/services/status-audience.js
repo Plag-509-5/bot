@@ -1,0 +1,295 @@
+'use strict';
+
+const MAX_STATUS_VIEWERS = 1000;
+
+function normalizedUserJid(value) {
+  if (value && typeof value === 'object') {
+    const candidates = [
+      value.phoneNumber,
+      value.pn,
+      value.participantAlt,
+      value.remoteJidAlt,
+      value.jid,
+      value.id,
+      value.lid
+    ];
+    for (const candidate of candidates) {
+      const normalized = normalizedUserJid(candidate);
+      if (normalized) return normalized;
+    }
+    return '';
+  }
+
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  const withoutDevice = raw.replace(/:\d+(?=@)/, '');
+  if (/^\d{6,15}$/.test(withoutDevice)) return `${withoutDevice}@s.whatsapp.net`;
+
+  const match = withoutDevice.match(/^([^@]+)@(s\.whatsapp\.net|lid)$/);
+  if (!match) return '';
+  if (match[2] === 's.whatsapp.net' && !/^\d{6,15}$/.test(match[1])) return '';
+  return `${match[1]}@${match[2]}`;
+}
+
+function parseStatusViewerNumbers(input) {
+  const tokens = (Array.isArray(input) ? input : String(input || '').split(/[\s,;|]+/))
+    .map(value => String(value || '').trim())
+    .filter(Boolean);
+  const numbers = [];
+  const invalid = [];
+  const seen = new Set();
+
+  for (const token of tokens) {
+    const compact = token.replace(/[\s().-]/g, '');
+    const number = compact.replace(/^\+/, '');
+    if (!/^\+?\d{6,15}$/.test(compact)) {
+      invalid.push(token);
+      continue;
+    }
+    if (!seen.has(number)) {
+      seen.add(number);
+      numbers.push(number);
+    }
+  }
+
+  return { numbers, invalid };
+}
+
+function mergeStatusViewerNumbers(currentInput, additionsInput) {
+  const current = parseStatusViewerNumbers(currentInput);
+  if (current.invalid.length) {
+    throw new Error('La liste STATUS_VIEWERS contient un numéro invalide. Corrige-la avec .setstatusviewers.');
+  }
+  const additions = parseStatusViewerNumbers(additionsInput);
+  if (additions.invalid.length) {
+    throw new Error(`Numéro(s) invalide(s) : ${additions.invalid.slice(0, 5).join(', ')}`);
+  }
+
+  const numbers = [...current.numbers];
+  const seen = new Set(numbers);
+  let added = 0;
+  let alreadyPresent = 0;
+  for (const number of additions.numbers) {
+    if (seen.has(number)) {
+      alreadyPresent += 1;
+      continue;
+    }
+    seen.add(number);
+    numbers.push(number);
+    added += 1;
+  }
+  if (numbers.length > MAX_STATUS_VIEWERS) {
+    throw new Error(`La liste est limitée à ${MAX_STATUS_VIEWERS} numéros; aucun changement n’a été enregistré.`);
+  }
+
+  return { numbers, added, alreadyPresent, total: numbers.length };
+}
+
+function participantLids(participant) {
+  const lids = [];
+  for (const value of [participant?.lid, participant?.lidJid]) {
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const raw = value.trim().toLowerCase();
+    const normalized = raw.includes('@')
+      ? normalizedUserJid(raw)
+      : (/^\d+(?::\d+)?$/.test(raw) ? `${raw.split(':')[0]}@lid` : '');
+    if (normalized.endsWith('@lid') && !lids.includes(normalized)) lids.push(normalized);
+  }
+  for (const value of [participant?.id, participant?.jid, participant?.participantAlt, participant?.remoteJidAlt]) {
+    const normalized = normalizedUserJid(value);
+    if (normalized.endsWith('@lid') && !lids.includes(normalized)) lids.push(normalized);
+  }
+  return lids;
+}
+
+function participantPhoneNumber(participant) {
+  for (const value of [
+    participant?.phoneNumber,
+    participant?.pn,
+    participant?.phoneNumberJid,
+    participant?.participantAlt,
+    participant?.remoteJidAlt,
+    participant?.id,
+    participant?.jid
+  ]) {
+    const parsed = parseStatusViewerNumbers([value]);
+    if (parsed.numbers.length) return parsed.numbers[0];
+    const normalized = normalizedUserJid(value);
+    if (normalized.endsWith('@s.whatsapp.net')) return normalized.split('@')[0];
+  }
+  return '';
+}
+
+async function getGroupParticipantNumbers(socket, participants = []) {
+  const numbers = [];
+  const seenNumbers = new Set();
+  const pendingLids = new Map();
+  let unresolvedParticipants = 0;
+
+  participants.forEach((participant, index) => {
+    const number = participantPhoneNumber(participant);
+    if (number) {
+      if (!seenNumbers.has(number)) {
+        seenNumbers.add(number);
+        numbers.push(number);
+      }
+      return;
+    }
+    const lid = participantLids(participant)[0];
+    if (lid) pendingLids.set(index, lid);
+    else unresolvedParticipants += 1;
+  });
+
+  const mapping = socket?.signalRepository?.lidMapping;
+  const uniqueLids = [...new Set(pendingLids.values())];
+  let mappings = [];
+  if (uniqueLids.length && typeof mapping?.getPNsForLIDs === 'function') {
+    try {
+      mappings = await mapping.getPNsForLIDs(uniqueLids) || [];
+    } catch (error) {
+      console.warn('[TOSTATUS] Résolution des numéros LID impossible:', error?.message || error);
+    }
+  } else if (uniqueLids.length && typeof mapping?.getPNForLID === 'function') {
+    mappings = (await Promise.all(uniqueLids.map(async lid => {
+      try {
+        const pn = await mapping.getPNForLID(lid);
+        return pn ? { lid, pn } : null;
+      } catch {
+        return null;
+      }
+    }))).filter(Boolean);
+  }
+
+  const phoneByLid = new Map();
+  for (const item of mappings) {
+    const lid = normalizedUserJid(item?.lid);
+    const pn = normalizedUserJid(item?.pn);
+    if (lid.endsWith('@lid') && pn.endsWith('@s.whatsapp.net')) {
+      phoneByLid.set(lid, pn.split('@')[0]);
+    }
+  }
+
+  for (const lid of pendingLids.values()) {
+    const number = phoneByLid.get(lid);
+    if (!number) {
+      unresolvedParticipants += 1;
+      continue;
+    }
+    if (!seenNumbers.has(number)) {
+      seenNumbers.add(number);
+      numbers.push(number);
+    }
+  }
+
+  return { numbers, participantCount: participants.length, unresolvedParticipants };
+}
+
+async function appendGroupParticipantsToStatusAudience(socket, groupJid, currentInput = []) {
+  if (typeof groupJid !== 'string' || !groupJid.endsWith('@g.us')) {
+    throw new Error('Le groupe sélectionné possède un JID invalide.');
+  }
+  if (typeof socket?.groupMetadata !== 'function') {
+    throw new Error('Les membres du groupe sont indisponibles sur cette session.');
+  }
+
+  let metadata;
+  try {
+    metadata = await socket.groupMetadata(groupJid);
+  } catch (error) {
+    throw new Error(`Impossible de lire les membres du groupe : ${error?.message || error}`);
+  }
+  if (!Array.isArray(metadata?.participants)) {
+    throw new Error('WhatsApp n’a pas renvoyé la liste des membres de ce groupe.');
+  }
+
+  const groupAudience = await getGroupParticipantNumbers(socket, metadata.participants);
+  if (!groupAudience.numbers.length) {
+    throw new Error(groupAudience.unresolvedParticipants
+      ? 'Aucun numéro de téléphone résolvable dans ce groupe. Les identifiants LID sans correspondance ont été ignorés.'
+      : 'Ce groupe ne contient aucun numéro à ajouter.');
+  }
+  const merged = mergeStatusViewerNumbers(currentInput, groupAudience.numbers);
+  return {
+    ...merged,
+    participantCount: groupAudience.participantCount,
+    unresolvedParticipants: groupAudience.unresolvedParticipants,
+    groupSubject: String(metadata.subject || '').trim()
+  };
+}
+
+function groupEntries(groups) {
+  if (groups instanceof Map) return [...groups.values()];
+  return Object.values(groups || {});
+}
+
+function contactEntries(contacts) {
+  if (contacts instanceof Map) {
+    return [...contacts.entries()].map(([jid, contact]) => ({
+      ...(contact && typeof contact === 'object' ? contact : {}),
+      id: contact?.id || jid
+    }));
+  }
+  return Object.entries(contacts || {}).map(([jid, contact]) => ({
+    ...(contact && typeof contact === 'object' ? contact : {}),
+    id: contact?.id || jid
+  }));
+}
+
+async function getStatusJidList(socket, configuredViewers = []) {
+  if (!socket) throw new Error('Socket WhatsApp indisponible.');
+  const recipients = new Set();
+  const ownJid = normalizedUserJid(socket.user?.id);
+  const hasCustomAudience = Array.isArray(configuredViewers)
+    ? configuredViewers.length > 0
+    : typeof configuredViewers === 'string' && Boolean(configuredViewers.trim());
+
+  if (hasCustomAudience) {
+    const { numbers, invalid } = parseStatusViewerNumbers(configuredViewers);
+    if (invalid.length || numbers.length === 0) {
+      throw new Error('La liste STATUS_VIEWERS contient un numéro invalide. Corrige-la avec .setstatusviewers.');
+    }
+    if (numbers.length > MAX_STATUS_VIEWERS) {
+      throw new Error(`La liste de destinataires est limitée à ${MAX_STATUS_VIEWERS} numéros.`);
+    }
+    for (const number of numbers) recipients.add(`${number}@s.whatsapp.net`);
+  } else {
+    for (const contact of contactEntries(socket.store?.contacts)) {
+      const jid = normalizedUserJid(contact);
+      if (jid && jid !== ownJid) recipients.add(jid);
+    }
+
+    // Ce bot n’installe pas de store Baileys par défaut. Si aucun carnet de
+    // contacts n’est attaché, les participants des groupes fournissent le
+    // fallback, comme demandé par `.tostatus`.
+    if (recipients.size === 0 && typeof socket.groupFetchAllParticipating === 'function') {
+      try {
+        const groups = await socket.groupFetchAllParticipating();
+        for (const group of groupEntries(groups)) {
+          for (const participant of group?.participants || []) {
+            const jid = normalizedUserJid(participant);
+            if (jid) recipients.add(jid);
+          }
+        }
+      } catch (error) {
+        console.warn('[TOSTATUS] Récupération des groupes pour l’audience impossible:', error?.message || error);
+      }
+    }
+  }
+
+  if (ownJid) recipients.add(ownJid);
+  return [...recipients];
+}
+
+module.exports = {
+  MAX_STATUS_VIEWERS,
+  normalizeSessionId(value) {
+    return String(value || '').replace(/[^0-9]/g, '') || 'session';
+  },
+  normalizedUserJid,
+  parseStatusViewerNumbers,
+  mergeStatusViewerNumbers,
+  getGroupParticipantNumbers,
+  appendGroupParticipantsToStatusAudience,
+  getStatusJidList,
+  _test: { groupEntries, contactEntries, participantLids, participantPhoneNumber }
+};

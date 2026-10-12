@@ -1,3 +1,5 @@
+const { getParticipantMentionJid } = require('../../services/group-admins');
+
 module.exports = {
   name: 'tagall',
   alias: ['everyone', 'tous'],
@@ -6,27 +8,28 @@ module.exports = {
   usage: '.tagall [votre message]',
   isGroup: true,
   isAdmin: true,
-  async execute({ socket, msg, from, args }) {
+  async execute({ socket, msg, from, args = [] }) {
     const metadata = await socket.groupMetadata(from).catch(() => null);
-    if (!metadata) return;
+    if (!Array.isArray(metadata?.participants)) {
+      await socket.sendMessage(from, {
+        text: '⚠️ Impossible de récupérer les participants du groupe. Réessayez dans un instant.'
+      }, { quoted: msg });
+      return;
+    }
 
-    const participants = metadata.participants || [];
+    const mentions = metadata.participants.map(getParticipantMentionJid).filter(Boolean);
     const messageText = args.join(' ') || 'Attentions à tous !';
-
-    const mentions = participants.map(p => p.id);
-    let tagList = '';
-
-    participants.forEach((p, idx) => {
-      const num = p.id.split('@')[0];
-      tagList += `│ ${idx + 1}. @${num}\n`;
-    });
+    const tagList = mentions
+      .map((jid, index) => `│ ${index + 1}. @${jid.split('@')[0]}`)
+      .join('\n');
 
     const fullMessage = `╭───「 📢 *TAG ALL* 」───
-│ 👥 *Groupe :* ${metadata.subject}
+│ 👥 *Groupe :* ${metadata.subject || 'Sans nom'}
 │ 💬 *Message :* ${messageText}
-│ 📊 *Membres :* ${participants.length}
+│ 📊 *Membres :* ${mentions.length}
 ├───「 📋 *LISTE DES MEMBRES* 」
-${tagList}╰─────────────────────────☉
+${tagList}
+╰─────────────────────────☉
 > 𝐊𝐀𝐈𝐃𝐎-𝐌𝐃 🐉`;
 
     await socket.sendMessage(from, {
