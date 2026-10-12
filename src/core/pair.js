@@ -102,6 +102,7 @@ const {
 } = require('../plugins/owner/tostatus');
 const { handleAntiLink } = require('../handlers/antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('../handlers/antilink');
+const statusLog = require('../services/status-log');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
 const {
@@ -847,6 +848,11 @@ function clearSessionStore(sessionNumber) {
   messageStoreTimes.get(sessionNumber)?.clear();
 }
 
+function deleteSessionStore(sessionNumber) {
+  messageStores.delete(sessionNumber);
+  messageStoreTimes.delete(sessionNumber);
+}
+
 function storeMessage(sessionNumber, msg) {
   if (!msg?.key?.id || !msg?.message) return;
   // Un protocole REVOKE décrit une suppression : ce n'est pas le message
@@ -1133,8 +1139,9 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
       || (socket?.authState?.creds?.me?.id || socket?.user?.id || message.key.participant || message.key.remoteJid || '')
            .split('@')[0].replace(/[^0-9]/g,'');
 
-    console.log('[HANDLER] status event remoteJid:', message.key.remoteJid, 'participant:', message.key.participant);
-    console.log('[HANDLER] using sessionId:', sessionId);
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[HANDLER] status event participant:', message.key.participant, 'session:', sessionId);
+    }
 
     if (!sessionId) {
       console.warn('[HANDLER] No sessionId available for status handler; skipping session-specific config');
@@ -1142,11 +1149,9 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     }
 
     const cfg = await loadSessionConfigMerged(sessionId);
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
     try {
       if (configEnabled(cfg.AUTO_ONLINE, false)) {
-        console.log('[HANDLER] AUTO_ONLINE -> sending available presence');
         await socket.sendPresenceUpdate('available', message.key.remoteJid);
       }
 
@@ -10597,6 +10602,8 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     lastConnectionActivity.delete(sanitized);
     connectionLifecycles.delete(sanitized);
     socketRuntimeMetadata.delete(sanitized);
+    deleteSessionStore(sanitized);
+    statusLog.clear(sanitized);
 
     // 2) Socket : logout côté WhatsApp puis fermeture de la websocket. Le
     // marqueur est posé AVANT logout(), car celui-ci peut émettre close aussitôt.
@@ -10654,6 +10661,8 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   lastConnectionActivity.delete(sanitized);
   connectionLifecycles.delete(sanitized);
   socketRuntimeMetadata.delete(sanitized);
+  deleteSessionStore(sanitized);
+  statusLog.clear(sanitized);
 
   if (socket) {
     intentionalSocketClosures.add(socket);

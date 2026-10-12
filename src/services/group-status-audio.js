@@ -4,6 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { Readable } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
@@ -34,6 +36,71 @@ const FONT_CANDIDATES = Object.freeze([
 ]);
 
 let ffmpegCache = null;
+const MAX_AUDIO_INPUT_BYTES = positiveInteger(process.env.AUDIO_STATUS_MAX_INPUT_BYTES, 32 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024);
+const MAX_AUDIO_OUTPUT_BYTES = positiveInteger(process.env.AUDIO_STATUS_MAX_OUTPUT_BYTES, 64 * 1024 * 1024, 1024 * 1024, 512 * 1024 * 1024);
+const MAX_AUDIO_CONCURRENT_JOBS = positiveInteger(process.env.AUDIO_STATUS_MAX_CONCURRENT, 1, 1, 4);
+const MAX_AUDIO_QUEUED_JOBS = positiveInteger(process.env.AUDIO_STATUS_MAX_QUEUE, 2, 0, 16);
+
+function positiveInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function createAudioJobQueue({
+  maxConcurrent = 1,
+  maxQueued = 0,
+  busyMessage = 'Les conversions audio sont occupées. Réessaie dans un instant.'
+} = {}) {
+  const concurrency = positiveInteger(maxConcurrent, 1, 1, 4);
+  const queueLimit = positiveInteger(maxQueued, 0, 0, 16);
+  const waiting = [];
+  let active = 0;
+
+  function drain() {
+    while (active < concurrency && waiting.length) {
+      const job = waiting.shift();
+      active += 1;
+      Promise.resolve()
+        .then(job.task)
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          active = Math.max(0, active - 1);
+          drain();
+        });
+    }
+  }
+
+  function run(task) {
+    return new Promise((resolve, reject) => {
+      if (active >= concurrency && waiting.length >= queueLimit) {
+        reject(new Error(busyMessage));
+        return;
+      }
+      waiting.push({ task, resolve, reject });
+      drain();
+    });
+  }
+
+  function stats() {
+    return { active, waiting: waiting.length, maxConcurrent: concurrency, maxQueued: queueLimit };
+  }
+
+  return { run, stats };
+}
+
+const audioStatusQueue = createAudioJobQueue({
+  maxConcurrent: MAX_AUDIO_CONCURRENT_JOBS,
+  maxQueued: MAX_AUDIO_QUEUED_JOBS
+});
+
+function runAudioStatusJob(task) {
+  return audioStatusQueue.run(task);
+}
+
+function getAudioStatusQueueStats() {
+  return audioStatusQueue.stats();
+}
 
 function escapeFilterPath(filePath) {
   return String(filePath)
@@ -164,29 +231,62 @@ function buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds, des
   ].join(';');
 }
 
-async function audioToStatusVideo(buffer, {
-  durationSeconds = 0,
-  branding = BRANDING,
-  design = DESIGN
-} = {}) {
-  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-    throw new Error('Aucune donnée audio téléchargée.');
+async function writeAudioSourceToFile(source, outputPath, maxBytes = MAX_AUDIO_INPUT_BYTES) {
+  const raw = source && typeof source === 'object' && source.stream ? source.stream : source;
+  const input = Buffer.isBuffer(raw) ? Readable.from([raw]) : raw;
+  if (!input || typeof input[Symbol.asyncIterator] !== 'function') {
+    throw new Error('Aucune donnée audio téléchargeable.');
   }
 
+  let bytesWritten = 0;
+  const boundedInput = Readable.from((async function* () {
+    try {
+      for await (const chunk of input) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytesWritten += buffer.length;
+        if (bytesWritten > maxBytes) {
+          throw new Error(`L’audio dépasse la limite de ${maxBytes} octets.`);
+        }
+        yield buffer;
+      }
+    } finally {
+      if (typeof input.destroy === 'function' && !input.destroyed) input.destroy();
+    }
+  })());
+
+  await pipeline(boundedInput, fs.createWriteStream(outputPath));
+  if (!bytesWritten) throw new Error('Aucune donnée audio téléchargée.');
+  return bytesWritten;
+}
+
+async function renderAudioStatus(source, {
+  durationSeconds = 0,
+  maxDurationSeconds = 0,
+  maxInputBytes = MAX_AUDIO_INPUT_BYTES,
+  maxOutputBytes = MAX_AUDIO_OUTPUT_BYTES,
+  branding = BRANDING,
+  design = DESIGN
+} = {}, returnFile = false) {
   const ffmpegPath = await resolveFfmpeg();
   const fontPath = findFont();
   if (!fontPath) {
     throw new Error('Police Poppins introuvable : vérifie assets/fonts/Poppins-SemiBold.ttf.');
   }
 
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaido-groupstatus-audio-'));
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kaido-groupstatus-audio-'));
   const inputPath = path.join(tempDir, 'source-audio');
   const outputPath = path.join(tempDir, 'kaido-audio-status.mp4');
+  let preserveDirectory = false;
 
   try {
-    await fs.promises.writeFile(inputPath, buffer);
+    const inputLimit = positiveInteger(maxInputBytes, MAX_AUDIO_INPUT_BYTES, 1024, 256 * 1024 * 1024);
+    await writeAudioSourceToFile(source, inputPath, inputLimit);
     const probedDuration = await getAudioDuration(ffmpegPath, inputPath);
     const duration = safeDuration(probedDuration, durationSeconds);
+    const maxDuration = Number(maxDurationSeconds);
+    if (Number.isFinite(maxDuration) && maxDuration > 0 && duration > maxDuration) {
+      throw new Error(`L’audio dure ${formatTime(duration)}; la limite de conversion est ${formatTime(maxDuration)}.`);
+    }
     const durationText = duration.toFixed(2);
 
     const writeText = async (filename, content) => {
@@ -214,31 +314,66 @@ async function audioToStatusVideo(buffer, {
 
     await execFileAsync(ffmpegPath, [
       '-hide_banner', '-loglevel', 'error', '-y',
+      '-filter_complex_threads', '1',
       '-i', inputPath,
       '-filter_complex', graph,
       '-map', '[v]', '-map', '0:a:0',
       '-t', durationText,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27', '-pix_fmt', 'yuv420p',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads:v', '1', '-crf', '27', '-pix_fmt', 'yuv420p',
       '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
       '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-ar', '48000', '-ac', '2',
       '-shortest', '-movflags', '+faststart', outputPath
     ], {
       timeout: Math.min(Math.ceil(duration * 2000) + 60000, 30 * 60 * 1000),
-      maxBuffer: 8 * 1024 * 1024
+      maxBuffer: 8 * 1024 * 1024,
+      windowsHide: true
     });
 
-    const video = await fs.promises.readFile(outputPath);
-    if (!video.length) throw new Error('La conversion audio → vidéo a produit un fichier vide.');
-    return video;
+    const output = await fs.promises.stat(outputPath);
+    if (!output.size) throw new Error('La conversion audio → vidéo a produit un fichier vide.');
+    const outputLimit = positiveInteger(maxOutputBytes, MAX_AUDIO_OUTPUT_BYTES, 1024, 512 * 1024 * 1024);
+    if (output.size > outputLimit) {
+      throw new Error(`La vidéo convertie dépasse la limite de ${outputLimit} octets.`);
+    }
+    if (returnFile) {
+      preserveDirectory = true;
+      let cleaned = false;
+      return {
+        path: outputPath,
+        sizeBytes: output.size,
+        durationSeconds: duration,
+        async cleanup() {
+          if (cleaned) return;
+          cleaned = true;
+          await fs.promises.rm(tempDir, { recursive: true, force: true });
+        }
+      };
+    }
+
+    return await fs.promises.readFile(outputPath);
   } finally {
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    if (!preserveDirectory) {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
   }
+}
+
+function audioToStatusVideo(buffer, options = {}) {
+  return runAudioStatusJob(() => renderAudioStatus(buffer, options, false));
+}
+
+function audioToStatusVideoFile(stream, options = {}) {
+  return runAudioStatusJob(() => renderAudioStatus(stream, options, true));
 }
 
 module.exports = {
   BRANDING,
   DESIGN,
   FONT_CANDIDATES,
+  MAX_AUDIO_INPUT_BYTES,
+  MAX_AUDIO_OUTPUT_BYTES,
+  MAX_AUDIO_CONCURRENT_JOBS,
+  MAX_AUDIO_QUEUED_JOBS,
   safeDuration,
   formatTime,
   escapeFilterPath,
@@ -246,5 +381,9 @@ module.exports = {
   resolveFfmpeg,
   getAudioDuration,
   buildAudioStatusFilterGraph,
-  audioToStatusVideo
+  writeAudioSourceToFile,
+  audioToStatusVideo,
+  audioToStatusVideoFile,
+  getAudioStatusQueueStats,
+  _test: { createAudioJobQueue, runAudioStatusJob, positiveInteger }
 };

@@ -1,7 +1,9 @@
 'use strict';
 
 const STATUS_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_STATUS_LOGS_PER_SESSION = 20;
+// .delstatus ne supprime que la dernière publication : ne gardons qu’une audience
+// (potentiellement longue) par session au lieu de dupliquer jusqu’à vingt listes.
+const MAX_STATUS_LOGS_PER_SESSION = 1;
 const logsBySession = new Map();
 
 function normalizeSessionId(value) {

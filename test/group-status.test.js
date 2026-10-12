@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const selector = require('../src/services/group-status-selector');
 const {
@@ -240,6 +241,82 @@ test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
   assert.ok(fs.existsSync(path.join(__dirname, '..', 'assets', 'fonts', 'OFL-Poppins.txt')));
   assert.equal(audioStatus.formatTime(65), '01:05');
   assert.equal(audioStatus.formatTime(3665), '1:01:05');
+});
+
+test('les conversions audio restent séquentielles et la file a une limite', async () => {
+  const queue = audioStatus._test.createAudioJobQueue({
+    maxConcurrent: 1,
+    maxQueued: 2,
+    busyMessage: 'queue pleine'
+  });
+  const started = [];
+  let startFirst;
+  let startSecond;
+  let finishFirst;
+  let finishSecond;
+  const firstStarted = new Promise(resolve => { startFirst = resolve; });
+  const secondStarted = new Promise(resolve => { startSecond = resolve; });
+  const first = queue.run(() => {
+    started.push('first');
+    startFirst();
+    return new Promise(resolve => { finishFirst = resolve; });
+  });
+  const second = queue.run(() => {
+    started.push('second');
+    startSecond();
+    return new Promise(resolve => { finishSecond = resolve; });
+  });
+  const third = queue.run(() => {
+    started.push('third');
+    return 'third-result';
+  });
+
+  assert.deepEqual(queue.stats(), { active: 1, waiting: 2, maxConcurrent: 1, maxQueued: 2 });
+  await assert.rejects(queue.run(() => 'overflow'), /queue pleine/);
+  await firstStarted;
+  assert.deepEqual(started, ['first']);
+
+  finishFirst('first-result');
+  assert.equal(await first, 'first-result');
+  await secondStarted;
+  assert.deepEqual(started, ['first', 'second']);
+  finishSecond('second-result');
+  assert.equal(await second, 'second-result');
+  assert.equal(await third, 'third-result');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(started, ['first', 'second', 'third']);
+  assert.deepEqual(queue.stats(), { active: 0, waiting: 0, maxConcurrent: 1, maxQueued: 2 });
+});
+
+test('écrit l’audio source en flux et arrête la lecture dès que la limite d’octets est dépassée', async () => {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kaido-audio-stream-test-'));
+  const sourcePath = path.join(tempDir, 'source-audio');
+  try {
+    async function* normalChunks() {
+      yield Buffer.from('audio-');
+      yield Buffer.from('stream');
+    }
+    const written = await audioStatus.writeAudioSourceToFile(normalChunks(), sourcePath, 64);
+    assert.equal(written, 12);
+    assert.equal((await fs.promises.readFile(sourcePath)).toString(), 'audio-stream');
+
+    let yielded = 0;
+    async function* oversizedChunks() {
+      yielded += 1;
+      yield Buffer.from('12345678');
+      yielded += 1;
+      yield Buffer.from('abcdefgh');
+      yielded += 1;
+      yield Buffer.from('must-not-be-read');
+    }
+    await assert.rejects(
+      audioStatus.writeAudioSourceToFile(oversizedChunks(), sourcePath, 10),
+      /limite de 10 octets/
+    );
+    assert.equal(yielded, 2, 'la source ne doit pas être consommée après le dépassement');
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('NYXCORE construit image, vidéo, audio et texte, puis le socket actif les relaie en statut de groupe', async () => {

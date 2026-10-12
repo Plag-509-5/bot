@@ -1,6 +1,8 @@
 'use strict';
 
 const MAX_STATUS_VIEWERS = 1000;
+const DEFAULT_AUDIENCE_CACHE_TTL_MS = 60_000;
+const defaultAudienceCache = new WeakMap();
 
 function normalizedUserJid(value) {
   if (value && typeof value === 'object') {
@@ -237,13 +239,13 @@ function contactEntries(contacts) {
 
 async function getStatusJidList(socket, configuredViewers = []) {
   if (!socket) throw new Error('Socket WhatsApp indisponible.');
-  const recipients = new Set();
   const ownJid = normalizedUserJid(socket.user?.id);
   const hasCustomAudience = Array.isArray(configuredViewers)
     ? configuredViewers.length > 0
     : typeof configuredViewers === 'string' && Boolean(configuredViewers.trim());
 
   if (hasCustomAudience) {
+    const recipients = new Set();
     const { numbers, invalid } = parseStatusViewerNumbers(configuredViewers);
     if (invalid.length || numbers.length === 0) {
       throw new Error('La liste STATUS_VIEWERS contient un numéro invalide. Corrige-la avec .setstatusviewers.');
@@ -252,36 +254,70 @@ async function getStatusJidList(socket, configuredViewers = []) {
       throw new Error(`La liste de destinataires est limitée à ${MAX_STATUS_VIEWERS} numéros.`);
     }
     for (const number of numbers) recipients.add(`${number}@s.whatsapp.net`);
-  } else {
-    for (const contact of contactEntries(socket.store?.contacts)) {
-      const jid = normalizedUserJid(contact);
-      if (jid && jid !== ownJid) recipients.add(jid);
-    }
+    if (ownJid) recipients.add(ownJid);
+    return [...recipients];
+  }
 
-    // Ce bot n’installe pas de store Baileys par défaut. Si aucun carnet de
-    // contacts n’est attaché, les participants des groupes fournissent le
-    // fallback, comme demandé par `.tostatus`.
-    if (recipients.size === 0 && typeof socket.groupFetchAllParticipating === 'function') {
-      try {
-        const groups = await socket.groupFetchAllParticipating();
-        for (const group of groupEntries(groups)) {
-          for (const participant of group?.participants || []) {
-            const jid = normalizedUserJid(participant);
-            if (jid) recipients.add(jid);
-          }
+  const cached = defaultAudienceCache.get(socket);
+  if (cached && cached.expiresAt > Date.now()) return [...cached.jids];
+
+  const recipients = new Set();
+  const addContact = (contact, fallbackJid) => {
+    const jid = contact && typeof contact === 'object'
+      ? normalizedUserJid(contact) || normalizedUserJid(contact.id || contact.jid || fallbackJid)
+      : normalizedUserJid(fallbackJid);
+    if (jid && jid !== ownJid) recipients.add(jid);
+  };
+  const contacts = socket.store?.contacts;
+  if (contacts instanceof Map) {
+    for (const [jid, contact] of contacts) addContact(contact, jid);
+  } else if (contacts && typeof contacts === 'object') {
+    for (const jid in contacts) {
+      if (Object.prototype.hasOwnProperty.call(contacts, jid)) addContact(contacts[jid], jid);
+    }
+  }
+
+  // Ce bot n’installe pas de store Baileys par défaut. Si aucun carnet de
+  // contacts n’est attaché, les participants des groupes fournissent le fallback.
+  if (recipients.size === 0 && typeof socket.groupFetchAllParticipating === 'function') {
+    try {
+      const groups = await socket.groupFetchAllParticipating();
+      const addGroupParticipants = group => {
+        for (const participant of group?.participants || []) {
+          const jid = normalizedUserJid(participant);
+          if (jid && jid !== ownJid) recipients.add(jid);
         }
-      } catch (error) {
-        console.warn('[TOSTATUS] Récupération des groupes pour l’audience impossible:', error?.message || error);
+      };
+      if (groups instanceof Map) {
+        for (const group of groups.values()) addGroupParticipants(group);
+      } else if (groups && typeof groups === 'object') {
+        for (const groupJid in groups) {
+          if (Object.prototype.hasOwnProperty.call(groups, groupJid)) addGroupParticipants(groups[groupJid]);
+        }
       }
+    } catch (error) {
+      console.warn('[TOSTATUS] Récupération des groupes pour l’audience impossible:', error?.message || error);
     }
   }
 
   if (ownJid) recipients.add(ownJid);
-  return [...recipients];
+  const jids = [...recipients];
+  if (jids.some(jid => jid !== ownJid)) {
+    defaultAudienceCache.set(socket, {
+      jids,
+      expiresAt: Date.now() + DEFAULT_AUDIENCE_CACHE_TTL_MS
+    });
+  } else {
+    // Ne pas mémoriser un fallback vide ou en erreur : le prochain essai doit
+    // pouvoir retenter la récupération des groupes.
+    defaultAudienceCache.delete(socket);
+  }
+  return [...jids];
 }
 
 module.exports = {
   MAX_STATUS_VIEWERS,
+  DEFAULT_AUDIENCE_CACHE_TTL_MS,
   normalizeSessionId(value) {
     return String(value || '').replace(/[^0-9]/g, '') || 'session';
   },
@@ -291,5 +327,5 @@ module.exports = {
   getGroupParticipantNumbers,
   appendGroupParticipantsToStatusAudience,
   getStatusJidList,
-  _test: { groupEntries, contactEntries, participantLids, participantPhoneNumber }
+  _test: { groupEntries, contactEntries, participantLids, participantPhoneNumber, defaultAudienceCache }
 };

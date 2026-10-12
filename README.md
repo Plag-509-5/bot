@@ -312,6 +312,8 @@ Le propriétaire du bot ou de la session publie dans son statut WhatsApp personn
 
 Pour un média, réponds à une photo, une vidéo ou un audio avec `.tostatus`; la caption du média est conservée et peut être remplacée par du texte ajouté à la commande. Les audios et notes vocales sont convertis en MP4 vertical animé, avec la carte visuelle « LE SEIGNEUR DES APPAREILS — PÈRE FONDATEUR DE TOUMAÏ MD ».
 
+Pour préserver la réactivité **de toutes les sessions**, les publications média partagent une file globale (2 actives, 4 en attente par défaut); image et vidéo sont envoyées en flux bornés au lieu d’être copiées intégralement en RAM. L’audio est aussi téléchargé vers un fichier temporaire, converti vers un MP4 de taille plafonnée et envoyé en flux. FFmpeg est limité à une conversion simultanée, un thread de rendu et 15 images/s pour ce statut. Les MP4 et les flux sont nettoyés même si le relay échoue. Les plafonds peuvent être ajustés avec `TOSTATUS_MEDIA_MAX_CONCURRENT`, `TOSTATUS_MEDIA_MAX_QUEUE`, `TOSTATUS_MAX_MEDIA_BYTES`, `TOSTATUS_MAX_AUDIO_BYTES`, `TOSTATUS_MAX_AUDIO_SECONDS`, `AUDIO_STATUS_MAX_INPUT_BYTES`, `AUDIO_STATUS_MAX_OUTPUT_BYTES`, `AUDIO_STATUS_MAX_CONCURRENT` et `AUDIO_STATUS_MAX_QUEUE` (valeurs par défaut dans `.env.example`).
+
 L’audience est enregistrée **par session** dans MongoDB :
 
 ```text

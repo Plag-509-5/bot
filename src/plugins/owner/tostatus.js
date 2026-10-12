@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('node:fs');
+const { Readable } = require('node:stream');
+const { acquireStatusMediaSlot } = require('../../services/status-media-queue');
 const {
   normalizeSessionId: normalizeStatusSessionId,
   getStatusJidList,
@@ -25,7 +28,12 @@ const {
   quotedText,
   streamToBuffer
 } = require('../../services/group-status-content');
-const { BRANDING, DESIGN } = require('../../services/group-status-audio');
+const {
+  BRANDING,
+  DESIGN,
+  formatTime,
+  audioToStatusVideoFile
+} = require('../../services/group-status-audio');
 const { personalStatus } = require('../../handlers/status');
 
 const PERSONAL_STATUS_BRANDING = Object.freeze({
@@ -36,6 +44,7 @@ const PERSONAL_STATUS_BRANDING = Object.freeze({
 
 const PERSONAL_STATUS_DESIGN = Object.freeze({
   ...DESIGN,
+  fps: 15,
   background: '0x0B1020',
   panel: '0x151F30',
   track: '0x1F2937',
@@ -45,6 +54,19 @@ const PERSONAL_STATUS_DESIGN = Object.freeze({
   muted: '0x9CA3AF'
 });
 
+function positiveLimitFromEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || !Number.isInteger(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+const TOSTATUS_MAX_MEDIA_BYTES = positiveLimitFromEnv(
+  'TOSTATUS_MAX_MEDIA_BYTES', 64 * 1024 * 1024, 1024 * 1024, 512 * 1024 * 1024
+);
+const TOSTATUS_MAX_AUDIO_BYTES = positiveLimitFromEnv(
+  'TOSTATUS_MAX_AUDIO_BYTES', 32 * 1024 * 1024, 1024 * 1024, TOSTATUS_MAX_MEDIA_BYTES
+);
+const TOSTATUS_MAX_AUDIO_SECONDS = positiveLimitFromEnv('TOSTATUS_MAX_AUDIO_SECONDS', 180, 30, 1800);
 const STATUS_JID = 'status@broadcast';
 const STATUS_AUDIENCE_SELECTION_PURPOSE = 'tostatus-audience';
 let nyxDownloadPromise = null;
@@ -81,6 +103,63 @@ function mediaCaption(media, isOwnMessage, statusText, prefix, command) {
     ? commandCaptionText(original, prefix, command)
     : original;
   return statusText || fallback;
+}
+
+function declaredMediaSize(media) {
+  const raw = media?.fileLength;
+  const size = Number(typeof raw?.toString === 'function' ? raw.toString() : raw);
+  return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+function unwrapMediaSource(source) {
+  return source && typeof source === 'object' && source.stream ? source.stream : source;
+}
+
+async function closeMediaSource(source) {
+  const raw = unwrapMediaSource(source);
+  if (!raw || Buffer.isBuffer(raw)) return;
+  if (typeof raw.destroy === 'function') {
+    if (!raw.destroyed) raw.destroy();
+    return;
+  }
+  if (typeof raw.cancel === 'function') return raw.cancel();
+  if (typeof raw.return === 'function') return raw.return();
+  if (typeof raw[Symbol.asyncIterator] === 'function') {
+    const iterator = raw[Symbol.asyncIterator]();
+    if (typeof iterator?.return === 'function') return iterator.return();
+  }
+}
+
+function mediaUploadStream(source, label, maxBytes = TOSTATUS_MAX_MEDIA_BYTES) {
+  const raw = unwrapMediaSource(source);
+  const input = Buffer.isBuffer(raw) ? Readable.from([raw]) : raw;
+  if (!input || typeof input[Symbol.asyncIterator] !== 'function') {
+    throw new Error(`${label} indisponible ou illisible.`);
+  }
+
+  const bounded = Readable.from((async function* () {
+    let bytesRead = 0;
+    try {
+      for await (const chunk of input) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytesRead += buffer.length;
+        if (bytesRead > maxBytes) {
+          throw new Error(`${label} dépasse la limite de ${maxBytes} octets.`);
+        }
+        yield buffer;
+      }
+      if (!bytesRead) throw new Error(`${label} vide ou indisponible.`);
+    } finally {
+      if (typeof input.destroy === 'function' && !input.destroyed) input.destroy();
+    }
+  })());
+  return { stream: bounded };
+}
+
+async function downloaderToBuffer(source) {
+  const raw = unwrapMediaSource(source);
+  if (Buffer.isBuffer(raw)) return raw;
+  return streamToBuffer(raw);
 }
 
 function renderStatusViewers(viewers, prefix) {
@@ -501,7 +580,12 @@ async function executeToStatus(context, dependencies = {}) {
       `🗑️ Suppression : ${prefix}delstatus`);
   }
 
+  let releaseMediaSlot = null;
+  let cleanupTemporaryMedia = null;
+  let mediaDownloadSourceRef = null;
+  let mediaUploadStreamRef = null;
   try {
+    if (image || video || audio) releaseMediaSlot = await acquireStatusMediaSlot();
     await reactToCommand(socket, from, msg, '⏳');
 
     const statusJidList = await (dependencies.getStatusJidList || getStatusJidList)(
@@ -516,50 +600,94 @@ async function executeToStatus(context, dependencies = {}) {
     let content;
     let label;
     if (image) {
+      const size = declaredMediaSize(image);
+      if (size > TOSTATUS_MAX_MEDIA_BYTES) {
+        throw new Error(`La photo dépasse la limite de ${TOSTATUS_MAX_MEDIA_BYTES} octets.`);
+      }
       const downloader = dependencies.downloadContentFromMessage || await loadNyxDownloader();
-      const buffer = await streamToBuffer(await downloader(image, 'image'));
-      if (!buffer.length) throw new Error('Photo vide ou indisponible. Transfère-la à nouveau puis réessaie.');
+      const downloaded = await downloader(image, 'image');
+      mediaDownloadSourceRef = downloaded;
       content = {
-        image: buffer,
+        image: mediaUploadStream(downloaded, 'La photo', TOSTATUS_MAX_MEDIA_BYTES),
         mimetype: image.mimetype || 'image/jpeg',
         caption: mediaCaption(image, image === ownMessage.imageMessage, statusText, prefix, command)
       };
+      mediaUploadStreamRef = content.image.stream;
       label = '🖼️ Image';
     } else if (video) {
+      const size = declaredMediaSize(video);
+      if (size > TOSTATUS_MAX_MEDIA_BYTES) {
+        throw new Error(`La vidéo dépasse la limite de ${TOSTATUS_MAX_MEDIA_BYTES} octets.`);
+      }
       const downloader = dependencies.downloadContentFromMessage || await loadNyxDownloader();
-      const buffer = await streamToBuffer(await downloader(video, 'video'));
-      if (!buffer.length) throw new Error('Vidéo vide ou indisponible. Transfère-la à nouveau puis réessaie.');
+      const downloaded = await downloader(video, 'video');
+      mediaDownloadSourceRef = downloaded;
       content = {
-        video: buffer,
+        video: mediaUploadStream(downloaded, 'La vidéo', TOSTATUS_MAX_MEDIA_BYTES),
         mimetype: video.mimetype || 'video/mp4',
         caption: mediaCaption(video, video === ownMessage.videoMessage, statusText, prefix, command)
       };
+      mediaUploadStreamRef = content.video.stream;
       label = '🎬 Vidéo';
     } else if (audio) {
-      const downloader = dependencies.downloadContentFromMessage || await loadNyxDownloader();
-      const audioBuffer = await streamToBuffer(await downloader(audio, 'audio'));
-      if (!audioBuffer.length) throw new Error('Audio vide ou indisponible. Transfère-le à nouveau puis réessaie.');
-
       const seconds = Number(audio.seconds) || 0;
+      if (seconds > TOSTATUS_MAX_AUDIO_SECONDS) {
+        throw new Error(`L’audio dure ${formatTime(seconds)}; la limite .tostatus est ${formatTime(TOSTATUS_MAX_AUDIO_SECONDS)}.`);
+      }
       if (seconds > 120) {
         await sendReply(socket, from, msg,
-          `🎞️ Conversion en cours (audio de ${require('../../services/group-status-audio').formatTime(seconds)})… cela peut prendre quelques minutes.`);
+          `🎞️ Conversion en cours (audio de ${formatTime(seconds)})… le bot limite le traitement à une conversion à la fois.`);
       }
-      const convert = dependencies.audioToStatusVideo
-        || require('../../services/group-status-audio').audioToStatusVideo;
-      const videoBuffer = await convert(audioBuffer, {
-        durationSeconds: seconds,
-        branding: PERSONAL_STATUS_BRANDING,
-        design: PERSONAL_STATUS_DESIGN
-      });
-      if (!Buffer.isBuffer(videoBuffer) || !videoBuffer.length) {
-        throw new Error('La conversion audio → vidéo stylisée n’a rien produit.');
+
+      const downloader = dependencies.downloadContentFromMessage || await loadNyxDownloader();
+      const audioSource = await downloader(audio, 'audio');
+      mediaDownloadSourceRef = audioSource;
+      let videoUpload;
+      if (typeof dependencies.audioToStatusVideo === 'function') {
+        // Compatibilité des tests et des intégrations qui fournissent déjà un convertisseur Buffer.
+        const audioBuffer = await downloaderToBuffer(audioSource);
+        if (!audioBuffer.length) throw new Error('Audio vide ou indisponible. Transfère-le à nouveau puis réessaie.');
+        const videoBuffer = await dependencies.audioToStatusVideo(audioBuffer, {
+          durationSeconds: seconds,
+          maxDurationSeconds: TOSTATUS_MAX_AUDIO_SECONDS,
+          maxInputBytes: TOSTATUS_MAX_AUDIO_BYTES,
+          maxOutputBytes: TOSTATUS_MAX_MEDIA_BYTES,
+          branding: PERSONAL_STATUS_BRANDING,
+          design: PERSONAL_STATUS_DESIGN
+        });
+        if (!Buffer.isBuffer(videoBuffer) || !videoBuffer.length) {
+          throw new Error('La conversion audio → vidéo stylisée n’a rien produit.');
+        }
+        videoUpload = mediaUploadStream(videoBuffer, 'La vidéo convertie', TOSTATUS_MAX_MEDIA_BYTES);
+      } else {
+        const convertToFile = dependencies.audioToStatusVideoFile || audioToStatusVideoFile;
+        const converted = await convertToFile(audioSource, {
+          durationSeconds: seconds,
+          maxDurationSeconds: TOSTATUS_MAX_AUDIO_SECONDS,
+          maxInputBytes: TOSTATUS_MAX_AUDIO_BYTES,
+          maxOutputBytes: TOSTATUS_MAX_MEDIA_BYTES,
+          branding: PERSONAL_STATUS_BRANDING,
+          design: PERSONAL_STATUS_DESIGN
+        });
+        if (!converted?.path) {
+          if (typeof converted?.cleanup === 'function') {
+            try { await converted.cleanup(); } catch {}
+          }
+          throw new Error('La conversion audio → vidéo stylisée n’a rien produit.');
+        }
+        cleanupTemporaryMedia = typeof converted.cleanup === 'function'
+          ? converted.cleanup.bind(converted)
+          : null;
+        const videoStream = fs.createReadStream(converted.path);
+        videoUpload = { stream: videoStream };
       }
+
       content = {
-        video: videoBuffer,
+        video: videoUpload,
         mimetype: 'video/mp4',
         caption: mediaCaption(audio, audio === ownMessage.audioMessage, statusText, prefix, command)
       };
+      mediaUploadStreamRef = content.video.stream;
       label = labelForAudio(audio);
     } else {
       content = { text: statusText || quotedBody };
@@ -597,9 +725,23 @@ async function executeToStatus(context, dependencies = {}) {
       `✅ Statut ${label} publié, visible par ${statusJidList.length} destinataire(s).\n` +
       `Pour le retirer : ${prefix}delstatus`);
   } catch (error) {
-    console.error('[TOSTATUS ERROR]', error);
+    const errorMessage = error?.message || String(error);
+    if (/^(?:Les publications média|Les conversions audio) sont/i.test(errorMessage)) {
+      console.warn('[TOSTATUS BUSY]', errorMessage);
+    } else {
+      console.error('[TOSTATUS ERROR]', error);
+    }
     await reactToCommand(socket, from, msg, '❌');
-    return sendReply(socket, from, msg, `❌ Erreur : ${error?.message || error}`);
+    return sendReply(socket, from, msg, `❌ Erreur : ${errorMessage}`);
+  } finally {
+    try { mediaUploadStreamRef?.destroy?.(); } catch {}
+    try { await closeMediaSource(mediaDownloadSourceRef); }
+    catch (error) { console.warn('[TOSTATUS] Fermeture du flux téléchargé échouée:', error?.message || error); }
+    if (cleanupTemporaryMedia) {
+      try { await cleanupTemporaryMedia(); }
+      catch (error) { console.warn('[TOSTATUS] Nettoyage temporaire échoué:', error?.message || error); }
+    }
+    releaseMediaSlot?.();
   }
 }
 
@@ -622,6 +764,12 @@ module.exports = {
     commandCaptionText,
     labelForAudio,
     mediaCaption,
+    declaredMediaSize,
+    mediaUploadStream,
+    downloaderToBuffer,
+    TOSTATUS_MAX_MEDIA_BYTES,
+    TOSTATUS_MAX_AUDIO_BYTES,
+    TOSTATUS_MAX_AUDIO_SECONDS,
     renderStatusViewers,
     renderStatusGroupSelection,
     statusSelectionActorIds,

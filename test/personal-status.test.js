@@ -2,6 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { Readable } = require('node:stream');
+const { getStatusMediaQueueStats } = require('../src/services/status-media-queue');
+const audioStatus = require('../src/services/group-status-audio');
 const audience = require('../src/services/status-audience');
 const statusLog = require('../src/services/status-log');
 const tostatus = require('../src/plugins/owner/tostatus');
@@ -58,6 +64,59 @@ function ownerContext(socket, overrides = {}) {
   };
 }
 
+function testStatusPublisher(relayed) {
+  return async (_socket, content, options) => {
+    const messageId = `test-status-${relayed.length + 1}`;
+    let message;
+    if (content.text) {
+      message = {
+        extendedTextMessage: {
+          text: content.text,
+          backgroundArgb: options.backgroundColor,
+          font: options.font
+        }
+      };
+    } else if (content.image) {
+      const media = content.image?.stream || content.image;
+      assert.equal(Buffer.isBuffer(content.image), false, 'la photo doit être envoyée en flux');
+      assert.equal(typeof media?.[Symbol.asyncIterator], 'function');
+      const chunks = [];
+      for await (const chunk of media) chunks.push(Buffer.from(chunk));
+      message = {
+        imageMessage: {
+          mimetype: content.mimetype,
+          caption: content.caption,
+          url: 'https://upload.invalid/image',
+          data: Buffer.concat(chunks)
+        }
+      };
+    } else if (content.video) {
+      const media = content.video?.stream || content.video;
+      assert.equal(Buffer.isBuffer(content.video), false, 'la vidéo doit être envoyée en flux');
+      assert.equal(typeof media?.[Symbol.asyncIterator], 'function');
+      const chunks = [];
+      for await (const chunk of media) chunks.push(Buffer.from(chunk));
+      message = {
+        videoMessage: {
+          mimetype: content.mimetype,
+          caption: content.caption,
+          url: 'https://upload.invalid/video',
+          data: Buffer.concat(chunks)
+        }
+      };
+    }
+    relayed.push({ jid: 'status@broadcast', message, options: { ...options, messageId } });
+    if (typeof _socket.upsertMessage === 'function') {
+      await _socket.upsertMessage({
+        key: { remoteJid: 'status@broadcast', fromMe: true, id: messageId },
+        message,
+        messageTimestamp: Math.floor(Date.now() / 1000)
+      }, 'append');
+    }
+    return { key: { id: messageId } };
+  };
+}
+
 function resetLog() {
   statusLog.clear();
 }
@@ -111,6 +170,31 @@ test('public personnalisé prioritaire; fallback aux membres de groupe si aucun 
   assert.deepEqual(custom.sort(), ['50900000000@s.whatsapp.net', '50999999999@s.whatsapp.net'].sort());
 });
 
+test('met en cache brièvement l’audience par socket et protège le cache des mutations appelantes', async () => {
+  let groupFetches = 0;
+  const { socket } = fakeSocket({
+    async groupFetchAllParticipating() {
+      groupFetches += 1;
+      return {
+        '1@g.us': {
+          participants: [{ id: '50911111111@s.whatsapp.net' }]
+        }
+      };
+    }
+  });
+
+  const first = await audience.getStatusJidList(socket, []);
+  first.push('50999999999@s.whatsapp.net');
+  const second = await audience.getStatusJidList(socket, []);
+
+  assert.equal(groupFetches, 1, 'l’audience par défaut ne doit pas relire les groupes à chaque statut');
+  assert.deepEqual(second.sort(), [
+    '50900000000@s.whatsapp.net',
+    '50911111111@s.whatsapp.net'
+  ].sort());
+  assert.equal(audience.DEFAULT_AUDIENCE_CACHE_TTL_MS, 60_000);
+});
+
 test('valide et déduplique la liste de numéros configurés', () => {
   assert.deepEqual(audience.parseStatusViewerNumbers(' +50911111111, 50922222222 50911111111 '), {
     numbers: ['50911111111', '50922222222'],
@@ -122,11 +206,24 @@ test('valide et déduplique la liste de numéros configurés', () => {
   });
 });
 
+test('borne un flux média et ferme la source dès le dépassement de taille', async () => {
+  const source = Readable.from([Buffer.from('1234'), Buffer.from('5678')]);
+  const upload = tostatus._test.mediaUploadStream(source, 'La photo', 5);
+  const chunks = [];
+  await assert.rejects((async () => {
+    for await (const chunk of upload.stream) chunks.push(Buffer.from(chunk));
+  })(), /dépasse la limite de 5 octets/);
+  assert.equal(Buffer.concat(chunks).toString(), '1234');
+  assert.equal(source.destroyed, true);
+});
+
 test('publie un statut texte avec statusJidList, option de fond et journal de suppression', async () => {
   resetLog();
   const { socket, sent, relayed, upserted } = fakeSocket();
   const context = ownerContext(socket);
-  await tostatus._test.executeToStatus(context);
+  await tostatus._test.executeToStatus(context, {
+    publishPersonalStatus: testStatusPublisher(relayed)
+  });
   await new Promise(resolve => setImmediate(resolve));
 
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
@@ -190,7 +287,8 @@ test('publie une image citée en utilisant le downloader NYXCORE injecté', asyn
       assert.equal(type, 'image');
       assert.equal(media.caption, 'photo citée');
       yield Buffer.from('png-binary');
-    }
+    },
+    publishPersonalStatus: testStatusPublisher(relayed)
   });
 
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
@@ -220,7 +318,8 @@ test('conserve une vidéo citée et retire la commande d’une caption de média
       assert.equal(media, video);
       assert.equal(type, 'video');
       yield Buffer.from('video-binary');
-    }
+    },
+    publishPersonalStatus: testStatusPublisher(relayed)
   });
 
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
@@ -259,7 +358,8 @@ test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï'
       assert.equal(buffer.toString(), 'audio-binary');
       converterOptions = options;
       return Buffer.from('stylized-video');
-    }
+    },
+    publishPersonalStatus: testStatusPublisher(relayed)
   });
 
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
@@ -271,6 +371,133 @@ test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï'
   assert.equal(converterOptions.branding.subtitle, 'PÈRE FONDATEUR DE TOUMAÏ MD');
   assert.equal(converterOptions.design.cyan, '0x25D366');
   assert.equal(converterOptions.design.background, '0x0B1020');
+});
+
+test('nettoie le MP4 temporaire et libère le slot média après un échec de publication', async () => {
+  resetLog();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kaido-tostatus-cleanup-test-'));
+  const videoPath = path.join(tempDir, 'converted.mp4');
+  await fs.writeFile(videoPath, 'converted-video');
+  const { socket, sent } = fakeSocket();
+  const audio = { mimetype: 'audio/ogg', seconds: 60, caption: 'audio temporaire' };
+  const context = ownerContext(socket, {
+    args: [],
+    msg: {
+      key: { remoteJid: '50911111111@s.whatsapp.net', fromMe: false, id: 'reply-audio-cleanup' },
+      message: {
+        extendedTextMessage: {
+          text: '.tostatus',
+          contextInfo: { quotedMessage: { audioMessage: audio } }
+        }
+      }
+    },
+    quotedMsg: { audioMessage: audio }
+  });
+  const before = getStatusMediaQueueStats();
+  let cleanupCalls = 0;
+
+  try {
+    await tostatus._test.executeToStatus(context, {
+      async *downloadContentFromMessage(_media, type) {
+        assert.equal(type, 'audio');
+        yield Buffer.from('audio-source');
+      },
+      async audioToStatusVideoFile(source) {
+        const chunks = [];
+        for await (const chunk of source) chunks.push(Buffer.from(chunk));
+        assert.equal(Buffer.concat(chunks).toString(), 'audio-source');
+        return {
+          path: videoPath,
+          async cleanup() {
+            cleanupCalls += 1;
+            await fs.rm(tempDir, { recursive: true, force: true });
+          }
+        };
+      },
+      async publishPersonalStatus(_activeSocket, content) {
+        assert.ok(content.video.stream instanceof Readable);
+        const chunks = [];
+        for await (const chunk of content.video.stream) chunks.push(Buffer.from(chunk));
+        assert.equal(Buffer.concat(chunks).toString(), 'converted-video');
+        throw new Error('publication simulée échouée');
+      }
+    });
+
+    assert.equal(cleanupCalls, 1);
+    assert.deepEqual(getStatusMediaQueueStats(), before);
+    await assert.rejects(fs.access(videoPath));
+    assert.match(sent.at(-1).content.text, /publication simulée échouée/);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('ferme la source audio si la file FFmpeg globale est pleine', async () => {
+  const queueLimits = audioStatus.getAudioStatusQueueStats();
+  assert.equal(queueLimits.active, 0);
+  assert.equal(queueLimits.waiting, 0);
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  const createHeldJob = () => {
+    const started = deferred();
+    const gate = deferred();
+    const job = audioStatus._test.runAudioStatusJob(() => {
+      started.resolve();
+      return gate.promise;
+    });
+    return { started, gate, job };
+  };
+  const activeJobs = Array.from({ length: queueLimits.maxConcurrent }, createHeldJob);
+  await Promise.all(activeJobs.map(job => job.started.promise));
+  const queuedJobs = Array.from({ length: queueLimits.maxQueued }, createHeldJob);
+  assert.deepEqual(audioStatus.getAudioStatusQueueStats(), {
+    active: queueLimits.maxConcurrent,
+    waiting: queueLimits.maxQueued,
+    maxConcurrent: queueLimits.maxConcurrent,
+    maxQueued: queueLimits.maxQueued
+  });
+
+  const source = new Readable({ read() {} });
+  const { socket } = fakeSocket();
+  const audio = { mimetype: 'audio/ogg', seconds: 60 };
+  const context = ownerContext(socket, {
+    args: [],
+    msg: {
+      key: { remoteJid: '50911111111@s.whatsapp.net', fromMe: false, id: 'audio-queue-full' },
+      message: {
+        extendedTextMessage: {
+          text: '.tostatus',
+          contextInfo: { quotedMessage: { audioMessage: audio } }
+        }
+      }
+    },
+    quotedMsg: { audioMessage: audio }
+  });
+
+  try {
+    await tostatus._test.executeToStatus(context, {
+      downloadContentFromMessage() { return source; }
+    });
+    assert.equal(source.destroyed, true, 'le flux téléchargé non consommé doit être fermé');
+  } finally {
+    for (const activeJob of activeJobs) activeJob.gate.resolve();
+    await Promise.all(activeJobs.map(job => job.job));
+    for (const queued of queuedJobs) {
+      await queued.started.promise;
+      queued.gate.resolve();
+      await queued.job;
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(audioStatus.getAudioStatusQueueStats(), {
+    active: 0,
+    waiting: 0,
+    maxConcurrent: queueLimits.maxConcurrent,
+    maxQueued: queueLimits.maxQueued
+  });
 });
 
 test('refuse un non-propriétaire et persiste/remplace l’audience par session', async () => {
