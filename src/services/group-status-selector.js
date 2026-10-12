@@ -1,6 +1,7 @@
 'use strict';
 
 const DEFAULT_SELECTION_TTL_MS = 5 * 60 * 1000;
+const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus']);
 const pendingSelections = new Map();
 const selectedGroups = new Map();
 
@@ -10,6 +11,11 @@ function normalizeSessionId(value) {
 
 function normalizeActorId(value) {
   return String(value || '').trim().toLowerCase() || 'unknown';
+}
+
+function isPublicGroupStatusCommand(remoteJid, command) {
+  return String(remoteJid || '').endsWith('@g.us')
+    && PUBLIC_GROUP_STATUS_COMMANDS.has(String(command || '').toLowerCase());
 }
 
 function selectionKey(sessionId, actorId) {
@@ -158,8 +164,10 @@ function actorIdFromMessage(socket, msg, remoteJid) {
 
 module.exports = {
   DEFAULT_SELECTION_TTL_MS,
+  PUBLIC_GROUP_STATUS_COMMANDS,
   normalizeSessionId,
   normalizeActorId,
+  isPublicGroupStatusCommand,
   selectionKey,
   identityTokens,
   participantMatches,

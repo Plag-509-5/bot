@@ -31,7 +31,7 @@
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
   - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast` avec une audience réglable par session (`.setstatusviewers`) et `.delstatus` pour retirer la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
-  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** le propriétaire choisit le groupe cible en privé, puis publie texte/image/vidéo/audio via `groupStatusMessageV2` sans confirmation dans le chat du groupe. Les textes ont une palette sombre personnalisée et une police WhatsApp plus élégante; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
+  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** en privé, le propriétaire choisit le groupe cible; depuis un groupe, tous les membres peuvent publier directement sur le statut du groupe et reçoivent la confirmation dans ce groupe. Les textes ont une palette sombre personnalisée; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -76,9 +76,9 @@ d'authentification WhatsApp.
 
 Les sessions, l’authentification MongoDB et les sockets principaux du bot
 utilisent le paquet officiel **`@whiskeysockets/baileys`** (version épinglée
-`7.0.0-rc14`), sans alias ni fork. Le plugin `.swgc` / `.gcstatus` utilise aussi
-**`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour ses helpers de téléchargement et de
-génération des messages de statut.
+`7.0.0-rc14`), sans alias ni fork. Les plugins `.swgc` / `.gcstatus` et
+`.tostatus` utilisent aussi **`@nyxcore/nyxcoresocket`** (`^0.3.2`) pour les
+helpers de téléchargement/génération des statuts.
 
 La méthode `sendGroupStatus()` de NYXCORE n’existe que sur les sockets produits
 par sa propre factory. Pour conserver les sessions actives du projet et éviter
@@ -291,14 +291,13 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
-### Statut de groupe privé avec `.swgc` / `.gcstatus`
+### Statut de groupe avec `.swgc` / `.gcstatus`
 
-1. Le propriétaire du bot envoie `.swgc` (ou `.gcstatus`) au bot en conversation privée.
-2. Il répond avec le numéro du groupe affiché; le choix expire après cinq minutes.
-3. Il publie avec `.swgc ton texte, violet` (ou `.gcstatus`) ou répond à une image, vidéo ou note audio avec la commande.
-4. Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
+- **En privé :** le propriétaire envoie `.swgc` au bot, choisit le groupe dans la liste, puis publie avec `.swgc ton texte, violet` ou en répondant à une image, une vidéo ou une note audio. La sélection expire après cinq minutes; les listes, erreurs et confirmations restent dans le chat privé.
+- **Depuis un groupe :** n’importe quel membre envoie `.swgc ton texte, violet` (ou répond à un média avec `.swgc`). Le statut est publié sur le statut de ce même groupe, et les confirmations/erreurs répondent dans le groupe, jamais en privé. Ce mode reste autorisé pour `.swgc` et ses alias même si la session est en `MODE=private`.
+- Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée. Les listes, erreurs et confirmations restent dans la conversation privée.
+Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée.
 
 Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
 
@@ -324,7 +323,7 @@ L’audience est enregistrée **par session** dans MongoDB :
 - Une liste personnalisée ne distribue le statut qu’aux numéros indiqués, plus le compte qui le publie.
 - Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
 - `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.
-- Les publications sont envoyées à `status@broadcast` en mode broadcast avec `statusJidList`; le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
+- NYXCORE construit le `WAMessage`, puis `relayMessage` du socket Baileys déjà connecté le publie à `status@broadcast` avec son `statusJidList`; le relay vérifie d’abord que la session WhatsApp est prête. Le contenu et les confirmations privées ne sont pas renvoyés dans le chat du groupe. Une commande lancée depuis un groupe reçoit sa réponse en message privé.
 - `.save`, en répondant à un statut ou à un média éphémère, transfère le contenu dans le chat « Vous » du compte WhatsApp connecté.
 
 ### Transfert automatique des réponses aux statuts avec `.send`
@@ -354,15 +353,15 @@ Quand une personne répond au statut personnel du compte du bot avec l’un des 
 .update reset
 ```
 
-`.update check` compare le commit installé au dépôt et à la branche sélectionnés, affiche les fichiers concernés et les branches disponibles sans modifier le clone. `.update` et `.update apply` appliquent le fast-forward. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer ces commandes.
+`.update check` compare le commit installé au dépôt et à la branche sélectionnés, affiche les fichiers concernés et les branches disponibles sans modifier le clone. `.update` (application par défaut) et `.update apply` appliquent automatiquement le fast-forward en ne remplaçant que les fichiers touchés par les commits GitHub. Seuls le propriétaire du bot et le propriétaire de la session peuvent lancer ces commandes.
 
 Configure `BOT_UPDATE_GITHUB_TOKEN` dans `.env` pour que le bot liste les dépôts accessibles (`.update repos`) et lise les dépôts privés. Utilise un token à privilèges minimaux, limité aux dépôts nécessaires et avec les permissions GitHub de métadonnées et de contenu en lecture. Le token n’est ni enregistré dans MongoDB ni affiché par le bot; ne l’envoie jamais dans WhatsApp. Les branches et dépôts publics peuvent être consultés sans token, sous réserve des limites d’API GitHub.
 
 `.update repo <owner/repo>` vérifie l’accès au dépôt et sélectionne sa branche par défaut. `.update branches` liste ses branches; `.update branch <nom>` en choisit une. La sélection est partagée par le bot et persistée dans MongoDB. En l’absence de sélection enregistrée, `BOT_UPDATE_REPO` et `BOT_UPDATE_BRANCH` dans `.env` servent de valeurs par défaut; sans dépôt configuré, le remote Git `origin` est utilisé et la branche par défaut est `main`. `.update reset` efface la sélection persistée.
 
-Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. La mise à jour refuse de continuer si des fichiers suivis ont des changements locaux, si les historiques n’ont pas de base commune ou si les branches ont divergé : elle ne fait jamais de `reset --hard` et ne remplace pas les fichiers locaux silencieusement. Les fichiers non suivis tels que `.env` ne sont pas visés. Le dépôt/branche choisi doit donc pouvoir avancer le commit installé par fast-forward.
+Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. L’application calcule le diff entre le commit installé et la cible, puis restaure uniquement les chemins ajoutés, modifiés, supprimés ou renommés dans ce diff avant d’avancer le pointeur Git en fast-forward. Un changement local sur un fichier également modifié par GitHub est remplacé; les changements locaux hors du diff et les fichiers non suivis tels que `.env` sont conservés. La commande affiche ces cas et ne fait jamais de `reset --hard`. Elle s’arrête si les historiques n’ont pas de base commune ou si les branches ont divergé.
 
-Après le fast-forward, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
+Après la mise à jour, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
 
 ---
 

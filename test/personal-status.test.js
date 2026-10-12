@@ -9,18 +9,32 @@ const pluginLoader = require('../src/core/pluginLoader');
 
 function fakeSocket(extra = {}) {
   const sent = [];
-  let nextId = 0;
+  const relayed = [];
+  const upserted = [];
   const socket = {
     user: { id: '50900000000:7@s.whatsapp.net' },
     async sendMessage(jid, content, options) {
       sent.push({ jid, content, options });
       if (jid === 'status@broadcast' && content?.delete) return { key: { id: content.delete.id } };
-      if (jid === 'status@broadcast') return { key: { id: `status-${++nextId}` } };
       return { key: { id: `reply-${sent.length}` } };
     },
+    async waUploadToServer(_encryptedPath, { mediaType } = {}) {
+      return {
+        mediaUrl: `https://upload.invalid/${mediaType || 'media'}`,
+        directPath: `/status/${mediaType || 'media'}`
+      };
+    },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+      return options?.messageId;
+    },
+    async upsertMessage(message, type) {
+      upserted.push({ message, type });
+    },
+    messageMutex: { async mutex(operation) { return operation(); } },
     ...extra
   };
-  return { socket, sent };
+  return { socket, sent, relayed, upserted };
 }
 
 function ownerContext(socket, overrides = {}) {
@@ -110,40 +124,44 @@ test('valide et déduplique la liste de numéros configurés', () => {
 
 test('publie un statut texte avec statusJidList, option de fond et journal de suppression', async () => {
   resetLog();
-  const { socket, sent } = fakeSocket();
+  const { socket, sent, relayed, upserted } = fakeSocket();
   const context = ownerContext(socket);
   await tostatus._test.executeToStatus(context);
+  await new Promise(resolve => setImmediate(resolve));
 
-  const statusSend = sent.find(event => event.jid === 'status@broadcast');
+  const statusSend = relayed.find(event => event.jid === 'status@broadcast');
   assert.ok(statusSend);
-  assert.deepEqual(statusSend.content, { text: 'Bonjour' });
+  assert.equal(sent.some(event => event.jid === 'status@broadcast'), false, 'la publication doit passer par le relay NYXCORE, pas par un second chemin sendMessage');
+  assert.equal(statusSend.message.extendedTextMessage.text, 'Bonjour');
   assert.deepEqual(statusSend.options.statusJidList.sort(), [
     '50900000000@s.whatsapp.net',
     '50922222222@s.whatsapp.net'
   ].sort());
-  assert.equal(statusSend.options.backgroundColor, '#000000');
-  assert.equal(statusSend.options.font, 0);
-  assert.equal(statusSend.options.broadcast, true);
-  assert.equal(statusLog.getLatest('50900000000').key.id, 'status-1');
+  assert.ok(statusSend.message.extendedTextMessage.backgroundArgb !== undefined);
+  assert.equal(statusLog.getLatest('50900000000').key.id, statusSend.options.messageId);
+  assert.equal(upserted.length, 1, 'le relay direct doit conserver l’append local effectué par sendMessage Baileys');
+  assert.equal(upserted[0].type, 'append');
+  assert.equal(upserted[0].message.key.fromMe, true);
+  assert.equal(upserted[0].message.key.id, statusSend.options.messageId);
   assert.match(sent.at(-1).content.text, /Statut 📝 Texte publié/);
   assert.match(sent.at(-1).content.text, /\.delstatus/);
 });
 
 test('ne publie pas un statut adressé uniquement au propre compte du bot', async () => {
   resetLog();
-  const { socket, sent } = fakeSocket();
+  const { socket, sent, relayed } = fakeSocket();
   await tostatus._test.executeToStatus(ownerContext(socket, {
     sessionCfg: { STATUS_VIEWERS: [] },
     args: ['invisible']
   }));
-  assert.equal(sent.some(event => event.jid === 'status@broadcast'), false);
+  assert.equal(relayed.some(event => event.jid === 'status@broadcast'), false);
   assert.match(sent.at(-1).content.text, /Aucun autre destinataire/);
   assert.match(sent.at(-1).content.text, /\.setstatusviewers/);
 });
 
 test('publie une image citée en utilisant le downloader NYXCORE injecté', async () => {
   resetLog();
-  const { socket, sent } = fakeSocket();
+  const { socket, sent, relayed } = fakeSocket();
   const context = ownerContext(socket, {
     args: [],
     msg: {
@@ -175,15 +193,15 @@ test('publie une image citée en utilisant le downloader NYXCORE injecté', asyn
     }
   });
 
-  const statusSend = sent.find(event => event.jid === 'status@broadcast');
-  assert.equal(statusSend.content.image.toString(), 'png-binary');
-  assert.equal(statusSend.content.mimetype, 'image/png');
-  assert.equal(statusSend.content.caption, 'photo citée');
+  const statusSend = relayed.find(event => event.jid === 'status@broadcast');
+  assert.equal(statusSend.message.imageMessage.mimetype, 'image/png');
+  assert.equal(statusSend.message.imageMessage.caption, 'photo citée');
+  assert.ok(statusSend.message.imageMessage.url || statusSend.message.imageMessage.directPath);
 });
 
 test('conserve une vidéo citée et retire la commande d’une caption de média propre', async () => {
   resetLog();
-  const { socket, sent } = fakeSocket();
+  const { socket, sent, relayed } = fakeSocket();
   const video = { mimetype: 'video/mp4', caption: 'légende vidéo' };
   await tostatus._test.executeToStatus(ownerContext(socket, {
     args: [],
@@ -205,17 +223,17 @@ test('conserve une vidéo citée et retire la commande d’une caption de média
     }
   });
 
-  const statusSend = sent.find(event => event.jid === 'status@broadcast');
-  assert.equal(statusSend.content.video.toString(), 'video-binary');
-  assert.equal(statusSend.content.mimetype, 'video/mp4');
-  assert.equal(statusSend.content.caption, 'légende vidéo');
+  const statusSend = relayed.find(event => event.jid === 'status@broadcast');
+  assert.equal(statusSend.message.videoMessage.mimetype, 'video/mp4');
+  assert.equal(statusSend.message.videoMessage.caption, 'légende vidéo');
+  assert.ok(statusSend.message.videoMessage.url || statusSend.message.videoMessage.directPath);
   assert.equal(tostatus._test.mediaCaption({ caption: '.tostatus Description' }, true, '', '.', 'tostatus'), 'Description');
   assert.equal(tostatus._test.commandCaptionText('!to+status Texte', '!', 'to+status'), 'Texte');
 });
 
 test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï', async () => {
   resetLog();
-  const { socket, sent } = fakeSocket();
+  const { socket, sent, relayed } = fakeSocket();
   const audio = { mimetype: 'audio/ogg', ptt: true, seconds: 180, caption: 'mon audio' };
   const context = ownerContext(socket, {
     args: [],
@@ -244,10 +262,10 @@ test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï'
     }
   });
 
-  const statusSend = sent.find(event => event.jid === 'status@broadcast');
-  assert.equal(statusSend.content.video.toString(), 'stylized-video');
-  assert.equal(statusSend.content.mimetype, 'video/mp4');
-  assert.equal(statusSend.content.caption, 'mon audio');
+  const statusSend = relayed.find(event => event.jid === 'status@broadcast');
+  assert.equal(statusSend.message.videoMessage.mimetype, 'video/mp4');
+  assert.equal(statusSend.message.videoMessage.caption, 'mon audio');
+  assert.ok(statusSend.message.videoMessage.url || statusSend.message.videoMessage.directPath);
   assert.equal(converterOptions.durationSeconds, 180);
   assert.equal(converterOptions.branding.title, 'LE SEIGNEUR DES APPAREILS');
   assert.equal(converterOptions.branding.subtitle, 'PÈRE FONDATEUR DE TOUMAÏ MD');

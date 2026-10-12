@@ -15,6 +15,7 @@ const {
   streamToBuffer
 } = require('../../services/group-status-content');
 const { BRANDING, DESIGN } = require('../../services/group-status-audio');
+const { personalStatus } = require('../../handlers/status');
 
 const PERSONAL_STATUS_BRANDING = Object.freeze({
   title: 'LE SEIGNEUR DES APPAREILS',
@@ -286,7 +287,8 @@ async function executeToStatus(context, dependencies = {}) {
       messageOptions.backgroundColor = '#000000';
       messageOptions.font = 0;
     }
-    const sent = await socket.sendMessage(STATUS_JID, content, messageOptions);
+    const publishStatus = dependencies.publishPersonalStatus || personalStatus;
+    const sent = await publishStatus(socket, content, messageOptions);
     if (!sent?.key?.id) {
       throw new Error('WhatsApp n’a pas renvoyé la clé du statut; la publication n’est pas confirmée.');
     }

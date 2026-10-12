@@ -89,7 +89,8 @@ const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
 const {
   resolveGroupSelection,
-  actorIdFromMessage
+  actorIdFromMessage,
+  isPublicGroupStatusCommand
 } = require('../services/group-status-selector');
 const { handleAntiLink } = require('../handlers/antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('../handlers/antilink');
@@ -1911,7 +1912,10 @@ function setupCommandHandlers(socket, number) {
     const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
 
     // En mode privé, les propriétaires et admins Mongo restent autorisés.
-    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
+    // L’usage public de `.swgc` dans son groupe reste toutefois ouvert à tous
+    // les membres, comme le prévoit le mode groupe de cette commande.
+    const publicGroupStatusCommand = isPublicGroupStatusCommand(from, command);
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged && !publicGroupStatusCommand) {
       await handleIgnoredMessage(socket, msg, sessionCfg);
       return;
     }

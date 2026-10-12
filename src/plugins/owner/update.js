@@ -9,7 +9,7 @@ const MAX_DISPLAYED_REPOSITORIES = 20;
 const VALID_MODES = new Set(['check', 'apply']);
 const USAGE = [
   '.update check — compare la mise à jour et affiche les branches GitHub',
-  '.update apply — applique le fast-forward',
+  '.update apply — remplace uniquement les fichiers touchés par GitHub',
   '.update repos — liste les dépôts accessibles avec le token GitHub',
   '.update repo <owner/repo> — sélectionne un dépôt',
   '.update branches — liste les branches du dépôt sélectionné',
@@ -40,7 +40,7 @@ async function reply(context, text) {
 }
 
 function changedFilesText(files = []) {
-  if (!files.length) return '  (aucun fichier modifié dans ce commit)';
+  if (!files.length) return '  (aucun fichier à mettre à jour)';
   const lines = files.slice(0, MAX_DISPLAYED_FILES).map(file => {
     const filePath = String(file.path || '').replace(/[\r\n\t]+/g, ' ').slice(0, 140);
     return `  • ${file.label}: ${filePath}`;
@@ -51,9 +51,25 @@ function changedFilesText(files = []) {
   return lines.join('\n');
 }
 
+function filePaths(file = {}) {
+  if (Array.isArray(file.paths) && file.paths.length) return file.paths;
+  return String(file.path || '').split(' → ').filter(Boolean);
+}
+
 function dependencyFilesChanged(files = []) {
   const dependencyFiles = new Set(['package.json', 'package-lock.json', 'npm-shrinkwrap.json']);
-  return files.some(file => String(file.path || '').split(' → ').some(filePath => dependencyFiles.has(filePath)));
+  return files.some(file => filePaths(file).some(filePath => dependencyFiles.has(filePath)));
+}
+
+function localChangeSummary(plan = {}) {
+  const localFiles = new Set((plan.localChanges || []).flatMap(change => (
+    Array.isArray(change.paths) && change.paths.length ? change.paths : [change.path]
+  )).filter(Boolean));
+  if (!localFiles.size) return '';
+  const githubFiles = new Set((plan.files || []).flatMap(filePaths));
+  const overwritten = [...localFiles].filter(filePath => githubFiles.has(filePath)).length;
+  const preserved = localFiles.size - overwritten;
+  return `⚠️ Changements locaux suivis : ${localFiles.size}; ${overwritten} fichier(s) également modifié(s) par GitHub seront remplacés et ${preserved} autre(s) conservé(s).`;
 }
 
 function branchListText(branches = [], selectedBranch = '', error = '', limit = MAX_DISPLAYED_BRANCHES) {
@@ -67,17 +83,23 @@ function branchListText(branches = [], selectedBranch = '', error = '', limit = 
 }
 
 function planSummary(plan, prefix = '.', branches = [], branchError = '') {
-  return [
+  const localSummary = localChangeSummary(plan);
+  const lines = [
     `🔎 *Mise à jour GitHub — ${plan.repository} (${plan.branch})*`,
     `Version locale : \`${plan.currentSha.slice(0, 7)}\` (${plan.currentBranch})`,
     `Dernière version : \`${plan.shortSha}\`${plan.commitSummary ? ` — ${plan.commitSummary}` : ''}`,
     `Fichiers concernés : ${plan.files.length}`,
-    changedFilesText(plan.files),
+    changedFilesText(plan.files)
+  ];
+  if (localSummary) lines.push(localSummary);
+  lines.push(
     '',
     branchListText(branches, plan.branch, branchError),
     '',
+    'Seuls les fichiers listés seront remplacés; les autres fichiers et fichiers non suivis restent intacts.',
     `Pour appliquer : ${prefix}update apply`
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 function dependencyNames(dependencies = {}) {
@@ -243,15 +265,26 @@ async function checkOrApply(context, mode, dependencies = {}) {
 
   if (mode === 'check') return reply(context, planSummary(plan, prefix, branches, branchError));
 
-  await reply(context,
-    `🔄 ${plan.files.length} fichier(s) à mettre à jour vers ${plan.shortSha}. Application en fast-forward…`);
+  const localSummary = localChangeSummary(plan);
+  const applyingMessage = [
+    `🔄 ${plan.files.length} fichier(s) touché(s) par GitHub vers ${plan.shortSha}. Seuls ces fichiers seront remplacés; les autres restent intacts.`,
+    localSummary
+  ].filter(Boolean).join('\n');
+  await reply(context, applyingMessage);
   const result = await services.applyUpdate(plan);
+  const appliedFiles = Array.isArray(result.files) ? result.files : plan.files;
   const notes = [
     `✅ Mise à jour appliquée depuis *${plan.repository}@${plan.branch}* : \`${result.updatedSha.slice(0, 7)}\`.`,
-    `${plan.files.length} ${plan.files.length === 1 ? 'fichier mis à jour' : 'fichiers mis à jour'}.`,
-    'Redémarre le bot pour charger complètement les nouveaux fichiers.'
+    `${appliedFiles.length} ${appliedFiles.length === 1 ? 'fichier mis à jour' : 'fichiers mis à jour'}.`
   ];
-  if (dependencyFilesChanged(plan.files)) {
+  if (result.overwrittenLocalFiles?.length) {
+    notes.push(`⚠️ Changements locaux remplacés sur ${result.overwrittenLocalFiles.length} fichier(s) du diff GitHub.`);
+  }
+  if (result.preservedLocalFiles?.length) {
+    notes.push(`✅ Changements locaux conservés hors du diff : ${result.preservedLocalFiles.length} fichier(s).`);
+  }
+  notes.push('Redémarre le bot pour charger complètement les nouveaux fichiers.');
+  if (dependencyFilesChanged(appliedFiles)) {
     notes.push('⚠️ `package.json` ou le lockfile a changé : exécute `npm install` avant le redémarrage.');
   }
   return reply(context, notes.join('\n'));

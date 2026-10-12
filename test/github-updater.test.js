@@ -2,6 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 const updater = require('../src/services/github-updater');
 const updatePlugin = require('../src/plugins/owner/update');
 
@@ -94,10 +98,14 @@ test('parse les commits ahead/behind et les fichiers ajoutés, modifiés, suppri
     'D\told.js',
     'R100\told-name.js\tnew-name.js'
   ].join('\n')), [
-    { status: 'M', label: 'MODIF', path: 'README.md' },
-    { status: 'A', label: 'AJOUT', path: 'src/new.js' },
-    { status: 'D', label: 'SUPPRESSION', path: 'old.js' },
-    { status: 'R100', label: 'MODIF', path: 'old-name.js → new-name.js' }
+    { status: 'M', label: 'MODIF', path: 'README.md', paths: ['README.md'] },
+    { status: 'A', label: 'AJOUT', path: 'src/new.js', paths: ['src/new.js'] },
+    { status: 'D', label: 'SUPPRESSION', path: 'old.js', paths: ['old.js'] },
+    { status: 'R100', label: 'MODIF', path: 'old-name.js → new-name.js', paths: ['old-name.js', 'new-name.js'] }
+  ]);
+  assert.deepEqual(updater.parseChangedFiles('R100\0folder/old name.txt\0folder/new name.txt\0M\0tab\tname.js\0'), [
+    { status: 'R100', label: 'MODIF', path: 'folder/old name.txt → folder/new name.txt', paths: ['folder/old name.txt', 'folder/new name.txt'] },
+    { status: 'M', label: 'MODIF', path: 'tab\tname.js', paths: ['tab\tname.js'] }
   ]);
 });
 
@@ -176,24 +184,25 @@ test('masque un token dans les erreurs de l’API GitHub', async () => {
   });
 });
 
-test('compare le HEAD local au dernier commit GitHub sans accepter de changements locaux suivis', async () => {
+test('compare le HEAD GitHub et conserve les changements locaux pour une application ciblée', async () => {
   const calls = [];
   let shallow = false;
+  let localStatus = '';
   const run = async (args, cwd) => {
     calls.push({ args, cwd });
     const command = args.join(' ');
     if (command === 'rev-parse --show-toplevel') return { stdout: '/srv/kaido' };
     if (command === 'remote get-url origin') return { stdout: 'https://github.com/Plag-509-5/bot.git' };
     if (command === 'branch --show-current') return { stdout: 'main' };
-    if (command === 'status --porcelain --untracked-files=no') return { stdout: '' };
+    if (args[0] === 'status') return { stdout: localStatus };
     if (command === 'rev-parse HEAD') return { stdout: currentSha };
     if (command === 'rev-parse --is-shallow-repository') return { stdout: shallow ? 'true' : 'false' };
     if (args[0] === 'fetch') return { stdout: '' };
-    if (command === `rev-parse refs/remotes/origin/main`) return { stdout: targetSha };
+    if (command === 'rev-parse refs/remotes/origin/main') return { stdout: targetSha };
     if (args[0] === 'merge-base') return { stdout: baseSha };
-    if (args[0] === 'rev-list') return { stdout: '0\t2' };
-    if (args[0] === 'diff') return { stdout: 'M\tREADME.md\nA\tsrc/new.js' };
-    if (args[0] === 'show') return { stdout: '2222222\tfix: latest changes' };
+    if (args[0] === 'rev-list') return { stdout: '0	2' };
+    if (args[0] === 'diff') return { stdout: 'M\0README.md\0A\0src/new.js\0' };
+    if (args[0] === 'show') return { stdout: '2222222	fix: latest changes' };
     throw new Error(`commande inattendue: ${command}`);
   };
 
@@ -205,6 +214,7 @@ test('compare le HEAD local au dernier commit GitHub sans accepter de changement
   assert.equal(plan.ahead, 0);
   assert.equal(plan.canFastForward, true);
   assert.deepEqual(plan.files.map(file => file.path), ['README.md', 'src/new.js']);
+  assert.deepEqual(plan.localChanges, []);
   assert.ok(calls.some(({ args }) => args[0] === 'fetch' && !args.includes('--unshallow')));
   assert.ok(calls.every(({ cwd }) => cwd === '/srv/kaido'));
 
@@ -213,14 +223,12 @@ test('compare le HEAD local au dernier commit GitHub sans accepter de changement
   await updater.checkForUpdates({ cwd: '/srv/kaido', branch: 'main', run });
   assert.ok(calls.some(({ args }) => args[0] === 'fetch' && args.includes('--unshallow')));
 
-  const dirtyRun = async (args) => {
-    if (args[0] === 'rev-parse') return { stdout: '/srv/kaido' };
-    if (args[0] === 'remote') return { stdout: 'https://github.com/Plag-509-5/bot.git' };
-    if (args[0] === 'branch') return { stdout: 'main' };
-    if (args[0] === 'status') return { stdout: ' M src/local-change.js' };
-    throw new Error(`ne devrait pas appeler ${args.join(' ')}`);
-  };
-  await assert.rejects(updater.checkForUpdates({ cwd: '/srv/kaido', run: dirtyRun }), /changements locaux/);
+  shallow = false;
+  localStatus = ' M src/local-change.js\0';
+  const dirtyPlan = await updater.checkForUpdates({ cwd: '/srv/kaido', run });
+  assert.equal(dirtyPlan.hasUpdate, true);
+  assert.equal(dirtyPlan.localChanges.length, 1);
+  assert.equal(dirtyPlan.localChanges[0].path, 'src/local-change.js');
 });
 
 test('peut comparer une branche d’un dépôt sélectionné et authentifier git fetch sans URL tokenisée', async () => {
@@ -233,7 +241,7 @@ test('peut comparer une branche d’un dépôt sélectionné et authentifier git
     if (command === 'rev-parse --show-toplevel') return { stdout: '/srv/kaido' };
     if (command === 'remote get-url origin') return { stdout: 'https://github.com/Plag-509-5/bot.git' };
     if (command === 'branch --show-current') return { stdout: 'main' };
-    if (command === 'status --porcelain --untracked-files=no') return { stdout: '' };
+    if (args[0] === 'status') return { stdout: '' };
     if (command === 'rev-parse HEAD') return { stdout: currentSha };
     if (command === 'rev-parse --is-shallow-repository') return { stdout: 'false' };
     if (args[0] === 'fetch') return { stdout: '' };
@@ -262,21 +270,35 @@ test('peut comparer une branche d’un dépôt sélectionné et authentifier git
   assert.equal(plan.canFastForward, true);
 });
 
-test('applique seulement un fast-forward confirmé, sans écraser un changement apparu entre-temps', async () => {
+test('applique uniquement le diff GitHub, déplace HEAD en fast-forward et refuse un HEAD périmé', async () => {
   const plan = updatePlan();
   const calls = [];
-  let merged = false;
+  let reset = false;
   const run = async args => {
     calls.push(args);
-    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: merged ? targetSha : currentSha };
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: reset ? targetSha : currentSha };
+    if (args[0] === 'branch') return { stdout: 'main' };
     if (args[0] === 'status') return { stdout: '' };
     if (args[0] === 'rev-parse') return { stdout: targetSha };
-    if (args[0] === 'merge') { merged = true; return { stdout: '' }; }
+    if (args[0] === 'merge-base') return { stdout: currentSha };
+    if (args[0] === 'rev-list') return { stdout: '0	2' };
+    if (args[0] === 'diff') return { stdout: 'M\0README.md\0A\0src/new.js\0' };
+    if (args[0] === 'restore') return { stdout: '' };
+    if (args[0] === 'update-ref') { reset = true; return { stdout: '' }; }
     throw new Error(`commande inattendue: ${args.join(' ')}`);
   };
   const result = await updater.applyUpdate(plan, { run });
   assert.equal(result.updatedSha, targetSha);
-  assert.ok(calls.some(args => args[0] === 'merge' && args.includes('--ff-only')));
+  assert.deepEqual(result.updatedPaths, ['README.md', 'src/new.js']);
+  assert.ok(calls.some(args => args[0] === 'restore'
+    && args.includes('--staged')
+    && args.includes(':(literal)README.md')
+    && args.includes(':(literal)src/new.js')));
+  assert.ok(calls.some(args => args[0] === 'update-ref'
+    && args.includes('HEAD')
+    && args.includes('refs/remotes/origin/main')
+    && args.includes(currentSha)));
+  assert.equal(calls.some(args => args[0] === 'reset' || args[0] === 'merge'), false);
 
   await assert.rejects(updater.applyUpdate(plan, {
     run: async args => {
@@ -284,6 +306,81 @@ test('applique seulement un fast-forward confirmé, sans écraser un changement 
       throw new Error(`ne devrait pas appeler ${args.join(' ')}`);
     }
   }), /a changé depuis la comparaison/);
+});
+
+test('application Git réelle : ne restaure que les fichiers du diff et préserve les personnalisations hors diff', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaido-update-test-'));
+  const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+  const write = (name, content) => fs.writeFileSync(path.join(root, name), content);
+  try {
+    git('init', '--quiet', '--initial-branch=main');
+    git('config', 'user.email', 'kaido-test@example.invalid');
+    git('config', 'user.name', 'Kaido Update Test');
+    git('remote', 'add', 'origin', 'https://github.com/Plag-509-5/bot.git');
+    write('change.txt', 'base value\n');
+    write('keep.txt', 'base keep\n');
+    write('delete.txt', 'delete from base\n');
+    write('rename-old.txt', 'unchanged rename body\n');
+    write('custom.txt', 'panel base\n');
+    write('staged.txt', 'staged base\n');
+    git('add', '-A');
+    git('commit', '--quiet', '-m', 'base');
+    const base = git('rev-parse', 'HEAD');
+
+    git('switch', '--quiet', '-c', 'update-target');
+    write('change.txt', 'from GitHub\n');
+    fs.rmSync(path.join(root, 'delete.txt'));
+    fs.renameSync(path.join(root, 'rename-old.txt'), path.join(root, 'rename-new.txt'));
+    write('added.txt', 'new from GitHub\n');
+    git('add', '-A');
+    git('commit', '--quiet', '-m', 'selective update');
+    const target = git('rev-parse', 'HEAD');
+    git('switch', '--quiet', 'main');
+    git('update-ref', 'refs/remotes/origin/update-target', target);
+
+    write('change.txt', 'panel edit that must be replaced\n');
+    write('custom.txt', 'panel-only customization\n');
+    write('staged.txt', 'staged panel customization\n');
+    git('add', 'staged.txt');
+    write('.env', 'PANEL_SECRET=keep-me\n');
+
+    const files = updater.parseChangedFiles(git(
+      'diff', '--no-ext-diff', '--name-status', '--find-renames', '-z', `${base}..${target}`
+    ));
+    const result = await updater.applyUpdate({
+      root,
+      branch: 'update-target',
+      currentBranch: 'main',
+      currentSha: base,
+      targetSha: target,
+      targetRef: 'refs/remotes/origin/update-target',
+      canFastForward: true,
+      files
+    });
+
+    assert.equal(result.updatedSha, target);
+    assert.equal(fs.readFileSync(path.join(root, 'change.txt'), 'utf8'), 'from GitHub\n');
+    assert.equal(fs.readFileSync(path.join(root, 'added.txt'), 'utf8'), 'new from GitHub\n');
+    assert.equal(fs.existsSync(path.join(root, 'delete.txt')), false);
+    assert.equal(fs.existsSync(path.join(root, 'rename-old.txt')), false);
+    assert.equal(fs.readFileSync(path.join(root, 'rename-new.txt'), 'utf8'), 'unchanged rename body\n');
+    assert.equal(fs.readFileSync(path.join(root, 'keep.txt'), 'utf8'), 'base keep\n');
+    assert.equal(fs.readFileSync(path.join(root, 'custom.txt'), 'utf8'), 'panel-only customization\n');
+    assert.equal(fs.readFileSync(path.join(root, 'staged.txt'), 'utf8'), 'staged panel customization\n');
+    assert.equal(fs.readFileSync(path.join(root, '.env'), 'utf8'), 'PANEL_SECRET=keep-me\n');
+    assert.deepEqual(new Set(result.overwrittenLocalFiles), new Set(['change.txt']));
+    assert.deepEqual(new Set(result.preservedLocalFiles), new Set(['custom.txt', 'staged.txt']));
+
+    const remainingChanges = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      cwd: root,
+      encoding: 'utf8'
+    });
+    assert.match(remainingChanges, /^ M custom\.txt$/m);
+    assert.match(remainingChanges, /^M  staged\.txt$/m);
+    assert.doesNotMatch(remainingChanges, /change\.txt|delete\.txt|rename-old\.txt|rename-new\.txt|added\.txt/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('`.update check` liste les changements sans appliquer et `.update` applique puis conseille le redémarrage', async () => {
@@ -318,6 +415,26 @@ test('`.update check` liste les changements sans appliquer et `.update` applique
   assert.equal(applied, true);
   assert.match(applying.sent.at(-1).content.text, /Redémarre le bot/);
   assert.match(applying.sent.at(-1).content.text, /npm install/);
+});
+
+test('`.update check` distingue les fichiers locaux remplacés de ceux qui seront conservés', async () => {
+  const check = commandContext({ args: ['check'] });
+  await updatePlugin._test.executeUpdate(check.context, pluginDependencies({
+    checkForUpdates: async () => updatePlan({
+      files: [
+        { status: 'M', label: 'MODIF', path: 'README.md', paths: ['README.md'] },
+        { status: 'M', label: 'MODIF', path: 'remote.js', paths: ['remote.js'] }
+      ],
+      localChanges: [
+        { status: ' M', path: 'README.md', paths: ['README.md'] },
+        { status: ' M', path: 'panel-only.js', paths: ['panel-only.js'] }
+      ]
+    })
+  }));
+  const reply = check.sent.at(-1).content.text;
+  assert.match(reply, /1 fichier\(s\) également modifié\(s\) par GitHub seront remplacés/);
+  assert.match(reply, /1 autre\(s\) conservé\(s\)/);
+  assert.match(reply, /Seuls les fichiers listés seront remplacés/);
 });
 
 test('`.update` est limité au propriétaire et répond en privé lorsqu’il est lancé dans un groupe', async () => {

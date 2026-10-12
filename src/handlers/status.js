@@ -1,7 +1,9 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { waitForReady } = require('../lib/safe-send');
 
+const PERSONAL_STATUS_JID = 'status@broadcast';
 let nyxHelpersPromise = null;
 
 function loadNyxHelpers() {
@@ -11,6 +13,86 @@ function loadNyxHelpers() {
 
 function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
+}
+
+function queueOwnMessageUpsert(socket, message) {
+  if (typeof socket?.upsertMessage !== 'function') return;
+  process.nextTick(() => {
+    Promise.resolve().then(() => {
+      const upsert = () => socket.upsertMessage(message, 'append');
+      return typeof socket.messageMutex?.mutex === 'function'
+        ? socket.messageMutex.mutex(upsert)
+        : upsert();
+    }).catch(error => {
+      socket.logger?.warn?.({ error, messageId: message?.key?.id }, 'Failed to add relayed status to the local message stream');
+    });
+  });
+}
+
+/**
+ * Publie un statut personnel via le relay du socket Baileys de la session.
+ * NYXCORE construit le WAMessage; le JID status@broadcast et l'audience sont
+ * ensuite remis explicitement à relayMessage, qui chiffre et distribue le
+ * statut sans ouvrir une autre connexion WhatsApp.
+ */
+async function personalStatus(socket, content, options = {}) {
+  if (!socket || typeof socket.relayMessage !== 'function') {
+    throw new Error('Socket WhatsApp invalide.');
+  }
+  if (!content || typeof content !== 'object') {
+    throw new Error('Contenu de statut invalide.');
+  }
+
+  const userJid = socket.authState?.creds?.me?.id || socket.user?.id;
+  if (!userJid) {
+    throw new Error('Le socket doit être connecté avant de publier un statut personnel.');
+  }
+  const statusJidList = [...new Set((Array.isArray(options.statusJidList) ? options.statusJidList : [])
+    .map(jid => String(jid || '').trim())
+    .filter(Boolean))];
+  if (!statusJidList.length) {
+    throw new Error('La liste des destinataires du statut est vide.');
+  }
+
+  const readiness = await waitForReady(socket);
+  if (!readiness.ready) {
+    throw new Error(`Connexion WhatsApp indisponible (${readiness.reason}).`);
+  }
+
+  const { backgroundColor: contentBackgroundColor, font: contentFont, ...payload } = content;
+  const upload = typeof socket.waUploadToServer === 'function'
+    ? socket.waUploadToServer.bind(socket)
+    : undefined;
+  const hasMedia = ['image', 'video', 'audio', 'document', 'sticker']
+    .some(mediaType => Object.hasOwn(payload, mediaType));
+  if (hasMedia && !upload) {
+    throw new Error('Téléversement média indisponible sur ce socket WhatsApp.');
+  }
+
+  const { generateWAMessage, generateMessageIDV2 } = await loadNyxHelpers();
+  const generated = await generateWAMessage(PERSONAL_STATUS_JID, payload, {
+    logger: options.logger || socket.logger,
+    userJid,
+    upload,
+    backgroundColor: options.backgroundColor ?? contentBackgroundColor,
+    font: options.font ?? contentFont,
+    messageId: generateMessageIDV2(userJid),
+    ...options
+  });
+
+  if (!generated?.message || !generated?.key?.id) {
+    throw new Error('NYXCORE n’a pas pu construire le statut personnel.');
+  }
+
+  await socket.relayMessage(PERSONAL_STATUS_JID, generated.message, {
+    messageId: generated.key.id,
+    statusJidList,
+    useCachedGroupMetadata: false
+  });
+  // Baileys sendMessage ajoute aussi les messages sortants au flux local. Le
+  // relay direct ne le fait pas, donc reproduire cet append sans bloquer l’envoi.
+  queueOwnMessageUpsert(socket, generated);
+  return generated;
 }
 
 /**
@@ -131,8 +213,10 @@ async function buildStatusContent(m, socket, prefix, command) {
 }
 
 module.exports = {
+  personalStatus,
   groupStatus,
   installGroupStatusMethod,
   buildStatusContent,
-  isGroupJid
+  isGroupJid,
+  PERSONAL_STATUS_JID
 };

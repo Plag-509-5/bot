@@ -179,19 +179,40 @@ function parseAheadBehind(output) {
   return { ahead: values[0], behind: values[1] };
 }
 
+function changedFileEntry(status, paths) {
+  const code = String(status || '')[0];
+  const safePaths = (paths || []).map(value => String(value || '')).filter(Boolean);
+  if (!status || !safePaths.length) return null;
+  const label = code === 'A' ? 'AJOUT' : code === 'D' ? 'SUPPRESSION' : 'MODIF';
+  const filePath = ['R', 'C'].includes(code) && safePaths.length > 1
+    ? `${safePaths[0]} → ${safePaths[1]}`
+    : safePaths.at(-1);
+  return { status, label, path: filePath, paths: safePaths };
+}
+
 function parseChangedFiles(output) {
-  return String(output || '')
+  const raw = String(output || '');
+  if (raw.includes('\0')) {
+    const fields = raw.split('\0');
+    const files = [];
+    for (let index = 0; index < fields.length;) {
+      const status = fields[index++];
+      if (!status) continue;
+      const pathCount = ['R', 'C'].includes(status[0]) ? 2 : 1;
+      const paths = fields.slice(index, index + pathCount);
+      index += pathCount;
+      const file = changedFileEntry(status, paths);
+      if (file) files.push(file);
+    }
+    return files;
+  }
+
+  return raw
     .split(/\r?\n/)
     .filter(Boolean)
     .map(line => {
       const [status = '', ...paths] = line.split('\t');
-      if (!status || !paths.length) return null;
-      const code = status[0];
-      const label = code === 'A' ? 'AJOUT' : code === 'D' ? 'SUPPRESSION' : 'MODIF';
-      const filePath = code === 'R' && paths.length > 1
-        ? `${paths[0]} → ${paths[1]}`
-        : paths.at(-1);
-      return { status, label, path: filePath };
+      return changedFileEntry(status, paths);
     })
     .filter(Boolean);
 }
@@ -230,6 +251,11 @@ async function gitOutput(run, args, cwd, options) {
   return String(result?.stdout || '').trim();
 }
 
+async function gitRawOutput(run, args, cwd, options) {
+  const result = await run(args, cwd, options);
+  return String(result?.stdout || '');
+}
+
 async function getOriginRepository({
   cwd = path.resolve(__dirname, '../..'),
   run = runGit
@@ -253,9 +279,45 @@ function makeUpdateTargetRef(repository, branch, originRepository) {
 }
 
 function listTrackedChanges(statusOutput) {
-  return String(statusOutput || '')
+  const raw = String(statusOutput || '');
+  if (raw.includes('\0')) {
+    const fields = raw.split('\0');
+    const changes = [];
+    for (let index = 0; index < fields.length;) {
+      const record = fields[index++];
+      if (!record) continue;
+      const status = record.slice(0, 2);
+      const filePath = record.slice(3);
+      const paths = filePath ? [filePath] : [];
+      if (/[RC]/.test(status) && fields[index]) paths.push(fields[index++]);
+      if (paths.length) changes.push({ status, path: filePath, paths });
+    }
+    return changes;
+  }
+
+  return raw
     .split(/\r?\n/)
-    .filter(Boolean);
+    .filter(Boolean)
+    .map(line => {
+      const status = line.slice(0, 2);
+      const filePath = line.length > 3 ? line.slice(3) : '';
+      return { status, path: filePath, paths: filePath ? [filePath] : [] };
+    })
+    .filter(change => change.paths.length > 0);
+}
+
+function uniquePaths(paths = []) {
+  return [...new Set(paths.map(value => String(value || '')).filter(Boolean))];
+}
+
+function pathsForChangedFiles(files = []) {
+  return uniquePaths(files.flatMap(file => {
+    if (Array.isArray(file?.paths) && file.paths.length) return file.paths;
+    const visiblePath = String(file?.path || '');
+    return visiblePath.includes(' → ')
+      ? visiblePath.split(' → ')
+      : [visiblePath];
+  }));
 }
 
 async function checkForUpdates({
@@ -278,14 +340,11 @@ async function checkForUpdates({
     throw new Error('Le dépôt est en HEAD détachée. Place le bot sur une branche Git avant de le mettre à jour.');
   }
 
-  const localChanges = listTrackedChanges(await gitOutput(
+  const localChanges = listTrackedChanges(await gitRawOutput(
     run,
-    ['status', '--porcelain', '--untracked-files=no'],
+    ['status', '--porcelain=v1', '--untracked-files=no', '-z'],
     root
   ));
-  if (localChanges.length) {
-    throw new Error(`Mise à jour annulée : ${localChanges.length} fichier(s) suivi(s) ont des changements locaux. Committe ou restaure-les d’abord.`);
-  }
 
   const currentSha = await gitOutput(run, ['rev-parse', 'HEAD'], root);
   if (!/^[a-f0-9]{40,64}$/i.test(currentSha)) {
@@ -329,9 +388,9 @@ async function checkForUpdates({
     ['rev-list', '--left-right', '--count', `${currentSha}...${targetRef}`],
     root
   ));
-  const files = parseChangedFiles(await gitOutput(
+  const files = parseChangedFiles(await gitRawOutput(
     run,
-    ['diff', '--no-ext-diff', '--name-status', '--find-renames', `${currentSha}..${targetRef}`],
+    ['diff', '--no-ext-diff', '--name-status', '--find-renames', '-z', `${currentSha}..${targetRef}`],
     root
   ));
   const latestCommit = await gitOutput(
@@ -356,6 +415,7 @@ async function checkForUpdates({
     ahead,
     behind,
     files,
+    localChanges,
     hasUpdate: behind > 0,
     canFastForward: ahead === 0 && behind > 0
   };
@@ -370,14 +430,9 @@ async function applyUpdate(plan, { run = runGit } = {}) {
   if (currentSha !== plan.currentSha) {
     throw new Error('Le dépôt a changé depuis la comparaison. Relance .update check avant de réessayer.');
   }
-
-  const localChanges = listTrackedChanges(await gitOutput(
-    run,
-    ['status', '--porcelain', '--untracked-files=no'],
-    plan.root
-  ));
-  if (localChanges.length) {
-    throw new Error('Mise à jour annulée : des fichiers suivis ont été modifiés depuis la comparaison.');
+  const currentBranch = await gitOutput(run, ['branch', '--show-current'], plan.root);
+  if (!currentBranch || (plan.currentBranch && currentBranch !== plan.currentBranch)) {
+    throw new Error('La branche locale a changé depuis la comparaison. Relance .update check.');
   }
 
   const targetRef = plan.targetRef || `refs/remotes/origin/${validateBranchName(plan.branch)}`;
@@ -386,7 +441,54 @@ async function applyUpdate(plan, { run = runGit } = {}) {
     throw new Error('GitHub a avancé depuis la comparaison. Relance .update check pour récupérer la nouvelle version.');
   }
 
-  await run(['merge', '--ff-only', '--no-edit', targetRef], plan.root, {
+  const mergeBase = await gitOutput(run, ['merge-base', currentSha, targetRef], plan.root);
+  if (!mergeBase || mergeBase !== currentSha) {
+    throw new Error('La mise à jour n’est plus un fast-forward; aucun fichier n’a été appliqué.');
+  }
+  const { ahead, behind } = parseAheadBehind(await gitOutput(
+    run,
+    ['rev-list', '--left-right', '--count', `${currentSha}...${targetRef}`],
+    plan.root
+  ));
+  if (ahead !== 0 || behind === 0) {
+    throw new Error('La mise à jour n’est plus un fast-forward; relance .update check.');
+  }
+
+  const files = parseChangedFiles(await gitRawOutput(
+    run,
+    ['diff', '--no-ext-diff', '--name-status', '--find-renames', '-z', `${currentSha}..${targetSha}`],
+    plan.root
+  ));
+  const changedPaths = pathsForChangedFiles(files);
+  const localChanges = listTrackedChanges(await gitRawOutput(
+    run,
+    ['status', '--porcelain=v1', '--untracked-files=no', '-z'],
+    plan.root
+  ));
+  const localPaths = uniquePaths(localChanges.flatMap(change => change.paths));
+  const changedPathSet = new Set(changedPaths);
+  const overwrittenLocalFiles = localPaths.filter(filePath => changedPathSet.has(filePath));
+  const preservedLocalFiles = localPaths.filter(filePath => !changedPathSet.has(filePath));
+
+  // Restaurer uniquement le diff entre le commit déjà installé et la cible.
+  // :(literal) évite qu’un nom de fichier GitHub soit interprété comme un
+  // glob/pathspec. De petits lots évitent ARG_MAX sur les panels chargés.
+  const restoreBatchSize = 48;
+  for (let index = 0; index < changedPaths.length; index += restoreBatchSize) {
+    const batch = changedPaths.slice(index, index + restoreBatchSize);
+    await run([
+      'restore',
+      `--source=${targetSha}`,
+      '--staged',
+      '--worktree',
+      '--',
+      ...batch.map(filePath => `:(literal)${filePath}`)
+    ], plan.root, { timeout: GIT_COMMAND_TIMEOUT_MS });
+  }
+
+  // Déplacer uniquement le pointeur de la branche garde exactement l’index et
+  // le worktree des fichiers hors du diff, y compris leurs états staged/unstaged.
+  await run(['update-ref', 'HEAD', targetRef, currentSha], plan.root, {
     timeout: GIT_COMMAND_TIMEOUT_MS
   });
 
@@ -394,7 +496,13 @@ async function applyUpdate(plan, { run = runGit } = {}) {
   if (updatedSha !== plan.targetSha) {
     throw new Error('Git n’a pas confirmé le commit attendu après la mise à jour.');
   }
-  return { updatedSha, files: plan.files };
+  return {
+    updatedSha,
+    files,
+    updatedPaths: changedPaths,
+    overwrittenLocalFiles,
+    preservedLocalFiles
+  };
 }
 
 module.exports = {
