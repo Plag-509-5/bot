@@ -1,5 +1,9 @@
 const fs = require('fs');
 const path = require('path');
+const {
+  isBotAdmin: isBotGroupAdmin,
+  isGroupAdmin
+} = require('../services/group-admins');
 
 let pluginsMap = new Map();
 let uniquePlugins = new Map();
@@ -183,31 +187,44 @@ async function executePlugin(commandName, context) {
     return true;
   }
 
-  // 3. Check Group Admin Permissions
+  // 3. Check Group Admin Permissions. Fail closed: without fresh metadata, never
+  // execute a command whose permissions could not be verified.
   if (isGroup && (plugin.isAdmin || plugin.isBotAdmin)) {
+    let groupMetadata = null;
     try {
-      const groupMetadata = await socket.groupMetadata(from).catch(() => null);
-      if (groupMetadata) {
-        const participants = groupMetadata.participants || [];
-        const botNum = socket.user?.id ? socket.user.id.split(':')[0].split('@')[0] : '';
-        const botJid = botNum ? `${botNum}@s.whatsapp.net` : null;
-        const senderJid = sender || msg.key.participant || from;
+      groupMetadata = await socket.groupMetadata(from);
+    } catch (error) {
+      console.warn('[PLUGIN PERMISSION CHECK ERROR]', error?.message || error);
+    }
 
-        const isUserAdmin = participants.some(p => p.id === senderJid && (p.admin === 'admin' || p.admin === 'superadmin'));
-        const isBotAdmin = botJid ? participants.some(p => p.id === botJid && (p.admin === 'admin' || p.admin === 'superadmin')) : false;
+    if (!Array.isArray(groupMetadata?.participants)) {
+      await socket.sendMessage(from, {
+        text: '⚠️ *Impossible de vérifier les administrateurs du groupe. Réessayez dans un instant.*'
+      }, { quoted: msg });
+      return true;
+    }
 
-        if (plugin.isAdmin && !isUserAdmin && !ownerCommandAccess) {
-          await socket.sendMessage(from, { text: '❌ *Seuls les administrateurs du groupe peuvent exécuter cette commande.*' }, { quoted: msg });
-          return true;
-        }
+    const senderIds = [
+      sender,
+      msg?.key?.participant,
+      msg?.key?.participantAlt,
+      msg?.key?.remoteJidAlt
+    ].filter(Boolean);
+    const userIsAdmin = isGroupAdmin(groupMetadata, senderIds);
+    const botIsAdmin = isBotGroupAdmin(groupMetadata, socket);
 
-        if (plugin.isBotAdmin && !isBotAdmin) {
-          await socket.sendMessage(from, { text: '⚠️ *Le bot doit être administrateur du groupe pour effectuer cette action.*' }, { quoted: msg });
-          return true;
-        }
-      }
-    } catch (e) {
-      console.warn('[PLUGIN PERMISSION CHECK ERROR]', e);
+    if (plugin.isAdmin && !userIsAdmin && !ownerCommandAccess) {
+      await socket.sendMessage(from, {
+        text: '❌ *Seuls les administrateurs du groupe peuvent exécuter cette commande.*'
+      }, { quoted: msg });
+      return true;
+    }
+
+    if (plugin.isBotAdmin && !botIsAdmin) {
+      await socket.sendMessage(from, {
+        text: '⚠️ *Le bot doit être administrateur du groupe pour effectuer cette action.*'
+      }, { quoted: msg });
+      return true;
     }
   }
 

@@ -68,7 +68,23 @@ const {
 const { configureGitHubUpdateSettings } = require('../services/github-update-settings');
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
-const { getGroupAdminsInfo, jidToNumber } = require('../lib/normalize');
+const { getGroupAdminsInfo } = require('../lib/normalize');
+const {
+  areSameIdentity,
+  findGroupParticipant,
+  getBotJid,
+  getGroupAdminJids,
+  getGroupAdminNumbers,
+  getParticipantId,
+  getParticipantMentionJid,
+  getPhoneNumberJid,
+  isAdminParticipant,
+  isBotAdmin: isBotGroupAdmin,
+  isBotIdentity,
+  isGroupAdmin,
+  isGroupSuperAdmin,
+  isSuperAdminParticipant
+} = require('../services/group-admins');
 const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
 const {
@@ -120,6 +136,28 @@ const {
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
+
+function resolveGroupActionTargets(metadata, identities) {
+  const candidates = Array.isArray(identities) ? identities : [identities];
+  const seen = new Set();
+  const targets = [];
+
+  for (const identity of candidates) {
+    const participant = findGroupParticipant(metadata, identity);
+    if (!participant) continue;
+    const jid = getParticipantId(participant);
+    if (!jid || seen.has(jid)) continue;
+    seen.add(jid);
+    targets.push({
+      participant,
+      jid,
+      mentionJid: getParticipantMentionJid(participant) || jid
+    });
+  }
+
+  return targets;
+}
+
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -1435,33 +1473,42 @@ function handleGroupStatusMention(socket, sessionId) {
             console.warn('[ANTISTATUS] impossible de récupérer groupMetadata', e?.message || e);
           }
 
-          // Vérifier si participant est admin
-          const isParticipantAdmin = groupMeta?.participants?.some(p => p.id === participant && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (isParticipantAdmin) {
+          const offender = findGroupParticipant(groupMeta, [participant, m.key?.participantAlt]);
+          if (!offender) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ @${participantNum} a atteint le seuil d'infractions mais est administrateur, impossible de l'expulser.`,
+              text: `⚠️ Impossible de vérifier @${participantNum} dans les métadonnées du groupe ; aucune expulsion effectuée.`,
               mentions: [participant]
             });
             return;
           }
+          const offenderJid = getParticipantId(offender);
+          const offenderMentionJid = getParticipantMentionJid(offender) || offenderJid;
+          if (!offenderJid) return;
 
-          // Vérifier si le bot est admin
-          const botJid = socket.user?.id || socket.user?.jid || null;
-          const isBotAdmin = groupMeta?.participants?.some(p => p.id === botJid && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (!isBotAdmin) {
+          // Vérifier par PN/LID/identifiants alternatifs, pas uniquement p.id.
+          if (isGroupAdmin(groupMeta, offender)) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ Le bot n'est pas administrateur, impossible d'expulser @${participantNum}.`,
-              mentions: [participant]
+              text: `⚠️ @${offenderMentionJid.split('@')[0]} a atteint le seuil d'infractions mais est administrateur, impossible de l'expulser.`,
+              mentions: [offenderMentionJid]
             });
             return;
           }
 
-          // Expulser
+          // Vérifier le vrai compte du bot, y compris son JID LID éventuel.
+          if (!isBotGroupAdmin(groupMeta, socket)) {
+            await socket.sendMessage(groupId, {
+              text: `⚠️ Le bot n'est pas administrateur, impossible d'expulser @${offenderMentionJid.split('@')[0]}.`,
+              mentions: [offenderMentionJid]
+            });
+            return;
+          }
+
+          // Expulser l'identifiant réellement présent dans le groupe.
           try {
-            await socket.groupParticipantsUpdate(groupId, [participant], 'remove');
+            await socket.groupParticipantsUpdate(groupId, [offenderJid], 'remove');
             await socket.sendMessage(groupId, {
-              text: `🚫 @${participantNum} a été expulsé pour récidive (mentions de statut).`,
-              mentions: [participant]
+              text: `🚫 @${offenderMentionJid.split('@')[0]} a été expulsé pour récidive (mentions de statut).`,
+              mentions: [offenderMentionJid]
             });
           } catch (e) {
             console.error('[ANTISTATUS] erreur expulsion', e);
@@ -1725,22 +1772,22 @@ function setupCommandHandlers(socket, number) {
         const groupMetadata = await socket.groupMetadata(jid).catch(() => null);
         if (!groupMetadata) return;
 
-        const participants = groupMetadata.participants;
         const senderJid = msg.key.participant || msg.key.remoteJid;
+        const senderParticipant = findGroupParticipant(groupMetadata, [senderJid, msg.key?.participantAlt]);
+        if (!senderParticipant) return;
+        const senderActionJid = getParticipantId(senderParticipant);
+        const senderMentionJid = getParticipantMentionJid(senderParticipant) || senderActionJid;
+        if (!senderActionJid) return;
 
-        // Vérifier si l'expéditeur est admin
-        const isSenderAdmin = participants.find(p => p.id === senderJid)?.admin === 'admin' || 
-                              participants.find(p => p.id === senderJid)?.admin === 'superadmin';
-
-        // Vérifier si le bot est admin
-        const botJid = socket.user?.id?.split(':')[0] + '@s.whatsapp.net' || socket.user?.id;
-        const isBotAdmin = participants.find(p => p.id === botJid)?.admin !== null;
+        // Vérifier les identifiants PN/LID de l'expéditeur et du bot.
+        const isSenderAdmin = isGroupAdmin(groupMetadata, senderParticipant);
+        const isBotAdmin = isBotGroupAdmin(groupMetadata, socket);
 
         // Si l'utilisateur est admin : simple avertissement, pas de sanction
         if (isSenderAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Admin Status Mention Detected\n├  User: @${senderJid.split('@')[0]}\n├  Admins get a free pass for status mentions\n├  But seriously, keep it minimal! 😒\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: `╭───(    TOXIC-MD    )───\n├  Admin Status Mention Detected\n├  User: @${senderMentionJid.split('@')[0]}\n├  Admins get a free pass for status mentions\n├  But seriously, keep it minimal! 😒\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1748,8 +1795,8 @@ function setupCommandHandlers(socket, number) {
         // Si le bot n'est pas admin : on prévient mais on ne peut pas supprimer
         if (!isBotAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Can't Delete Status Mention! 😤\n├  User: @${senderJid.split('@')[0]} just dropped a status mention\n├  But I'm not admin here! How embarrassing...\n├  Admins: Make me admin so I can delete this nonsense!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: `╭───(    TOXIC-MD    )───\n├  Can't Delete Status Mention! 😤\n├  User: @${senderMentionJid.split('@')[0]} just dropped a status mention\n├  But I'm not admin here! How embarrassing...\n├  Admins: Make me admin so I can delete this nonsense!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1767,20 +1814,20 @@ function setupCommandHandlers(socket, number) {
         // Action selon le mode
         if (mode === 'delete') {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Status Mention Deleted! 🗑️\n├  User: @${senderJid.split('@')[0]} thought they could spam\n├  Status mentions are NOT allowed here!\n├  Next violation = Immediate removal! ⚠️\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: `╭───(    TOXIC-MD    )───\n├  Status Mention Deleted! 🗑️\n├  User: @${senderMentionJid.split('@')[0]} thought they could spam\n├  Status mentions are NOT allowed here!\n├  Next violation = Immediate removal! ⚠️\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            mentions: [senderMentionJid]
           });
         } else if (mode === 'remove') {
           try {
-            await socket.groupParticipantsUpdate(jid, [senderJid], 'remove');
+            await socket.groupParticipantsUpdate(jid, [senderActionJid], 'remove');
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  User Removed for Status Mention! 🚫\n├  @${senderJid.split('@')[0]} ignored the warnings\n├  No status mentions allowed in this group!\n├  Learn the rules or stay out! 😤\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: `╭───(    TOXIC-MD    )───\n├  User Removed for Status Mention! 🚫\n├  @${senderMentionJid.split('@')[0]} ignored the warnings\n├  No status mentions allowed in this group!\n├  Learn the rules or stay out! 😤\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+              mentions: [senderMentionJid]
             });
           } catch (kickErr) {
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  Failed to Remove User! 😠\n├  Tried to kick @${senderJid.split('@')[0]} for status mention\n├  But I don't have enough permissions!\n├  Admins: Fix my permissions and promote me or deal with spammers yourself!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: `╭───(    TOXIC-MD    )───\n├  Failed to Remove User! 😠\n├  Tried to kick @${senderMentionJid.split('@')[0]} for status mention\n├  But I don't have enough permissions!\n├  Admins: Fix my permissions and promote me or deal with spammers yourself!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+              mentions: [senderMentionJid]
             });
           }
         }
@@ -4551,9 +4598,14 @@ case 'tagall': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+      break;
+    }
 
-    // Construire la liste des mentions (JID complets)
+    // Construire la liste des mentions avec le JID PN lorsqu'il est connu.
     const mentions = participants.map(p => p.jid).filter(Boolean);
     if (!mentions.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre détecté.' }, { quoted: msg });
@@ -4591,14 +4643,14 @@ case 'setgpp': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
 
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent changer la photo du groupe.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour changer la photo du groupe.' }, { quoted: msg });
       break;
     }
@@ -4671,7 +4723,12 @@ case 'h': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser hidetag.' }, { quoted: msg });
+      break;
+    }
 
     // Récupérer le texte (sans la commande elle-même)
     const text = args.join(' ').trim();
@@ -4731,13 +4788,13 @@ case 'kick': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -4748,15 +4805,19 @@ case 'kick': {
       break;
     }
 
-    // filtrer : ne pas retirer les admins ni le bot
-    const toRemove = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    // Résoudre les alias PN/LID vers le JID réel du participant, puis protéger admins et bot.
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible est admin ou bot).' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible absente, admin ou bot).' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retiré(s): ${toRemove.map(j => j.split('@')[0]).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retiré(s): ${toRemove.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICK ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4771,10 +4832,14 @@ case 'add': {
     break;
   }
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent ajouter des membres.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour ajouter des membres.' }, { quoted: msg });
       break;
     }
     const number = args[0];
@@ -4794,19 +4859,23 @@ case 'add': {
 case 'promote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .promote @membre' }, { quoted: msg });
 
-    const toPromote = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(j => j.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('PROMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4818,19 +4887,23 @@ case 'promote': {
 case 'demote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .demote @membre' }, { quoted: msg });
 
-    const toDemote = mentions.filter(m => groupAdminsJid.includes(m) && m !== botJid);
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(j => j.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('DEMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4842,22 +4915,21 @@ case 'demote': {
 case 'kickall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
 
-    // retirer tous les participants dont p.jid n'est pas admin et n'est pas le bot
-    const nonAdminJids = participants
-      .map(p => p.jid)
-      .filter(Boolean)
-      .filter(j => !groupAdminsJid.includes(j) && j !== botJid);
+    // Ne retirer ni les administrateurs (PN/LID) ni le compte du bot.
+    const toRemove = resolveGroupActionTargets(metadata, participants)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
+    if (!toRemove.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
 
-    const unique = [...new Set(nonAdminJids)];
-    if (!unique.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
-
-    await socket.groupParticipantsUpdate(from, unique, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retirés: ${unique.length} membres`, mentions: unique }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retirés: ${toRemove.length} membres`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICKALL ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4869,9 +4941,9 @@ case 'kickall': {
 case 'tagall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
 
     const mentions = participants.map(p => p.jid).filter(Boolean);
     const text = `🔔 Mention de tous les membres (${mentions.length})`;
@@ -4887,10 +4959,14 @@ case 'acceptall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent accepter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour accepter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4918,10 +4994,14 @@ case 'revokeall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rejeter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour rejeter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4949,10 +5029,13 @@ case 'revokeall': {
 case 'mute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent activer mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour fermer le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -4979,10 +5062,13 @@ case 'mute': {
 case 'unmute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent désactiver mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour rouvrir le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -5094,26 +5180,14 @@ case 'testgrp': {
       break;
     }
 
-    // Récupérer metadata complet
+    // Récupérer les admins et le compte du bot avec les alias PN/LID réels.
     const metadata = await socket.groupMetadata(from);
-    // Participants bruts
     const participants = metadata?.participants || [];
-    // Liste des admins (JID complet)
-    const groupAdminsJid = participants.filter(p => p?.admin).map(p => p.id);
-    // Liste des admins nettoyée (numéros)
-    const groupAdminsNum = groupAdminsJid.map(j => (j || '').split('@')[0].split(':')[0]);
-    // Détecter JID du bot (robuste)
-    let botJid = null;
-    if (socket.user) {
-      if (socket.user.jid) botJid = socket.user.jid;
-      else if (socket.user.id) botJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    }
-    if (!botJid) {
-      const idPart = socket.user?.id ? socket.user.id.split(':')[0] : null;
-      const maybe = participants.find(p => p.id && idPart && p.id.startsWith(idPart));
-      if (maybe) botJid = maybe.id;
-    }
-    const botNum = botJid ? botJid.split('@')[0].split(':')[0] : '';
+    const groupAdminsJid = getGroupAdminJids(metadata);
+    const groupAdminsNum = getGroupAdminNumbers(metadata);
+    const botJid = getBotJid(metadata, socket) || null;
+    const botNum = getPhoneNumberJid(socket.user || {}).split('@')[0] || '';
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Construire un résumé lisible
     let text = `🔎 *TESTGRP — Diagnostic du groupe*\n\n`;
@@ -5130,7 +5204,8 @@ case 'testgrp': {
     if (groupAdminsNum.length) text += groupAdminsNum.join(', ') + '\n'; else text += '—\n';
 
     text += `\n🤖 *Bot JID* : ${botJid || 'non détecté'}\n`;
-    text += `🤖 *Bot numéro* : ${botNum || '—'}\n\n`;
+    text += `🤖 *Bot numéro* : ${botNum || '—'}\n`;
+    text += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}\n\n`;
 
     // Exemple de mapping participants -> rôle et format brut (limité à 50 pour éviter message trop long)
     text += `📋 *Aperçu participants (max 50)* :\n`;
@@ -5138,8 +5213,8 @@ case 'testgrp': {
     sample.forEach((p, i) => {
       const id = p.id || '—';
       const num = id.split('@')[0].split(':')[0];
-      const admin = p.admin || '—';
-      const isSuper = admin === 'superadmin' ? ' (superadmin)' : '';
+      const admin = isAdminParticipant(p) ? p.admin : '—';
+      const isSuper = typeof admin === 'string' && admin.toLowerCase() === 'superadmin' ? ' (superadmin)' : '';
       text += `${i+1}. ${num} — admin: ${admin}${isSuper}\n`;
     });
     if (participants.length > 50) text += `... et ${participants.length - 50} autres\n`;
@@ -5187,9 +5262,10 @@ case 'admininfo': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    // Même logique que kickall pour détecter le bot et les admins
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+    // Utiliser les alias PN/LID des participants pour le diagnostic.
+    const botJid = getBotJid(metadata, socket) || 'non détecté';
+    const botNumber = getPhoneNumberJid(socket.user || {}).split('@')[0] || '—';
+    const groupAdmins = getGroupAdminJids(metadata);
 
     // Construire la liste lisible des admins (numéros)
     let adminListText = `👥 *ADMINS DU GROUPE* — ${groupName}\n\n`;
@@ -5202,16 +5278,15 @@ case 'admininfo': {
       });
     }
 
-    // Vérifier si le bot est admin
-    const botIsAdmin = groupAdmins.includes(botNumber);
+    // Vérifier le compte du bot par ses identifiants PN/LID.
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Ajouter info bot
-    adminListText += `\n🤖 *Bot JID* : ${botNumber}\n`;
+    adminListText += `\n🤖 *Bot JID* : ${botJid}\n`;
+    adminListText += `🤖 *Bot numéro* : ${botNumber}\n`;
     adminListText += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}`;
 
-    // Préparer mentions : mentionner les admins (et le bot si présent dans la liste)
     const mentions = [...groupAdmins];
-    if (botIsAdmin && !mentions.includes(botNumber)) mentions.push(botNumber);
 
     await socket.sendMessage(from, {
       text: adminListText,
@@ -5239,17 +5314,14 @@ case 'tagall': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    // Vérifier que l'auteur est admin (même logique)
-    if (!groupAdmins.includes(sender)) {
+    // Vérifier l'auteur par son JID principal ou son alias.
+    if (!isGroupAdmin(metadata, [sender, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
       break;
     }
 
     // Construire le message et la liste de mentions (exclure le bot si tu veux)
-    const members = participants.map(p => p.id).filter(id => id !== botNumber);
+    const members = participants.map(getParticipantId).filter(id => id && !isBotIdentity(socket, id));
     if (!members.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre à mentionner.' }, { quoted: msg });
       break;
@@ -5278,14 +5350,13 @@ case 'kick': {
   }
 
   try {
-    const { participants, groupAdminsJid, groupAdminsNum, botJid, botNum } = await getGroupAdminsInfo(socket, from);
-
-    const senderNum = jidToNumber(sender);
-    if (!groupAdminsNum.includes(senderNum)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const senderIds = [nowsender, msg.key?.participant, msg.key?.participantAlt].filter(Boolean);
+    if (!isGroupAdmin(metadata, senderIds)) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botNum || !groupAdminsNum.includes(botNum)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -5293,18 +5364,19 @@ case 'kick': {
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .kick @membre' }, { quoted: msg });
 
-    const toRemove = mentions.filter(m => {
-      const num = jidToNumber(m);
-      return !groupAdminsNum.includes(num) && num !== botNum;
-    });
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
 
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible est admin ou bot.' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible absente, admin ou bot.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(x => '@' + jidToNumber(x)).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR kick]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors du kick.\n\n${e.message || e}` }, { quoted: msg });
@@ -5322,16 +5394,14 @@ case 'promote': {
   try {
     const metadata = await socket.groupMetadata(from);
     const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour promouvoir des membres.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5341,15 +5411,19 @@ case 'promote': {
       break;
     }
 
-    // Ne pas promouvoir le bot ni les admins déjà promus
-    const toPromote = mentions.filter(m => !groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas promouvoir le bot ni les admins déjà promus.
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR promote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la promotion.\n\n${e.message || e}` }, { quoted: msg });
@@ -5366,17 +5440,14 @@ case 'demote': {
 
   try {
     const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour rétrograder des membres.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5386,15 +5457,19 @@ case 'demote': {
       break;
     }
 
-    // Ne pas démoter le bot et ne cibler que les admins
-    const toDemote = mentions.filter(m => groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas démoter le bot et ne cibler que les admins.
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR demote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la rétrogradation.\n\n${e.message || e}` }, { quoted: msg });
@@ -6002,39 +6077,51 @@ case 'admin': {
 
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
+    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
       await socket.sendMessage(sender, { 
         text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.' 
       }, { quoted: msg });
       break;
     }
+    if (!isGroupSuperAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour promouvoir un membre.' }, { quoted: msg });
+      break;
+    }
 
-    // Identifier la personne à promouvoir
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      // Réponse à un message
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      // Mention ou numéro
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne' 
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Vérifier que la personne est dans le groupe
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
       }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de promouvoir le bot.' }, { quoted: msg });
+      break;
+    }
+    if (isGroupAdmin(groupMetadata, target)) {
+      await socket.sendMessage(sender, { text: '❌ Cette personne est déjà administratrice.' }, { quoted: msg });
       break;
     }
 
@@ -6042,8 +6129,8 @@ case 'admin': {
     await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
     
     await socket.sendMessage(sender, { 
-      text: `👑 ${target.notify || targetJid.split('@')[0]} a été promu(e) administrateur.`,
-      mentions: [targetJid]
+      text: `👑 ${target.notify || targetMentionJid.split('@')[0]} a été promu(e) administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
@@ -6075,64 +6162,76 @@ case 'unadmin': {
 
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
+    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
       await socket.sendMessage(sender, { 
         text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.' 
       }, { quoted: msg });
       break;
     }
+    if (!isGroupSuperAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour rétrograder un membre.' }, { quoted: msg });
+      break;
+    }
 
-    // Identifier la personne à rétrograder
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne' 
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Vérifier que la personne est admin
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
+      }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de rétrograder le bot.' }, { quoted: msg });
+      break;
+    }
+    if (!isAdminParticipant(target)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas administrateur.'
       }, { quoted: msg });
       break;
     }
 
-    if (target.admin !== 'admin' && target.admin !== 'superadmin') {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas administrateur.' 
+    const superAdmins = (groupMetadata.participants || []).filter(isSuperAdminParticipant);
+    if (isSuperAdminParticipant(target) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de rétrograder l\'unique super-administrateur du groupe.'
       }, { quoted: msg });
       break;
     }
-
-    // Ne pas permettre de se démettre soi-même si on est le seul superadmin
-    if (targetJid === nowsender) {
-      const superAdmins = groupMetadata.participants.filter(p => p.admin === 'superadmin');
-      if (superAdmins.length === 1) {
-        await socket.sendMessage(sender, { 
-          text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.' 
-        }, { quoted: msg });
-        break;
-      }
+    if (areSameIdentity(target, [nowsender, msg.key?.participantAlt]) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.'
+      }, { quoted: msg });
+      break;
     }
 
     // Rétrograder
     await socket.groupParticipantsUpdate(from, [targetJid], 'demote');
     
     await socket.sendMessage(sender, { 
-      text: `📉 ${target.notify || targetJid.split('@')[0]} n\'est plus administrateur.`,
-      mentions: [targetJid]
+      text: `📉 ${target.notify || targetMentionJid.split('@')[0]} n\'est plus administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
@@ -6584,16 +6683,13 @@ case 'add': {
     break;
   }
   try {
-    const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour ajouter des membres.' }, { quoted: msg });
       break;
     }
@@ -7613,17 +7709,27 @@ ${statusEmoji} *Statut :* ${status}
                 }
 
                 try {
-                    const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-                    const groupName = metadata.subject || "Sans nom";
+                    const { metadata, participants } = await getGroupAdminsInfo(socket, from);
+                    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+                    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
+                        await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    if (!isBotGroupAdmin(metadata, socket)) {
+                        await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    const groupName = metadata?.subject || "Sans nom";
 
-                    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-                    // Membres à expulser (non-admins, pas le bot)
-                    const toKick = participants.filter(p => 
-                        !groupAdmins.includes(p.id) && p.id !== botNumber
-                    );
+                    // Membres à expulser (non-admins et pas le bot), résolus par leur JID réel.
+                    const toKick = participants
+                        .filter(participant => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant))
+                        .map(participant => ({
+                            ...participant,
+                            id: getParticipantId(participant),
+                            mentionJid: getParticipantMentionJid(participant)
+                        }))
+                        .filter(participant => participant.id);
 
                     if (!toKick.length) {
                         await socket.sendMessage(from, { 
@@ -7635,7 +7741,7 @@ ${statusEmoji} *Statut :* ${status}
                     // Liste numérotée
                     let kickLines = "";
                     toKick.forEach((mem, i) => {
-                        const num = mem.id.split('@')[0];
+                        const num = (mem.mentionJid || mem.id).split('@')[0];
                         kickLines += `☠️ ${(i + 1).toString().padStart(2, '0')}. @${num}\n`;
                     });
 
@@ -7645,7 +7751,7 @@ ${statusEmoji} *Statut :* ${status}
 ✦━━━━━━━━━━━━━━━━━━━━✦
 
 📌 GROUPE : ${groupName}
-⚓ Ordre donné par : @${sender.split('@')[0]}
+⚓ Ordre donné par : @${actor.split('@')[0]}
 
 💬 Vous tous avez étés jugés indigne de persister dans ce groupe🚶. Le roi des bêtes à scellé votre destin 🐉!
 👥 Membres expulsés : ${toKick.length}
@@ -7657,7 +7763,7 @@ ${kickLines}
                     // Annonce avant expulsion
                     await socket.sendMessage(from, {
                         text: caption,
-                        mentions: [sender, ...toKick.map(p => p.id)]
+                        mentions: [actor, ...toKick.map(p => p.mentionJid || p.id)]
                     }, { quoted: msg });
 
                     // Expulsion en un seul coup
@@ -7687,10 +7793,7 @@ ${kickLines}
 
                 try {
                     const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-
-                    // Liste des admins
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+                    const groupAdmins = getGroupAdminJids(metadata);
 
                     if (!groupAdmins.length) {
                         await socket.sendMessage(from, { 
@@ -9843,10 +9946,14 @@ case 'tagall': {
       }, { quoted: msg });
     }
 
-    const participants = gm.participants || [];
+    const participants = Array.isArray(gm.participants) ? gm.participants : [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(gm, [actor, msg.key?.participantAlt])) {
+      return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+    }
     if (!participants.length) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Aucun membre trouvé dans le groupe.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Aucun membre trouvé dans le groupe.'
       }, { quoted: msg });
     }
 
@@ -9857,7 +9964,7 @@ case 'tagall': {
       groupPP = await socket.profilePictureUrl(from, 'image'); 
     } catch(e){}
 
-    const mentions = participants.map(p => p.id || p.jid);
+    const mentions = participants.map(getParticipantMentionJid).filter(Boolean);
     const groupName = gm.subject || 'Groupe';
     const totalMembers = participants.length;
 
