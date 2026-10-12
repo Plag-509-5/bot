@@ -30,7 +30,7 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
-  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast` avec une audience réglable par session (`.setstatusviewers`) et `.delstatus` pour retirer la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
+  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast`; gère l’audience par session avec `.setstatusviewers`, `.tostatus new group`, `.tostatus add` et `.tostatus export`. `.delstatus` retire la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
   - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** en privé, le propriétaire choisit le groupe cible; dans un groupe ouvert, tous les membres peuvent publier directement sur son statut et reçoivent la confirmation dans ce groupe. Dans un groupe admin-only, le compte du bot doit être administrateur. Les textes ont une palette sombre personnalisée; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
@@ -316,11 +316,17 @@ L’audience est enregistrée **par session** dans MongoDB :
 
 ```text
 .setstatusviewers 509XXXXXXXX, 509YYYYYYYY
+.tostatus new group
+.tostatus add
+.tostatus export
 .statusviewers
 .setstatusviewers clear
 .delstatus
 ```
 
+- `.tostatus new group` affiche les groupes communs avec le nombre de membres. Réponds avec un numéro : les numéros résolus du groupe s’ajoutent à l’audience déjà enregistrée, sans remplacer les groupes ou imports précédents. Les doublons sont ignorés. Les participants Baileys identifiés par LID sont convertis en numéro via le mapping disponible; les LID non résolus ne sont pas enregistrés et sont signalés.
+- `.tostatus add`, en répondant à un message avec une liste de numéros, un fichier `.txt` ou une vCard / `.vcf`, ajoute les numéros détectés à la même audience. Le texte peut aussi être passé après `add`. Les fichiers importés sont limités à 1 Mio.
+- `.tostatus export` envoie un fichier `.txt` avec les numéros de l’audience triés numériquement, un par ligne.
 - Une liste personnalisée ne distribue le statut qu’aux numéros indiqués, plus le compte qui le publie.
 - Sans liste personnalisée, le bot utilise son carnet de contacts lorsqu’il en a un; sinon, il prend les participants des groupes auxquels la session est inscrite. `.statusviewers` affiche l’état actuel.
 - `.delstatus` retire le statut le plus récent publié par `.tostatus` pendant que son journal temporaire est disponible. Le journal est gardé en mémoire pendant 24 heures; il ne permet donc pas de retrouver les statuts publiés avant le démarrage courant ou par une autre application.

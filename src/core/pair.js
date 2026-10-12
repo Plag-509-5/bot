@@ -92,6 +92,10 @@ const {
   actorIdFromMessage,
   isPublicGroupStatusCommand
 } = require('../services/group-status-selector');
+const {
+  completeStatusAudienceGroupSelection,
+  STATUS_AUDIENCE_SELECTION_PURPOSE
+} = require('../plugins/owner/tostatus');
 const { handleAntiLink } = require('../handlers/antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('../handlers/antilink');
 const cheerio = require('cheerio');
@@ -1715,17 +1719,40 @@ function setupCommandHandlers(socket, number) {
     const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
     console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
-    // Une réponse numérique en conversation privée peut finaliser le choix du
-    // groupe pour `.swgc`. Elle est traitée avant le routeur de commandes afin
-    // que l’utilisateur n’ait pas à préfixer le numéro.
+    // Les réponses numériques des sélecteurs `.swgc` et `.tostatus new group`
+    // sont traitées avant le routeur de commandes, en distinguant leur intention.
     if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
       const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
       const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
       if (selection.status !== 'none') {
-        activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
+        const isStatusAudienceSelection = selection.purpose === STATUS_AUDIENCE_SELECTION_PURPOSE;
+        const selectionCommand = isStatusAudienceSelection ? 'tostatus' : 'swgc';
+        const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+        activateCommandTheme(selectionCommand, isOniThemeEnabled(cfg.THEME));
         await wakeForCommand(socket, msg, cfg);
-        if (selection.status === 'selected') {
-          const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+
+        if (selection.status === 'selected' && isStatusAudienceSelection) {
+          try {
+            const result = await completeStatusAudienceGroupSelection({
+              socket,
+              sessionNumber: sessionId,
+              sessionCfg: cfg,
+              setUserConfigInMongo
+            }, selection.group);
+            const unresolved = result.unresolvedParticipants
+              ? `\n⚠️ ${result.unresolvedParticipants} membre(s) sans numéro résolvable ont été ignorés (dont les LID sans correspondance).`
+              : '';
+            await socket.sendMessage(remoteJid, {
+              text: `✅ Groupe ajouté au public du statut : *${result.groupSubject || selection.group.subject}*.\n` +
+                `${result.added} numéro(s) ajouté(s), ${result.alreadyPresent} déjà présent(s), ${result.total} au total.${unresolved}\n` +
+                `Pour ajouter un autre groupe : ${selectedPrefix}tostatus new group.`
+            }, { quoted: msg });
+          } catch (error) {
+            await socket.sendMessage(remoteJid, {
+              text: `❌ Ajout du groupe impossible : ${error?.message || error}`
+            }, { quoted: msg });
+          }
+        } else if (selection.status === 'selected') {
           await socket.sendMessage(remoteJid, {
             text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
               `Tu peux utiliser ${selectedPrefix}swgc <texte>[, couleur] ` +
@@ -1737,8 +1764,11 @@ function setupCommandHandlers(socket, number) {
             text: `❌ Choix invalide. Réponds avec un numéro entre ${selection.min} et ${selection.max}.`
           }, { quoted: msg });
         } else if (selection.status === 'expired') {
+          const retry = isStatusAudienceSelection
+            ? `${selectedPrefix}tostatus new group`
+            : `${selectedPrefix}swgc`;
           await socket.sendMessage(remoteJid, {
-            text: `⌛ La sélection a expiré. Relance ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+            text: `⌛ La sélection a expiré. Relance ${retry}.`
           }, { quoted: msg });
         }
         return;

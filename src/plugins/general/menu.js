@@ -270,7 +270,8 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 
 > 〢 𝐒𝐓𝐀𝐓𝐔𝐓 𝐏𝐄𝐑𝐒𝐎𝐍𝐍𝐄𝐋 📲
 
-> ・ ${p}tostatus
+> ・ ${p}tostatus <texte> / ${p}tostatus new group
+> ・ ${p}tostatus add / ${p}tostatus export
 > ・ ${p}setstatusviewers / ${p}statusviewers
 > ・ ${p}delstatus
 
