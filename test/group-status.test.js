@@ -513,6 +513,125 @@ test('swgc trouve un média cité dans le contexte de message et répond dans le
   assert.match(fixture.sent.at(-1).content.text, /Statut image posté/);
 });
 
+test('swgc publie image, vidéo et audio dans un groupe admin-only quand le bot et l’auteur sont admins', async () => {
+  resetSelections();
+  const botJid = '50900000000:1@s.whatsapp.net';
+  const memberJid = '50911111111@s.whatsapp.net';
+  const metadata = {
+    id: '111@g.us',
+    subject: 'Groupe fermé',
+    announce: true,
+    participants: [
+      { id: '50900000000@s.whatsapp.net', admin: 'admin' },
+      { id: memberJid, admin: 'admin' }
+    ]
+  };
+  const relayed = [];
+  const uploaded = [];
+  const sent = [];
+  const socket = {
+    user: { id: botJid },
+    async groupMetadata(jid) {
+      assert.equal(jid, metadata.id);
+      return metadata;
+    },
+    async waUploadToServer(filePath, options = {}) {
+      assert.ok(fs.existsSync(filePath), 'fichier média temporaire absent pendant le téléversement');
+      uploaded.push({ filePath, mediaType: options.mediaType });
+      return { mediaUrl: `https://upload.invalid/${options.mediaType}`, directPath: `/closed/${options.mediaType}` };
+    },
+    async relayMessage(jid, message, options) {
+      relayed.push({ jid, message, options });
+    },
+    async sendMessage(jid, content, options) {
+      sent.push({ jid, content, options });
+      return { key: { id: `reply-${sent.length}` } };
+    }
+  };
+  const cases = [
+    { type: 'image', key: 'imageMessage', media: { mimetype: 'image/png', caption: 'photo du groupe' } },
+    { type: 'video', key: 'videoMessage', media: { mimetype: 'video/mp4', caption: 'vidéo du groupe' } },
+    { type: 'audio', key: 'audioMessage', media: { mimetype: 'audio/ogg', seconds: 3, caption: 'audio du groupe' } }
+  ];
+
+  for (const [index, item] of cases.entries()) {
+    const context = {
+      socket,
+      from: metadata.id,
+      sender: memberJid,
+      senderNumber: '50911111111',
+      sessionNumber: '50900000000',
+      prefix: '.',
+      args: [],
+      isOwner: false,
+      isSessionOwner: false,
+      isSudo: false,
+      msg: {
+        key: { remoteJid: metadata.id, participant: memberJid, id: `closed-${index}` },
+        message: {
+          extendedTextMessage: {
+            text: '.swgc',
+            contextInfo: { quotedMessage: { [item.key]: item.media } }
+          }
+        }
+      }
+    };
+    await swgc._test.executeSwgc(context, {
+      async *downloadContent(_media, mediaType) {
+        assert.equal(mediaType, item.type);
+        yield Buffer.from(`${item.type}-source`);
+      },
+      async audioToStatusVideo(audio) {
+        assert.equal(audio.toString(), 'audio-source');
+        return Buffer.from('audio-converted-to-video');
+      }
+    });
+  }
+
+  assert.equal(relayed.length, 3);
+  assert.ok(relayed.every(event => event.options.useCachedGroupMetadata === false), 'le relay d’un groupe fermé doit utiliser des métadonnées fraîches');
+  assert.equal(uploaded.length, 3);
+  assert.deepEqual(uploaded.map(item => item.mediaType), ['image', 'video', 'video']);
+  assert.ok(relayed[0].message.groupStatusMessageV2.message.imageMessage);
+  assert.equal(relayed[0].message.groupStatusMessageV2.message.imageMessage.caption, 'photo du groupe');
+  assert.ok(relayed[1].message.groupStatusMessageV2.message.videoMessage);
+  assert.equal(relayed[1].message.groupStatusMessageV2.message.videoMessage.caption, 'vidéo du groupe');
+  assert.ok(relayed[2].message.groupStatusMessageV2.message.videoMessage);
+  assert.equal(relayed[2].message.groupStatusMessageV2.message.videoMessage.caption, 'audio du groupe');
+  assert.equal(sent.length, 3);
+  assert.ok(sent.every(event => event.jid === metadata.id), 'les confirmations doivent rester dans le groupe fermé');
+  assert.ok(sent.every(event => /posté sur : ce groupe/.test(event.content.text)));
+});
+
+test('swgc refuse un groupe admin-only si le compte du bot n’en est pas administrateur', async () => {
+  const fixture = privateFixture();
+  const groupJid = '111@g.us';
+  let publications = 0;
+  fixture.socket.user.id = '50900000000@s.whatsapp.net';
+  fixture.socket.groupMetadata = async () => ({
+    id: groupJid,
+    announce: true,
+    participants: [
+      { id: '50900000000@s.whatsapp.net', admin: null },
+      { id: '50911111111@s.whatsapp.net', admin: 'admin' }
+    ]
+  });
+  const context = {
+    ...fixture.context,
+    from: groupJid,
+    args: ['test fermé'],
+    msg: { key: { remoteJid: groupJid, participant: '50911111111@s.whatsapp.net' }, message: {} }
+  };
+  await swgc._test.executeSwgc(context, {
+    async publishGroupStatus() { publications += 1; }
+  });
+
+  assert.equal(publications, 0);
+  assert.equal(fixture.sent.at(-1).jid, groupJid);
+  assert.match(fixture.sent.at(-1).content.text, /admin-only/i);
+  assert.match(fixture.sent.at(-1).content.text, /administrateur/i);
+});
+
 test('le handler intercepte la réponse numérique et l’ancien case swgc bruyant a disparu', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
   assert.match(source, /resolveGroupSelection\(sessionId, selectionActor, normalizedBody\)/);

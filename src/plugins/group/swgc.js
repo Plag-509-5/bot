@@ -11,6 +11,7 @@ const {
   actorIdFromMessage
 } = require('../../services/group-status-selector');
 const { buildGroupStatusPayload } = require('../../services/group-status-content');
+const { isBotAdmin } = require('../../services/group-admins');
 
 function groupStatusConfirmation(type, subject) {
   const labels = {
@@ -48,12 +49,32 @@ function quotedMessageFromContext(context = {}) {
     || null;
 }
 
-async function ensureMembership(socket, group, identifiers) {
+async function ensureMembership(socket, group, identifiers, metadataOverride) {
   if (!group?.jid || typeof socket?.groupMetadata !== 'function') return false;
-  const metadata = await socket.groupMetadata(group.jid).catch(() => null);
+  const metadata = metadataOverride === undefined
+    ? await socket.groupMetadata(group.jid).catch(() => null)
+    : metadataOverride;
   if (!metadata) return false;
   const tokens = identityTokens(identifiers);
   return (metadata.participants || []).some(participant => participantMatches(participant, tokens));
+}
+
+async function getGroupStatusMetadata(socket, jid) {
+  if (typeof socket?.groupMetadata !== 'function') return null;
+  try {
+    return await socket.groupMetadata(jid);
+  } catch (error) {
+    console.warn('[SWGC] Impossible de lire les paramètres du groupe:', error?.message || error);
+    throw new Error('Impossible de vérifier les paramètres du groupe. Réessaie dans un instant.');
+  }
+}
+
+function ensureBotCanPublishStatus(metadata, socket) {
+  if (metadata?.announce && !isBotAdmin(metadata, socket)) {
+    throw new Error(
+      'Ce groupe est en mode admin-only : le compte WhatsApp connecté au bot doit être administrateur pour publier un statut. Promeus le bot dans ce groupe, puis réessaie.'
+    );
+  }
 }
 
 async function executeSwgc(context, dependencies = {}) {
@@ -125,8 +146,11 @@ async function executeSwgc(context, dependencies = {}) {
       });
     }
 
+    const targetMetadata = await getGroupStatusMetadata(socket, target.jid);
+    ensureBotCanPublishStatus(targetMetadata, socket);
+
     if (!isGroupCommand) {
-      const stillMember = await ensureMembership(socket, target, identifiers);
+      const stillMember = await ensureMembership(socket, target, identifiers, targetMetadata);
       if (!stillMember) {
         clearSelectedGroup(sessionNumber, actorId);
         return sendContextReply(context, {
@@ -149,7 +173,7 @@ async function executeSwgc(context, dependencies = {}) {
 
     let sendGroupStatus;
     if (dependencies.publishGroupStatus) {
-      sendGroupStatus = (jid, payload) => dependencies.publishGroupStatus(socket, jid, payload);
+      sendGroupStatus = (jid, payload, options) => dependencies.publishGroupStatus(socket, jid, payload, options);
     } else {
       const { installGroupStatusMethod } = require('../../handlers/status');
       const adapter = installGroupStatusMethod(socket);
@@ -157,7 +181,8 @@ async function executeSwgc(context, dependencies = {}) {
         ? socket.sendGroupStatus.bind(socket)
         : adapter;
     }
-    await sendGroupStatus(target.jid, built.payload);
+    const sendOptions = targetMetadata?.announce ? { useCachedGroupMetadata: false } : undefined;
+    await sendGroupStatus(target.jid, built.payload, sendOptions);
 
     return sendContextReply(context, {
       text: groupStatusConfirmation(built.type, target.subject)
@@ -177,5 +202,13 @@ module.exports = {
   description: 'Publie un statut dans le groupe courant ou choisit un groupe en privé',
   usage: '.swgc [texte][, couleur] | répondre à un média avec .swgc',
   execute: executeSwgc,
-  _test: { groupStatusConfirmation, sendContextReply, quotedMessageFromContext, ensureMembership, executeSwgc }
+  _test: {
+    groupStatusConfirmation,
+    sendContextReply,
+    quotedMessageFromContext,
+    ensureMembership,
+    getGroupStatusMetadata,
+    ensureBotCanPublishStatus,
+    executeSwgc
+  }
 };
