@@ -19,7 +19,7 @@
 - **🛡️ Sécurité & Modération de Groupe :**
   - **Anti-Link :** Suppression automatique des liens externes indésirables.
   - **Anti-Delete :** modes privé/groupe/tout, prise en charge des chats LID, récupération directe des médias et identification du véritable suppresseur avec le nom de la conversation.
-  - **Anti-Status Mention :** Avertissement et expulsion en cas de spam de mentions.
+  - **Anti-Status Mention :** désactivé par défaut; lorsqu’il est activé, les avertissements sont présentés dans le style Kaido MD et les sanctions suivent le mode configuré.
   - **Bienvenue / Au revoir :** Messages personnalisés pour les nouveaux membres.
 - **📥 Téléchargeurs Multimédia :**
   - YouTube (MP3 & Vidéo MP4 HD)

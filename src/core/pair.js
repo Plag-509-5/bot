@@ -31,11 +31,15 @@ const {
   ownerNumbers,
   resolveAccess
 } = require('../services/access-control');
+const { resolveAntiStatusMode, formatKaidoStatusMention } = require('../services/status-mention-guard');
 const {
   DEFAULT_NEWSLETTER_EMOJIS,
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  parseNewsletterMessageReference,
+  extractNewsletterServerId,
+  reactToNewsletterMessage,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
@@ -190,7 +194,9 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
   PREFIX: '.',
   AUTO_ONLINE: false,
-  ANTI_TAG_MODE: true,
+  ANTI_TAG_MODE: 'off',
+  antistatusmention: false,
+  antistatusmention_threshold: 2,
   MODE: 'public',
   THEME: 'onigashima',
   SUDO_USERS: [],
@@ -1007,57 +1013,60 @@ async function sendOTP(socket, number, otp) {
 async function setupNewsletterHandlers(socket, sessionNumber) {
   const rrPointers = new Map();
 
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const message = messages[0];
-    if (!message?.key) return;
-    const jid = message.key.remoteJid;
+  socket.ev.on('messages.upsert', async ({ messages = [] }) => {
+    const newsletterMessages = messages.filter(message =>
+      message?.key && normaliseNewsletterJid(message.key.remoteJid)
+    );
+    if (!newsletterMessages.length) return;
 
     try {
-      const normalizedJid = normaliseNewsletterJid(jid);
-      if (!normalizedJid) return;
-      const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
+      const followedDocs = await listNewslettersFromMongo();
+      const reactConfigs = await listNewsletterReactsFromMongo();
       const reactMap = new Map();
       for (const item of reactConfigs) {
         const itemJid = normaliseNewsletterJid(item.jid);
         if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
 
-      const followed = followedDocs.find(item => item.jid === normalizedJid);
-      if (!followed && !reactMap.has(normalizedJid)) return;
+      for (const message of newsletterMessages) {
+        const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
+        const followed = followedDocs.find(item => item.jid === normalizedJid);
+        if (!followed && !reactMap.has(normalizedJid)) continue;
 
-      // newsletter_list est la source principale partagée par le dashboard et
-      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
-      const emojis = resolveNewsletterEmojis(
-        followed?.emojis,
-        reactMap.get(normalizedJid),
-        DEFAULT_NEWSLETTER_EMOJIS
-      );
+        // NYXCORE place le server_id requis par newsletterReactMessage dans
+        // message.key.server_id (pas dans key.id, qui est le stanza id).
+        const serverId = extractNewsletterServerId(message);
+        if (!serverId) {
+          console.warn(`[NEWSLETTER REACTION] server_id absent pour ${normalizedJid}; publication ignorée.`);
+          continue;
+        }
 
-      let idx = rrPointers.get(normalizedJid) || 0;
-      const emoji = emojis[idx % emojis.length];
-      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
+        const emojis = resolveNewsletterEmojis(
+          followed?.emojis,
+          reactMap.get(normalizedJid),
+          DEFAULT_NEWSLETTER_EMOJIS
+        );
+        const idx = rrPointers.get(normalizedJid) || 0;
+        const emoji = emojis[idx % emojis.length];
+        rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
 
-      const messageId = message.newsletterServerId || message.key.id;
-      if (!messageId) return;
-
-      let retries = 3;
-      while (retries-- > 0) {
-        try {
-          if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
-          } else {
-            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
+        let succeeded = false;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await reactToNewsletterMessage(socket, normalizedJid, serverId, emoji);
+            console.log(`Reacted to ${normalizedJid} ${serverId} with ${emoji}`);
+            await saveNewsletterReaction(normalizedJid, serverId, emoji, sessionNumber || null);
+            succeeded = true;
+            break;
+          } catch (error) {
+            console.warn(`Newsletter reaction attempt failed (${attempt}/3):`, error?.message || error);
+            if (attempt < 3) await delay(1200);
           }
-          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
-          break;
-        } catch (err) {
-          console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
-          await delay(1200);
+        }
+        if (!succeeded) {
+          console.error(`[NEWSLETTER REACTION] Échec après 3 tentatives pour ${normalizedJid}#${serverId}.`);
         }
       }
-
     } catch (error) {
       console.error('Newsletter reaction handler error:', error?.message || error);
     }
@@ -1449,7 +1458,11 @@ function handleGroupStatusMention(socket, sessionId) {
         // Avertir publiquement l’expéditeur
         try {
           await socket.sendMessage(groupId, {
-            text: `⚠️ @${participantNum}, les mentions de statut sont interdites dans ce groupe. Répète et tu seras expulsé.`,
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${participantNum}`,
+              'Les mentions de statut sont désactivées dans ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
             mentions: participant ? [participant] : []
           });
         } catch (e) {
@@ -1481,7 +1494,10 @@ function handleGroupStatusMention(socket, sessionId) {
           const offender = findGroupParticipant(groupMeta, [participant, m.key?.participantAlt]);
           if (!offender) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ Impossible de vérifier @${participantNum} dans les métadonnées du groupe ; aucune expulsion effectuée.`,
+              text: formatKaidoStatusMention('Vérification impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu vérifier son rôle; aucune exclusion effectuée.'
+              ]),
               mentions: [participant]
             });
             return;
@@ -1493,7 +1509,10 @@ function handleGroupStatusMention(socket, sessionId) {
           // Vérifier par PN/LID/identifiants alternatifs, pas uniquement p.id.
           if (isGroupAdmin(groupMeta, offender)) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ @${offenderMentionJid.split('@')[0]} a atteint le seuil d'infractions mais est administrateur, impossible de l'expulser.`,
+              text: formatKaidoStatusMention('Administrateur exempté', [
+                `Administrateur : @${offenderMentionJid.split('@')[0]}`,
+                'Aucune exclusion ne sera effectuée pour ce rôle.'
+              ]),
               mentions: [offenderMentionJid]
             });
             return;
@@ -1502,7 +1521,10 @@ function handleGroupStatusMention(socket, sessionId) {
           // Vérifier le vrai compte du bot, y compris son JID LID éventuel.
           if (!isBotGroupAdmin(groupMeta, socket)) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ Le bot n'est pas administrateur, impossible d'expulser @${offenderMentionJid.split('@')[0]}.`,
+              text: formatKaidoStatusMention('Exclusion non effectuée', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'Kaido MD doit être administrateur pour appliquer cette sanction.'
+              ]),
               mentions: [offenderMentionJid]
             });
             return;
@@ -1512,13 +1534,19 @@ function handleGroupStatusMention(socket, sessionId) {
           try {
             await socket.groupParticipantsUpdate(groupId, [offenderJid], 'remove');
             await socket.sendMessage(groupId, {
-              text: `🚫 @${offenderMentionJid.split('@')[0]} a été expulsé pour récidive (mentions de statut).`,
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'La récidive aux mentions de statut a entraîné une exclusion.'
+              ]),
               mentions: [offenderMentionJid]
             });
           } catch (e) {
             console.error('[ANTISTATUS] erreur expulsion', e);
             await socket.sendMessage(groupId, {
-              text: `⚠️ Impossible d'expulser @${participantNum}.`,
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu appliquer l’exclusion; contacte un administrateur.'
+              ]),
               mentions: [participant]
             });
           }
@@ -1792,8 +1820,8 @@ function setupCommandHandlers(socket, number) {
         // Ne pas traiter si ce n'est pas un groupe ou si c'est un message du bot
         if (!jid.endsWith('@g.us') || msg.key.fromMe) return;
 
-        const mode = cfg.ANTI_TAG_MODE || 'off';
-        if (mode === 'off' || mode === 'false') return;
+        const mode = resolveAntiStatusMode(cfg.ANTI_TAG_MODE);
+        if (mode === 'off') return;
 
         // Groupe exempté (personnalisable)
         const exemptGroup = "120363156185607326@g.us"; // Remplace par ton groupe si besoin
@@ -1817,7 +1845,11 @@ function setupCommandHandlers(socket, number) {
         // Si l'utilisateur est admin : simple avertissement, pas de sanction
         if (isSenderAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Admin Status Mention Detected\n├  User: @${senderMentionJid.split('@')[0]}\n├  Admins get a free pass for status mentions\n├  But seriously, keep it minimal! 😒\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Administrateur : @${senderMentionJid.split('@')[0]}`,
+              'Les administrateurs sont exemptés de sanction.',
+              'Merci de limiter les mentions au nécessaire.'
+            ]),
             mentions: [senderMentionJid]
           });
           return;
@@ -1826,7 +1858,11 @@ function setupCommandHandlers(socket, number) {
         // Si le bot n'est pas admin : on prévient mais on ne peut pas supprimer
         if (!isBotAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Can't Delete Status Mention! 😤\n├  User: @${senderMentionJid.split('@')[0]} just dropped a status mention\n├  But I'm not admin here! How embarrassing...\n├  Admins: Make me admin so I can delete this nonsense!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Kaido MD ne peut pas la supprimer sans droits d’administrateur.',
+              'Un administrateur peut accorder ces droits au bot.'
+            ]),
             mentions: [senderMentionJid]
           });
           return;
@@ -1845,19 +1881,29 @@ function setupCommandHandlers(socket, number) {
         // Action selon le mode
         if (mode === 'delete') {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Status Mention Deleted! 🗑️\n├  User: @${senderMentionJid.split('@')[0]} thought they could spam\n├  Status mentions are NOT allowed here!\n├  Next violation = Immediate removal! ⚠️\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+            text: formatKaidoStatusMention('Mention de statut supprimée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Merci de respecter les règles de ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
             mentions: [senderMentionJid]
           });
         } else if (mode === 'remove') {
           try {
             await socket.groupParticipantsUpdate(jid, [senderActionJid], 'remove');
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  User Removed for Status Mention! 🚫\n├  @${senderMentionJid.split('@')[0]} ignored the warnings\n├  No status mentions allowed in this group!\n├  Learn the rules or stay out! 😤\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'La mention a été supprimée et la récidive a entraîné une exclusion.'
+              ]),
               mentions: [senderMentionJid]
             });
           } catch (kickErr) {
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  Failed to Remove User! 😠\n├  Tried to kick @${senderMentionJid.split('@')[0]} for status mention\n├  But I don't have enough permissions!\n├  Admins: Fix my permissions and promote me or deal with spammers yourself!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'Kaido MD ne dispose pas des droits nécessaires pour cette action.'
+              ]),
               mentions: [senderMentionJid]
             });
           }
@@ -6863,32 +6909,13 @@ case 'breact': {
     let channelRef = parts[0].trim();
     const reactEmoji = parts[1].trim();
 
-    // Extraction du channelJid et messageId
-    let channelJid = null;
-    let messageId = null;
-
-    // Format URL
-    const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-    if (urlMatch) {
-      channelJid = `${urlMatch[1]}@newsletter`;
-      messageId = urlMatch[2];
-    } 
-    // Format court
-    else {
-      const maybeParts = channelRef.split('/');
-      if (maybeParts.length >= 2) {
-        messageId = maybeParts[maybeParts.length - 1];
-        channelJid = maybeParts[maybeParts.length - 2];
-        if (!channelJid.endsWith('@newsletter')) {
-          if (/^\d+$/.test(channelJid)) {
-            channelJid = `${channelJid}@newsletter`;
-          }
-        }
-      }
-    }
+    // Les réactions de chaîne exigent le server_id de la publication.
+    const reference = parseNewsletterMessageReference(channelRef);
+    const channelJid = reference?.jid || '';
+    const messageId = reference?.serverId || '';
 
     // Validation du format
-    if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
+    if (!channelJid || !messageId || !reactEmoji) {
       await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
       await socket.sendMessage(sender, { 
         text: "❌ Format invalide. Utilisez :\n1. `!breact 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n2. `!breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`" 
@@ -6941,16 +6968,11 @@ L'opération est en cours...`
         try {
           const botSocket = activeSockets.get(botNumber);
           
-          // Essayer de faire suivre le canal au bot
-          try {
-            await botSocket.newsletterFollow(channelJid);
-            await delay(1500); // Attente après le follow
-          } catch (followError) {
-            // Le bot suit peut-être déjà le canal, continuer
-          }
-          
-          // Envoyer la réaction
-          await botSocket.newsletterReactMessage(channelJid, messageId, reactEmoji);
+          // NYXCORE expose newsletterReactMessage(jid, serverId, reaction).
+          await reactToNewsletterMessage(botSocket, channelJid, messageId, reactEmoji, {
+            ensureFollow: true,
+            followDelayMs: 1500
+          });
           
           // Sauvegarder dans MongoDB
           await saveNewsletterReaction(channelJid, messageId, reactEmoji, botNumber);
@@ -7273,7 +7295,7 @@ case 'cfn': {
   const full = args.join(" ").trim();
   if (!full) {
     await socket.sendMessage(sender, { 
-      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 120363402094635383@newsletter | 🔥,❤️` 
+      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 0029Vb761O39mrGTZvQ8UQ02@newsletter | 🔥,❤️`
     }, { quoted: msg });
     break;
   }
@@ -7366,34 +7388,12 @@ case 'chr': {
   let channelRef = parts[0].trim();
   const reactEmoji = parts[1].trim();
 
-  let channelJid = null;
-  let messageId = null;
-
-  // 🔹 OPTION 1 : URL complète (https://whatsapp.com/channel/...)
-  const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-  if (urlMatch) {
-    channelJid = `${urlMatch[1]}@newsletter`;
-    messageId = urlMatch[2];
-  }
-  // 🔹 OPTION 2 : Format channelJid/messageId
-  else {
-    const maybeParts = channelRef.split('/');
-    if (maybeParts.length >= 2) {
-      messageId = maybeParts[maybeParts.length - 1];
-      channelJid = maybeParts[maybeParts.length - 2];
-      
-      // Vérifier si le JID contient déjà @newsletter
-      if (!channelJid.endsWith('@newsletter')) {
-        // Si c'est juste des chiffres, ajouter @newsletter
-        if (/^\d+$/.test(channelJid)) {
-          channelJid = `${channelJid}@newsletter`;
-        }
-      }
-    }
-  }
+  const reference = parseNewsletterMessageReference(channelRef);
+  const channelJid = reference?.jid || '';
+  const messageId = reference?.serverId || '';
 
   // Validation finale
-  if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
+  if (!channelJid || !messageId || !reactEmoji) {
     return await socket.sendMessage(sender, { 
       text: '❌ Format invalide. Utilisez :\n' +
             '1. `chr 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n' +
@@ -7402,7 +7402,10 @@ case 'chr': {
   }
 
   try {
-    await socket.newsletterReactMessage(channelJid, messageId.toString(), reactEmoji);
+    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, {
+      ensureFollow: true,
+      followDelayMs: 1500
+    });
     await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
 
     // BotName meta mention
