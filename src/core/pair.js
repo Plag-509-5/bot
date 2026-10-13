@@ -146,6 +146,14 @@ const {
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
+const {
+  SESSION_KEEPALIVE_INTERVAL_MS,
+  SESSION_HEALTH_CHECK_INTERVAL_MS,
+  SESSION_STALE_AFTER_MS,
+  getSocketOpenState,
+  forceCloseSessionSocket,
+  createSessionHealthWatcher
+} = require('../services/session-health-watcher');
 
 function resolveGroupActionTargets(metadata, identities) {
   const candidates = Array.isArray(identities) ? identities : [identities];
@@ -798,28 +806,6 @@ const baileysVersionResolver = createBaileysVersionResolver({
 
 const SESSION_RECONNECT_BASE_MS = Math.max(2000, Number(process.env.SESSION_RECONNECT_BASE_MS) || 5000);
 const SESSION_RECONNECT_MAX_MS = Math.max(30000, Number(process.env.SESSION_RECONNECT_MAX_MS) || 120000);
-const SESSION_STALE_AFTER_MS = Math.max(60000, Number(process.env.SESSION_STALE_AFTER_MS) || 10 * 60 * 1000);
-
-// Filet de sécurité : un socket dont la websocket est fermée mais que Baileys
-// n'a pas signalée reste dans `activeSockets` et avale silencieusement les
-// envois. Au-delà de SESSION_STALE_AFTER_MS on force la fermeture pour
-// déclencher une reconnexion propre.
-setInterval(() => {
-  const now = Date.now();
-  activeSockets.forEach((socket, number) => {
-    try {
-      const readyState = socket?.ws?.readyState;
-      if (typeof readyState !== 'number') return;
-      if (readyState === 1) { lastConnectionActivity.set(number, now); return; }
-      const last = lastConnectionActivity.get(number) || now;
-      if (now - last >= SESSION_STALE_AFTER_MS) {
-        console.warn(`[SESSION ${number}] websocket fermée depuis ${Math.round((now - last) / 1000)} s — fermeture forcée.`);
-        try { socket.ws.close(); } catch (e) {}
-        lastConnectionActivity.set(number, now);
-      }
-    } catch (e) {}
-  });
-}, Math.max(30000, Math.floor(SESSION_STALE_AFTER_MS / 4))).unref?.();
 
 const otpStore = new Map();
 // ============================================================
@@ -10717,6 +10703,41 @@ const reconnectScheduler = createReconnectScheduler({
   }
 });
 
+// Baileys envoie déjà une IQ ping-pong sur CHAQUE socket au rythme configuré
+// dans makeWASocket. Ce watchdog vérifie le vrai getter `socket.ws.isOpen` de
+// WebSocketClient (pas `readyState`, qui n’existe pas sur son wrapper) et ne
+// recycle que les sockets durablement bloqués. Il réutilise le scheduler unique.
+const sessionHealthWatcher = createSessionHealthWatcher({
+  getSessions: () => activeSockets,
+  intervalMs: SESSION_HEALTH_CHECK_INTERVAL_MS,
+  staleAfterMs: SESSION_STALE_AFTER_MS,
+  onStale: async (number, socket, health) => {
+    if (shuttingDown || activeSockets.get(number) !== socket || getSocketOpenState(socket) !== false) return;
+    console.error(
+      `[SESSION ${number}] WebSocket toujours fermé après ${Math.round(health.unhealthyForMs / 1000)} s; reconnexion ciblée.`
+    );
+    activeSockets.delete(number);
+    socketCreationTime.delete(number);
+    try {
+      forceCloseSessionSocket(socket, error => {
+        console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+      });
+    } catch (error) {
+      console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+    }
+    const scheduled = reconnectScheduler.schedule(number, {
+      reason: 'watchdog keepalive : socket non ouvert'
+    });
+    if (!scheduled.scheduled && scheduled.reason === 'tentatives-epuisees') {
+      console.error(`[SESSION ${number}] le watchdog ne peut plus programmer de reconnexion.`);
+    }
+  },
+  onError: (error, number) => {
+    console.error(`[SESSION ${number || 'watchdog'}] contrôle keepalive :`, error?.message || error);
+  }
+});
+sessionHealthWatcher.start();
+
 function setupAutoRestart(socket, number, auth) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
   lastConnectionActivity.set(sanitized, Date.now());
@@ -10968,6 +10989,7 @@ async function EmpirePair(number, res, options = {}) {
       version: waVersion,
       printQRInTerminal: false,
       logger,
+      keepAliveIntervalMs: SESSION_KEEPALIVE_INTERVAL_MS,
       markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
       browser: WA_BROWSER
     });
@@ -11509,7 +11531,7 @@ router.get('/api/session/health', async (req, res) => {
       const auth = authStates.get(number);
       sessions.push({
         number,
-        websocketOuverte: socket?.ws?.readyState === 1,
+        websocketOuverte: getSocketOpenState(socket) === true,
         enregistre: Boolean(socket?.authState?.creds?.registered),
         sourceAuth: auth ? auth.source : null,
         clesSignal: auth ? auth.keyCount() : null,
@@ -11592,6 +11614,7 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  sessionHealthWatcher.stop();
   console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
   const socketsToClose = new Set([...activeSockets.values(), ...pairingSockets.values()]);
   socketsToClose.forEach((socket) => {

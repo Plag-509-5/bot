@@ -238,6 +238,10 @@ ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
 MONGO_DB=MUGIWARA_NO_PLAG
 
+# Keepalive WhatsApp par session; valeurs par défaut : 30 s / 90 s.
+SESSION_KEEPALIVE_INTERVAL_MS=30000
+SESSION_STALE_AFTER_MS=90000
+
 # Facultatif : le mode normal récupère et met en cache la version live.
 # À renseigner seulement si web.whatsapp.com/sw.js est bloqué.
 WA_WEB_VERSION=
@@ -262,6 +266,8 @@ TOURL_MAX_BYTES=104857600
 TOURL_TIMEOUT_MS=60000
 CATBOX_USER_HASH=
 ```
+
+Chaque socket Baileys envoie déjà une **IQ ping-pong toutes les 30 secondes** via sa connexion WhatsApp existante. Le watchdog vérifie le vrai état `isOpen` de chaque session toutes les 30 secondes; si un socket reste fermé 90 secondes, il ne relance que cette session avec l’ordonnanceur de reconnexion existant. Les sockets sains ne sont pas redémarrés toutes les heures : cela provoquerait des interruptions et des reconnexions simultanées sans bénéfice par rapport au keepalive natif.
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
 

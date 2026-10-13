@@ -87,8 +87,11 @@ test('les creds et clés sont sauvegardés par les APIs MongoDB dédiées', () =
   assert.doesNotMatch(state, /node:fs|fs-extra|node:os|SESSIONS_DIR/);
 });
 
-test('une seule reconnexion est programmée par fermeture', () => {
-  assert.equal(occurrences(source, 'reconnectScheduler.schedule('), 1);
+test('le lifecycle et le watchdog partagent le même ordonnanceur de reconnexion', () => {
+  // Une programmation vient du lifecycle Baileys, l’autre du watchdog si le
+  // close n’a pas été signalé. L’ordonnanceur partagé déduplique le numéro.
+  assert.equal(occurrences(source, 'reconnectScheduler.schedule('), 2);
+  assert.match(source, /createSessionHealthWatcher\(/);
   assert.doesNotMatch(code, /Reconnexion automatique dans 5 secondes/);
 });
 
