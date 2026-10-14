@@ -139,6 +139,7 @@ const {
 } = require('../auth/pairing-lifecycle');
 const { issuePairingCode } = require('../auth/pairing-code');
 const { createPairingCodeUrl } = require('../services/pairing-code-url');
+const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
   createBaileysVersionResolver,
@@ -1645,6 +1646,7 @@ function setupCommandHandlers(socket, number) {
 
         const isHandled = await executePlugin(cmdName, {
           socket,
+          downloadContentFromMessage,
           msg: syntheticMsg,
           from: targetChat,
           sender: reactorJid,
@@ -2025,6 +2027,7 @@ function setupCommandHandlers(socket, number) {
     try {
       const isHandled = await executePlugin(command, {
         socket,
+        downloadContentFromMessage,
         msg,
         from,
         sender: nowsender,
@@ -6635,39 +6638,17 @@ case 'vv': {
       break;
     }
 
-    // Helper : extraire le contenu view-once quel que soit le nesting (iOS/Android/ephemeral)
-    function extractViewOnceContent(q) {
-      // cas 1: q.viewOnceMessage?.message.{imageMessage|videoMessage|...}
-      if (q.viewOnceMessage && q.viewOnceMessage.message) {
-        const inner = q.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 2: q.ephemeralMessage?.message?.viewOnceMessage?.message.{...} (iPhone parfois)
-      if (q.ephemeralMessage && q.ephemeralMessage.message && q.ephemeralMessage.message.viewOnceMessage && q.ephemeralMessage.message.viewOnceMessage.message) {
-        const inner = q.ephemeralMessage.message.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 3: q.{imageMessage|videoMessage|stickerMessage|documentMessage|audioMessage} direct
-      const directTypes = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-      const directFound = directTypes.find(t => q[t]);
-      if (directFound) return { qType: directFound, content: q[directFound] };
-      // aucun trouvé
-      return null;
-    }
-
-    const extracted = extractViewOnceContent(quoted);
-    if (!extracted) {
+    // Les aliases de réaction et les différents clients WhatsApp peuvent ajouter
+    // plusieurs enveloppes autour du média (ephemeral, V2/V2Extension, document).
+    const extracted = extractViewOnceMedia(quoted);
+    if (!extracted || !extracted.isViewOnce) {
       await socket.sendMessage(sender, {
         text: '❌ Le message cité ne contient pas de média view-once supporté.'
       }, { quoted: msg });
       break;
     }
 
-    const { qType, content } = extracted;
+    const { field: qType, content } = extracted;
     const messageType = qType.replace(/Message$/i, '').toLowerCase(); // 'image', 'video', 'sticker', 'document', 'audio'
 
     // Télécharger le flux via downloadContentFromMessage
@@ -7077,6 +7058,9 @@ case 'getpp': {
 
                 
 case 'code': {
+  // `from` is the remote chat JID (group or private), so the API result is
+  // returned to the exact conversation in which `.code` was issued.
+  const codeChat = from || msg.key?.remoteJid;
   const q = msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
@@ -7087,7 +7071,7 @@ case 'code': {
   const number = args.join(' ').trim();
 
   if (!number) {
-    return await socket.sendMessage(sender, {
+    return await socket.sendMessage(codeChat, {
       text: `*📌 𝗖𝗢𝗗𝗘 𝗗𝗘 𝗖𝗢𝗡𝗡𝗘𝗫𝗜𝗢𝗡 𝗞𝗔𝗜𝗗𝗢*\n\n` +
             `*Usage:* .code [numéro]\n` +
             `*Exemple:* .code 5094744XXXX\n\n` +
@@ -7097,7 +7081,7 @@ case 'code': {
 
   const cleanNumber = number.replace(/[^\d]/g, '');
   if (cleanNumber.length < 9 || cleanNumber.length > 15) {
-    return await socket.sendMessage(sender, {
+    return await socket.sendMessage(codeChat, {
       text: `*❌ 𝙵𝚘𝚛𝚖𝚊𝚝 𝚒𝚗𝚌𝚘𝚛𝚛𝚎𝚌𝚝  *\n\n` +
             `ʟᴇ Nᴜᴍᴇʀᴏ ᴅᴏɪᴛ ᴄᴏɴᴛᴇɴɪʀ ᴇɴᴛʀᴇ 9 ᴇᴛ 15 ᴄʜɪғғʀᴇs.\n` +
             `ᗴ᙭ᗴᗰᑭᒪᗴ: 50947441234`
@@ -7105,7 +7089,7 @@ case 'code': {
   }
 
   try {
-    await socket.sendMessage(sender, { react: { text: "⏳", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "⏳", key: msg.key } });
 
     let fetch;
     try {
@@ -7144,7 +7128,7 @@ case 'code': {
     const code = result.code.trim();
 
     // Message interactif avec bouton copy
-    await socket.relayMessage(sender, {
+    await socket.relayMessage(codeChat, {
       viewOnceMessage: {
         message: {
           interactiveMessage: {
@@ -7177,12 +7161,12 @@ case 'code': {
       }
     }, { quoted: msg });
 
-    await socket.sendMessage(sender, { react: { text: "✅", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "✅", key: msg.key } });
 
   } catch (err) {
     console.error("❌ Erreur commande code:", err);
-    await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(sender, { text: `❌ Erreur: ${err.message || err}` }, { quoted: msg });
+    await socket.sendMessage(codeChat, { react: { text: "❌", key: msg.key } });
+    await socket.sendMessage(codeChat, { text: `❌ Erreur: ${err.message || err}` }, { quoted: msg });
   }
   break;
 }

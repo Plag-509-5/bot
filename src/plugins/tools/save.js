@@ -5,6 +5,17 @@ const {
   collectContextInfos,
   findQuotedStatus
 } = require('../../services/status-reply-forwarder');
+const { extractViewOnceMedia } = require('../../services/view-once-media');
+
+const VIEW_ONCE_ALIASES = new Set(['vv', 'rvo', 'readviewonce']);
+const MAX_VIEW_ONCE_MEDIA_BYTES = 100 * 1024 * 1024;
+const VIEW_ONCE_DEFAULTS = {
+  image: { mimetype: 'image/jpeg', fileName: 'view-once.jpg', caption: '📷 Vue unique déballée' },
+  video: { mimetype: 'video/mp4', fileName: 'view-once.mp4', caption: '🎥 Vue unique déballée' },
+  audio: { mimetype: 'audio/mpeg', fileName: 'view-once.mp3', caption: '🎧 Vue unique déballée' },
+  document: { mimetype: 'application/octet-stream', fileName: 'view-once', caption: '📎 Vue unique déballée' },
+  sticker: { mimetype: 'image/webp', fileName: 'view-once.webp', caption: '✨ Sticker vue unique déballé' }
+};
 
 const VIEW_ONCE_WRAPPERS = [
   'ephemeralMessage',
@@ -64,12 +75,106 @@ function makeForwardKey({ message, from, quotedContext, statusQuote, selfJid }) 
   };
 }
 
+async function collectMediaStream(stream, maxBytes = MAX_VIEW_ONCE_MEDIA_BYTES) {
+  if (Buffer.isBuffer(stream)) return stream;
+  if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
+    throw new Error('Le téléchargeur Baileys n’a pas retourné de flux média valide.');
+  }
+
+  const chunks = [];
+  let size = 0;
+  try {
+    for await (const chunk of stream) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += buffer.length;
+      if (size > maxBytes) {
+        stream.destroy?.();
+        throw new Error(`Le média dépasse la limite de sécurité de ${Math.round(maxBytes / 1024 / 1024)} Mo.`);
+      }
+      chunks.push(buffer);
+    }
+  } catch (error) {
+    stream.destroy?.();
+    throw error;
+  }
+  return Buffer.concat(chunks, size);
+}
+
+function getCommandName(context) {
+  if (context?.command) return String(context.command).toLowerCase();
+  return String(context?.body || '').trim().split(/\s+/)[0].replace(/^[./!#]+/, '').toLowerCase();
+}
+
+async function executeViewOnce(context, quoted) {
+  const { socket, msg, downloadContentFromMessage } = context;
+  const chatId = context?.from || msg?.key?.remoteJid;
+  if (!chatId) throw new Error('Conversation d’origine introuvable.');
+
+  if (!quoted) {
+    return socket.sendMessage(chatId, {
+      text: '❗ Réponds à une image, vidéo, audio, document ou sticker en vue unique avec .vv.'
+    }, { quoted: msg });
+  }
+
+  const extracted = extractViewOnceMedia(quoted);
+  if (!extracted || !extracted.isViewOnce) {
+    return socket.sendMessage(chatId, {
+      text: '❌ Le message cité ne contient pas de média en vue unique reconnu.'
+    }, { quoted: msg });
+  }
+  if (typeof downloadContentFromMessage !== 'function') {
+    throw new Error('Le téléchargeur média Baileys n’est pas disponible pour cette session.');
+  }
+
+  if (msg?.key) {
+    await socket.sendMessage(chatId, { react: { text: '⏳', key: msg.key } }).catch(() => {});
+  }
+
+  const stream = await downloadContentFromMessage(extracted.content, extracted.type);
+  const buffer = await collectMediaStream(stream);
+  if (!buffer.length) throw new Error('Le flux view-once téléchargé est vide.');
+
+  const defaults = VIEW_ONCE_DEFAULTS[extracted.type];
+  const mimetype = extracted.content.mimetype || defaults.mimetype;
+  const fileName = extracted.content.fileName || defaults.fileName;
+  const originalCaption = extracted.content.caption || '';
+  const caption = originalCaption ? `${originalCaption}\n\n${defaults.caption}` : defaults.caption;
+  let payload;
+
+  switch (extracted.type) {
+    case 'image':
+      payload = { image: buffer, caption, mimetype };
+      break;
+    case 'video':
+      payload = { video: buffer, caption, mimetype, fileName };
+      break;
+    case 'audio':
+      payload = { audio: buffer, mimetype, ptt: Boolean(extracted.content.ptt) };
+      break;
+    case 'document':
+      payload = { document: buffer, mimetype, fileName, caption };
+      break;
+    case 'sticker':
+      payload = { sticker: buffer, mimetype };
+      break;
+    default:
+      throw new Error('Type de média non pris en charge pour une vue unique.');
+  }
+
+  const sent = await socket.sendMessage(chatId, payload, { quoted: msg });
+  if (!sent) throw new Error('WhatsApp n’a pas confirmé l’envoi du média.');
+  if (msg?.key) {
+    await socket.sendMessage(chatId, { react: { text: '✅', key: msg.key } }).catch(() => {});
+  }
+  return sent;
+}
+
 module.exports = {
   name: 'save',
   alias: ['sauvegarder', 'vv', 'rvo', 'readviewonce'],
   category: 'tools',
-  description: 'Transfère un statut ou un média éphémère dans le chat « Vous » du compte du bot',
-  usage: '.save (en répondant à un média, statut ou vue unique)',
+  description: 'Transfère .save dans le chat « Vous »; .vv déballe une vue unique dans le chat courant',
+  usage: '.save (statut/média) | .vv (en répondant à une vue unique)',
   async execute(context) {
     const { socket, msg, from, quotedMsg } = context;
     const quoted = quotedMsg
@@ -78,8 +183,25 @@ module.exports = {
       || msg?.message?.imageMessage?.contextInfo?.quotedMessage
       || msg?.message?.videoMessage?.contextInfo?.quotedMessage
       || msg?.quoted?.msg;
-    const statusQuote = findQuotedStatus(msg);
 
+    if (VIEW_ONCE_ALIASES.has(getCommandName(context))) {
+      try {
+        return await executeViewOnce(context, quoted);
+      } catch (error) {
+        console.error('[READVIEWONCE ERROR]', error);
+        const chatId = from || msg?.key?.remoteJid;
+        if (!chatId) return null;
+        if (msg?.key) {
+          await socket.sendMessage(chatId, { react: { text: '❌', key: msg.key } }).catch(() => {});
+        }
+        await socket.sendMessage(chatId, {
+          text: `❌ Impossible de déballer la vue unique : ${error?.message || error}`
+        }, { quoted: msg });
+        return null;
+      }
+    }
+
+    const statusQuote = findQuotedStatus(msg);
     if (!quoted && !statusQuote) {
       return socket.sendMessage(from, {
         text: '❌ *Réponds à un média (photo, vidéo, audio, statut ou vue unique) avec .save.*'
@@ -127,5 +249,12 @@ module.exports = {
       return null;
     }
   },
-  _test: { unwrapForSave, getQuotedMessageFromContext, makeForwardKey }
+  _test: {
+    unwrapForSave,
+    getQuotedMessageFromContext,
+    makeForwardKey,
+    collectMediaStream,
+    executeViewOnce,
+    getCommandName
+  }
 };
