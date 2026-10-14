@@ -402,7 +402,9 @@ test('nettoie le MP4 temporaire et libère le slot média après un échec de pu
         assert.equal(type, 'audio');
         yield Buffer.from('audio-source');
       },
-      async audioToStatusVideoFile(source) {
+      async audioToStatusVideoFile(source, options) {
+        assert.equal(options.maxDurationSeconds, 180);
+        assert.equal(Object.hasOwn(options, 'maxOutputBytes'), false);
         const chunks = [];
         for await (const chunk of source) chunks.push(Buffer.from(chunk));
         assert.equal(Buffer.concat(chunks).toString(), 'audio-source');

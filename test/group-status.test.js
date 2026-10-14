@@ -207,6 +207,65 @@ test('construit les statuts image/vidéo et transforme les audios en vidéo de m
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
 });
 
+test('le chemin audio par défaut diffuse le MP4 temporaire et expose son nettoyage après publication', async () => {
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kaido-group-status-file-test-'));
+  const videoPath = path.join(tempDir, 'converted.mp4');
+  let cleanupCalls = 0;
+  try {
+    const built = await buildGroupStatusPayload({
+      quotedMessage: { audioMessage: { bytes: 'audio-source', mimetype: 'audio/ogg', seconds: 205, caption: 'long audio' } },
+      downloadContent: async function * download() { yield Buffer.from('audio-source'); },
+      audioToStatusVideoFile: async (source, options) => {
+        assert.deepEqual(options, { durationSeconds: 205 });
+        const chunks = [];
+        for await (const chunk of source) chunks.push(Buffer.from(chunk));
+        assert.equal(Buffer.concat(chunks).toString(), 'audio-source');
+        await fs.promises.writeFile(videoPath, 'large-enough-mp4');
+        return {
+          path: videoPath,
+          async cleanup() {
+            cleanupCalls += 1;
+            await fs.promises.rm(tempDir, { recursive: true, force: true });
+          }
+        };
+      }
+    });
+
+    assert.equal(built.type, 'audio');
+    assert.ok(built.payload.video.stream, 'la vidéo doit rester en flux, pas en buffer');
+    assert.equal((await fs.promises.readFile(videoPath)).toString(), 'large-enough-mp4');
+    const uploadedChunks = [];
+    for await (const chunk of built.payload.video.stream) uploadedChunks.push(Buffer.from(chunk));
+    assert.equal(Buffer.concat(uploadedChunks).toString(), 'large-enough-mp4');
+    await built.cleanup();
+    assert.equal(cleanupCalls, 1);
+    await assert.rejects(fs.promises.access(videoPath));
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('les fichiers audio temporaires vont sur le volume configurable, pas dans /tmp par défaut', () => {
+  assert.equal(
+    audioStatus.getAudioStatusTempRoot({}),
+    path.resolve(__dirname, '..', 'tmp', 'audio-status')
+  );
+  assert.equal(
+    audioStatus.getAudioStatusTempRoot({ AUDIO_STATUS_TEMP_DIR: '/data/kaido/audio-work' }),
+    path.resolve('/data/kaido/audio-work')
+  );
+});
+
+test('une erreur ENOSPC indique le dossier persistant sans renvoyer la commande FFmpeg complète', () => {
+  const error = audioStatus._test.formatFfmpegError({
+    stderr: 'av_interleaved_write_frame(): No space left on device',
+    message: `Command failed: ffmpeg ${'filter-graph '.repeat(1000)}`
+  }, '/data/kaido/audio-work');
+  assert.match(error.message, /Espace disque insuffisant sur \/data\/kaido\/audio-work/);
+  assert.match(error.message, /AUDIO_STATUS_TEMP_DIR/);
+  assert.doesNotMatch(error.message, /Command failed|filter-graph/);
+});
+
 test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
   const paths = {
     title: '/tmp/title.txt',
@@ -678,6 +737,71 @@ test('swgc publie image, vidéo et audio dans un groupe admin-only quand le bot 
   assert.equal(sent.length, 3);
   assert.ok(sent.every(event => event.jid === metadata.id), 'les confirmations doivent rester dans le groupe fermé');
   assert.ok(sent.every(event => /posté sur : ce groupe/.test(event.content.text)));
+});
+
+test('swgc supprime le MP4 temporaire après la fin du relay, même si la publication échoue', async () => {
+  for (const shouldFail of [false, true]) {
+    resetSelections();
+    const fixture = privateFixture();
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kaido-swgc-audio-cleanup-'));
+    const videoPath = path.join(tempDir, 'group-status.mp4');
+    let cleanupCalls = 0;
+    let relayFinished = false;
+    const audio = { mimetype: 'audio/ogg', seconds: 205, caption: 'audio de groupe' };
+    const context = {
+      ...fixture.context,
+      from: '111@g.us',
+      sender: '50911111111@s.whatsapp.net',
+      args: [],
+      quotedMsg: { audioMessage: audio },
+      msg: {
+        key: { remoteJid: '111@g.us', participant: '50911111111@s.whatsapp.net', id: `audio-${shouldFail}` },
+        message: {}
+      }
+    };
+
+    try {
+      await swgc._test.executeSwgc(context, {
+        async *downloadContent(_media, type) {
+          assert.equal(type, 'audio');
+          yield Buffer.from('audio-source');
+        },
+        async audioToStatusVideoFile(source, options) {
+          assert.equal(options.durationSeconds, 205);
+          const chunks = [];
+          for await (const chunk of source) chunks.push(Buffer.from(chunk));
+          assert.equal(Buffer.concat(chunks).toString(), 'audio-source');
+          await fs.promises.writeFile(videoPath, 'converted-group-status-video');
+          return {
+            path: videoPath,
+            async cleanup() {
+              assert.equal(relayFinished, true, 'le fichier ne doit pas être supprimé avant la fin du relay');
+              cleanupCalls += 1;
+              await fs.promises.rm(tempDir, { recursive: true, force: true });
+            }
+          };
+        },
+        async publishGroupStatus(_socket, jid, payload) {
+          assert.equal(jid, '111@g.us');
+          assert.ok(payload.video.stream);
+          const chunks = [];
+          for await (const chunk of payload.video.stream) chunks.push(Buffer.from(chunk));
+          assert.equal(Buffer.concat(chunks).toString(), 'converted-group-status-video');
+          relayFinished = true;
+          if (shouldFail) throw new Error('relay de test échoué');
+        }
+      });
+
+      assert.equal(cleanupCalls, 1);
+      await assert.rejects(fs.promises.access(videoPath));
+      assert.equal(fixture.sent.at(-1).jid, '111@g.us');
+      assert.match(fixture.sent.at(-1).content.text, shouldFail
+        ? /relay de test échoué/
+        : /Statut audio stylisé en vidéo posté/);
+    } finally {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
+  }
 });
 
 test('swgc refuse un groupe admin-only si le compte du bot n’en est pas administrateur', async () => {

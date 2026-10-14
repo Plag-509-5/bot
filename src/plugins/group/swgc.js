@@ -113,6 +113,7 @@ async function executeSwgc(context, dependencies = {}) {
     });
   }
 
+  let builtStatus = null;
   try {
     const target = isGroupCommand
       ? { jid: from, subject: 'ce groupe' }
@@ -164,11 +165,12 @@ async function executeSwgc(context, dependencies = {}) {
       const nyxBaileys = await import('@nyxcore/nyxcoresocket');
       downloadContent = nyxBaileys.downloadContentFromMessage;
     }
-    const built = await buildGroupStatusPayload({
+    builtStatus = await buildGroupStatusPayload({
       quotedMessage: quotedMsg,
       textInput,
       downloadContent,
-      audioToStatusVideo: dependencies.audioToStatusVideo
+      audioToStatusVideo: dependencies.audioToStatusVideo,
+      audioToStatusVideoFile: dependencies.audioToStatusVideoFile
     });
 
     let sendGroupStatus;
@@ -182,16 +184,22 @@ async function executeSwgc(context, dependencies = {}) {
         : adapter;
     }
     const sendOptions = targetMetadata?.announce ? { useCachedGroupMetadata: false } : undefined;
-    await sendGroupStatus(target.jid, built.payload, sendOptions);
+    await sendGroupStatus(target.jid, builtStatus.payload, sendOptions);
 
     return sendContextReply(context, {
-      text: groupStatusConfirmation(built.type, target.subject)
+      text: groupStatusConfirmation(builtStatus.type, target.subject)
     });
   } catch (error) {
     console.error('[SWGC ERROR]', error);
     return sendContextReply(context, {
       text: `❌ Publication impossible : ${error?.message || error}`
     });
+  } finally {
+    try { builtStatus?.payload?.video?.stream?.destroy?.(); } catch {}
+    if (typeof builtStatus?.cleanup === 'function') {
+      try { await builtStatus.cleanup(); }
+      catch (error) { console.warn('[SWGC] Nettoyage du média temporaire échoué:', error?.message || error); }
+    }
   }
 }
 

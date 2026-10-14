@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('node:fs');
+
 const DEFAULT_TEXT_STATUS_FONT = 2;
 const STATUS_BACKGROUND_PALETTE = Object.freeze([
   '#12002B', // améthyste profond
@@ -106,6 +108,7 @@ async function buildGroupStatusPayload({
   colorInput = '',
   downloadContent,
   audioToStatusVideo,
+  audioToStatusVideoFile,
   random = Math.random
 }) {
   const quoted = unwrapMessage(quotedMessage);
@@ -123,45 +126,76 @@ async function buildGroupStatusPayload({
     if (!media) continue;
     if (typeof downloadContent !== 'function') throw new Error('Téléchargement média indisponible');
     const stream = await downloadContent(media, downloadType);
-    const buffer = await streamToBuffer(stream);
-    if (!buffer.length) throw new Error('Le média cité est vide');
-
     const caption = String(media.caption || '').trim() || requestedText;
-    if (downloadType === 'image') {
-      return {
-        type: 'image',
-        payload: {
-          image: buffer,
-          mimetype: media.mimetype || 'image/jpeg',
-          ...(caption ? { caption } : {})
-        }
-      };
+
+    if (downloadType === 'image' || downloadType === 'video') {
+      const buffer = await streamToBuffer(stream);
+      if (!buffer.length) throw new Error('Le média cité est vide');
+      return downloadType === 'image'
+        ? {
+            type: 'image',
+            payload: {
+              image: buffer,
+              mimetype: media.mimetype || 'image/jpeg',
+              ...(caption ? { caption } : {})
+            }
+          }
+        : {
+            type: 'video',
+            payload: {
+              video: buffer,
+              mimetype: media.mimetype || 'video/mp4',
+              ...(caption ? { caption } : {})
+            }
+          };
     }
-    if (downloadType === 'video') {
+
+    // Compatibilité des appels qui injectent un convertisseur Buffer. Le chemin
+    // normal reste en flux de fichier pour éviter de conserver deux MP4 en RAM.
+    if (typeof audioToStatusVideo === 'function') {
+      const buffer = await streamToBuffer(stream);
+      if (!buffer.length) throw new Error('Le média cité est vide');
+      const video = await audioToStatusVideo(buffer, {
+        durationSeconds: Number(media.seconds) || 0
+      });
+      if (!Buffer.isBuffer(video) || video.length === 0) {
+        throw new Error('La conversion audio → vidéo a produit un fichier vide.');
+      }
       return {
-        type: 'video',
+        type: 'audio',
         payload: {
-          video: buffer,
-          mimetype: media.mimetype || 'video/mp4',
+          video,
+          mimetype: 'video/mp4',
           ...(caption ? { caption } : {})
         }
       };
     }
 
-    const convertAudio = audioToStatusVideo
-      || require('./group-status-audio').audioToStatusVideo;
-    const video = await convertAudio(buffer, {
+    const convertAudioToFile = audioToStatusVideoFile
+      || require('./group-status-audio').audioToStatusVideoFile;
+    const converted = await convertAudioToFile(stream, {
       durationSeconds: Number(media.seconds) || 0
     });
-    if (!Buffer.isBuffer(video) || video.length === 0) {
+    if (!converted?.path) {
+      if (typeof converted?.cleanup === 'function') await converted.cleanup();
       throw new Error('La conversion audio → vidéo a produit un fichier vide.');
     }
+
+    const videoStream = fs.createReadStream(converted.path);
+    let cleaned = false;
     return {
       type: 'audio',
       payload: {
-        video,
+        video: { stream: videoStream },
         mimetype: 'video/mp4',
         ...(caption ? { caption } : {})
+      },
+      async cleanup() {
+        if (cleaned) return;
+        cleaned = true;
+        videoStream.destroy();
+        if (typeof converted.cleanup === 'function') await converted.cleanup();
+        else await fs.promises.rm(converted.path, { force: true });
       }
     };
   }

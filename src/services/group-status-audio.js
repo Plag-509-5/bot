@@ -1,7 +1,6 @@
 'use strict';
 
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { Readable } = require('node:stream');
@@ -37,7 +36,31 @@ const FONT_CANDIDATES = Object.freeze([
 
 let ffmpegCache = null;
 const MAX_AUDIO_INPUT_BYTES = positiveInteger(process.env.AUDIO_STATUS_MAX_INPUT_BYTES, 32 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024);
-const MAX_AUDIO_OUTPUT_BYTES = positiveInteger(process.env.AUDIO_STATUS_MAX_OUTPUT_BYTES, 64 * 1024 * 1024, 1024 * 1024, 512 * 1024 * 1024);
+
+function getAudioStatusTempRoot(env = process.env) {
+  const configured = String(env.AUDIO_STATUS_TEMP_DIR || '').trim();
+  return path.resolve(configured || path.join(__dirname, '../../tmp/audio-status'));
+}
+
+function formatFfmpegError(error, tempRoot) {
+  const details = [error?.stderr, error?.message].filter(Boolean).join('\n');
+  if (/No space left on device|ENOSPC/i.test(details)) {
+    return new Error(
+      `Espace disque insuffisant sur ${tempRoot} pendant la conversion audio. `
+      + 'Le rendu ne comporte pas de plafond artificiel; vérifie l’espace libre ou configure '
+      + 'AUDIO_STATUS_TEMP_DIR vers un volume persistant avec assez d’espace.',
+      { cause: error }
+    );
+  }
+
+  const stderr = String(error?.stderr || '').trim().slice(0, 1000);
+  const code = error?.code ? ` (${error.code})` : '';
+  const timeout = error?.killed ? ' Le processus FFmpeg a été interrompu ou a dépassé son délai.' : '';
+  return new Error(
+    `Échec de la conversion audio par FFmpeg${code}.${stderr ? ` ${stderr}` : timeout || ' Aucun diagnostic FFmpeg disponible.'}`,
+    { cause: error }
+  );
+}
 const MAX_AUDIO_CONCURRENT_JOBS = positiveInteger(process.env.AUDIO_STATUS_MAX_CONCURRENT, 1, 1, 4);
 const MAX_AUDIO_QUEUED_JOBS = positiveInteger(process.env.AUDIO_STATUS_MAX_QUEUE, 2, 0, 16);
 
@@ -263,7 +286,7 @@ async function renderAudioStatus(source, {
   durationSeconds = 0,
   maxDurationSeconds = 0,
   maxInputBytes = MAX_AUDIO_INPUT_BYTES,
-  maxOutputBytes = MAX_AUDIO_OUTPUT_BYTES,
+  maxOutputBytes = null,
   branding = BRANDING,
   design = DESIGN
 } = {}, returnFile = false) {
@@ -273,12 +296,18 @@ async function renderAudioStatus(source, {
     throw new Error('Police Poppins introuvable : vérifie assets/fonts/Poppins-SemiBold.ttf.');
   }
 
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'kaido-groupstatus-audio-'));
-  const inputPath = path.join(tempDir, 'source-audio');
-  const outputPath = path.join(tempDir, 'kaido-audio-status.mp4');
+  // Évite /tmp, souvent monté en tmpfs ou avec un quota minuscule dans les
+  // conteneurs. Les gros MP4 sont créés sur le volume persistant du bot, puis
+  // le dossier entier est supprimé après publication (ou en cas d’erreur).
+  const tempRoot = getAudioStatusTempRoot();
+  let tempDir = null;
   let preserveDirectory = false;
 
   try {
+    await fs.promises.mkdir(tempRoot, { recursive: true });
+    tempDir = await fs.promises.mkdtemp(path.join(tempRoot, 'kaido-groupstatus-audio-'));
+    const inputPath = path.join(tempDir, 'source-audio');
+    const outputPath = path.join(tempDir, 'kaido-audio-status.mp4');
     const inputLimit = positiveInteger(maxInputBytes, MAX_AUDIO_INPUT_BYTES, 1024, 256 * 1024 * 1024);
     await writeAudioSourceToFile(source, inputPath, inputLimit);
     const probedDuration = await getAudioDuration(ffmpegPath, inputPath);
@@ -312,28 +341,35 @@ async function renderAudioStatus(source, {
       design
     });
 
-    await execFileAsync(ffmpegPath, [
-      '-hide_banner', '-loglevel', 'error', '-y',
-      '-filter_complex_threads', '1',
-      '-i', inputPath,
-      '-filter_complex', graph,
-      '-map', '[v]', '-map', '0:a:0',
-      '-t', durationText,
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads:v', '1', '-crf', '27', '-pix_fmt', 'yuv420p',
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
-      '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-ar', '48000', '-ac', '2',
-      '-shortest', '-movflags', '+faststart', outputPath
-    ], {
-      timeout: Math.min(Math.ceil(duration * 2000) + 60000, 30 * 60 * 1000),
-      maxBuffer: 8 * 1024 * 1024,
-      windowsHide: true
-    });
+    try {
+      await execFileAsync(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-filter_complex_threads', '1',
+        '-i', inputPath,
+        '-filter_complex', graph,
+        '-map', '[v]', '-map', '0:a:0',
+        '-t', durationText,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads:v', '1', '-crf', '27', '-pix_fmt', 'yuv420p',
+        '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+        '-c:a', 'aac', '-profile:a', 'aac_low', '-b:a', '128k', '-ar', '48000', '-ac', '2',
+        '-shortest', '-movflags', '+faststart', outputPath
+      ], {
+        timeout: Math.min(Math.ceil(duration * 2000) + 60000, 30 * 60 * 1000),
+        maxBuffer: 8 * 1024 * 1024,
+        windowsHide: true
+      });
+    } catch (error) {
+      throw formatFfmpegError(error, tempRoot);
+    }
 
     const output = await fs.promises.stat(outputPath);
     if (!output.size) throw new Error('La conversion audio → vidéo a produit un fichier vide.');
-    const outputLimit = positiveInteger(maxOutputBytes, MAX_AUDIO_OUTPUT_BYTES, 1024, 512 * 1024 * 1024);
-    if (output.size > outputLimit) {
-      throw new Error(`La vidéo convertie dépasse la limite de ${outputLimit} octets.`);
+    const requestedOutputLimit = Number(maxOutputBytes);
+    if (Number.isFinite(requestedOutputLimit) && requestedOutputLimit > 0) {
+      const outputLimit = positiveInteger(requestedOutputLimit, requestedOutputLimit, 1024, 512 * 1024 * 1024);
+      if (output.size > outputLimit) {
+        throw new Error(`La vidéo convertie dépasse la limite de ${outputLimit} octets.`);
+      }
     }
     if (returnFile) {
       preserveDirectory = true;
@@ -351,8 +387,15 @@ async function renderAudioStatus(source, {
     }
 
     return await fs.promises.readFile(outputPath);
+  } catch (error) {
+    const details = `${error?.code || ''}\n${error?.message || ''}`;
+    if (/No space left on device|ENOSPC/i.test(details)
+      && !/Espace disque insuffisant/i.test(error?.message || '')) {
+      throw formatFfmpegError(error, tempRoot);
+    }
+    throw error;
   } finally {
-    if (!preserveDirectory) {
+    if (!preserveDirectory && tempDir) {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
     }
   }
@@ -371,8 +414,8 @@ module.exports = {
   DESIGN,
   FONT_CANDIDATES,
   MAX_AUDIO_INPUT_BYTES,
-  MAX_AUDIO_OUTPUT_BYTES,
   MAX_AUDIO_CONCURRENT_JOBS,
+  getAudioStatusTempRoot,
   MAX_AUDIO_QUEUED_JOBS,
   safeDuration,
   formatTime,
@@ -385,5 +428,5 @@ module.exports = {
   audioToStatusVideo,
   audioToStatusVideoFile,
   getAudioStatusQueueStats,
-  _test: { createAudioJobQueue, runAudioStatusJob, positiveInteger }
+  _test: { createAudioJobQueue, runAudioStatusJob, positiveInteger, formatFfmpegError }
 };

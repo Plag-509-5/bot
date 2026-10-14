@@ -665,7 +665,6 @@ async function executeToStatus(context, dependencies = {}) {
           durationSeconds: seconds,
           maxDurationSeconds: TOSTATUS_MAX_AUDIO_SECONDS,
           maxInputBytes: TOSTATUS_MAX_AUDIO_BYTES,
-          maxOutputBytes: TOSTATUS_MAX_MEDIA_BYTES,
           branding: PERSONAL_STATUS_BRANDING,
           design: PERSONAL_STATUS_DESIGN
         });
