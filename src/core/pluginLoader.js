@@ -229,14 +229,22 @@ async function executePlugin(commandName, context) {
   }
 
   // Extract quoted message context if available across message types
-  const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
+  // Certains appels (notamment les alias de réaction) possèdent déjà le
+  // message cité provenant du cache Baileys. Le garder en priorité évite de le
+  // perdre lorsque la commande synthétique n'a pas tous les wrappers contextInfo.
+  const quotedMsg = context.quotedMsg
+    || context.quoted
+    || msg.message?.extendedTextMessage?.contextInfo?.quotedMessage
     || msg.message?.stickerMessage?.contextInfo?.quotedMessage
     || msg.message?.imageMessage?.contextInfo?.quotedMessage
     || msg.message?.videoMessage?.contextInfo?.quotedMessage
     || msg.quoted?.msg
+    || msg.quoted?.message
     || null;
 
-  const quotedSender = msg.message?.extendedTextMessage?.contextInfo?.participant
+  const quotedSender = context.quotedSender
+    || msg.message?.extendedTextMessage?.contextInfo?.participantAlt
+    || msg.message?.extendedTextMessage?.contextInfo?.participant
     || msg.message?.stickerMessage?.contextInfo?.participant
     || msg.message?.imageMessage?.contextInfo?.participant
     || msg.quoted?.sender

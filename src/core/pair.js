@@ -138,7 +138,13 @@ const {
   waitForPairingReady
 } = require('../auth/pairing-lifecycle');
 const { issuePairingCode } = require('../auth/pairing-code');
-const { createPairingCodeUrl } = require('../services/pairing-code-url');
+const {
+  createPairingCodeUrlCandidates,
+  isPairingNetworkError,
+  fetchPairingCodeWithFallback
+} = require('../services/pairing-code-url');
+const { resolvePairingNumber } = require('../services/pairing-code-input');
+const { resolveReactionTargetMessage } = require('../services/reaction-target-message');
 const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
@@ -1585,7 +1591,14 @@ function setupCommandHandlers(socket, number) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
-        const targetMsg = getStoredMessage(number, targetMsgId);
+        const targetMsg = await resolveReactionTargetMessage({
+          cachedMessage: getStoredMessage(number, targetMsgId),
+          socket,
+          targetKey: { ...targetKey, remoteJid: targetChat }
+        });
+        if (!targetMsg) {
+          console.warn(`[REACTION-CMD] Message cible ${targetMsgId || '(sans id)'} introuvable dans le cache de la session ${number}.`);
+        }
 
         const reactorJid = msg.key.fromMe 
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
@@ -1616,7 +1629,11 @@ function setupCommandHandlers(socket, number) {
         activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
-        const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
+        const quotedParticipant = targetMsg?.key?.participant
+          || targetMsg?.key?.participantAlt
+          || targetKey?.participant
+          || targetKey?.participantAlt
+          || (!String(targetChat).endsWith('@g.us') ? targetChat : null);
 
         const syntheticMsg = {
           key: {
@@ -7068,18 +7085,27 @@ case 'code': {
   
   const args = q.trim().split(/\s+/);
   args.shift(); // enlever la commande
-  const number = args.join(' ').trim();
+  const requestedNumber = args.join(' ').trim();
+  const pairingTarget = await resolvePairingNumber({
+    explicitNumber: requestedNumber,
+    msg,
+    from,
+    senderJid: nowsender,
+    socket
+  });
+  const cleanNumber = pairingTarget.number;
 
-  if (!number) {
+  if (!cleanNumber) {
+    const details = pairingTarget.error || 'Indique un numéro de téléphone valide.';
     return await socket.sendMessage(codeChat, {
       text: `*📌 𝗖𝗢𝗗𝗘 𝗗𝗘 𝗖𝗢𝗡𝗡𝗘𝗫𝗜𝗢𝗡 𝗞𝗔𝗜𝗗𝗢*\n\n` +
+            `${details}\n\n` +
             `*Usage:* .code [numéro]\n` +
-            `*Exemple:* .code 5094744XXXX\n\n` +
-            `*Note:* Le numéro doit être au format international sans le +`
+            `Réponds à un message de la personne, ou utilise .code sans numéro pour ton propre compte.\n` +
+            `*Exemple:* .code 50947441234 (sans +)`
     }, { quoted: msg });
   }
 
-  const cleanNumber = number.replace(/[^\d]/g, '');
   if (cleanNumber.length < 9 || cleanNumber.length > 15) {
     return await socket.sendMessage(codeChat, {
       text: `*❌ 𝙵𝚘𝚛𝚖𝚊𝚝 𝚒𝚗𝚌𝚘𝚛𝚛𝚎𝚌𝚝  *\n\n` +
@@ -7088,24 +7114,43 @@ case 'code': {
     }, { quoted: msg });
   }
 
+  let localFallbackAttempted = false;
+  let pairingApiNetworkFailure = false;
   try {
     await socket.sendMessage(codeChat, { react: { text: "⏳", key: msg.key } });
 
-    let fetch;
+    // Chaque invocation demande un code frais. On tente d'abord l'hôte public
+    // configuré, puis localhost:PORT si l'adresse publique ne répond pas depuis
+    // le processus lui-même (cas fréquent avec une IP sans hairpin NAT).
+    const pairingUrls = createPairingCodeUrlCandidates(
+      cleanNumber,
+      process.env,
+      undefined,
+      { forceFresh: true }
+    );
+    let pairingResponse;
     try {
-      fetch = (await import('node-fetch')).default;
-    } catch {
-      fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+      pairingResponse = await fetchPairingCodeWithFallback(
+        pairingUrls,
+        fetch,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
+            'Accept': 'application/json'
+          },
+          timeout: PAIRING_CODE_HTTP_TIMEOUT_MS
+        },
+        () => {
+          localFallbackAttempted = true;
+          console.warn('[CODE] Hôte pairing inaccessible; nouvel essai sur localhost et le PORT courant.');
+        }
+      );
+    } catch (error) {
+      pairingApiNetworkFailure = isPairingNetworkError(error);
+      throw error;
     }
-
-    const url = createPairingCodeUrl(cleanNumber);
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
-        'Accept': 'application/json'
-      },
-      timeout: PAIRING_CODE_HTTP_TIMEOUT_MS
-    });
+    localFallbackAttempted = localFallbackAttempted || pairingResponse.usedFallback;
+    const response = pairingResponse.response;
 
     const bodyText = await response.text();
     let result;
@@ -7164,9 +7209,22 @@ case 'code': {
     await socket.sendMessage(codeChat, { react: { text: "✅", key: msg.key } });
 
   } catch (err) {
-    console.error("❌ Erreur commande code:", err);
+    const errorText = String(err?.message || err);
+    const isTimeout = pairingApiNetworkFailure && (
+      err?.type === 'request-timeout'
+      || err?.code === 'ETIMEDOUT'
+      || err?.code === 'ESOCKETTIMEDOUT'
+      || /network timeout|timed? ?out|timeout/i.test(errorText)
+    );
+    const isNetworkFailure = pairingApiNetworkFailure;
+    console.error("❌ Erreur commande code:", errorText);
     await socket.sendMessage(codeChat, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(codeChat, { text: `❌ Erreur: ${err.message || err}` }, { quoted: msg });
+    const userMessage = isNetworkFailure
+      ? isTimeout
+        ? `❌ Délai dépassé en attendant le serveur de pairing. Une demande de code frais (force=1) a été tentée${localFallbackAttempted ? ' via l’hôte configuré puis localhost' : ''}. Vérifie l’hôte et le PORT, puis réessaie si aucun code n’est arrivé.`
+        : `❌ Le serveur de pairing est inaccessible${localFallbackAttempted ? ' via l’hôte configuré et localhost' : ''}. Vérifie l’hôte et le PORT.${errorText ? ` (${errorText})` : ''}`
+      : `❌ Erreur: ${errorText}`;
+    await socket.sendMessage(codeChat, { text: userMessage }, { quoted: msg });
   }
   break;
 }

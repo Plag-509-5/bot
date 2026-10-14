@@ -8,7 +8,11 @@ const {
   DEFAULT_HOST,
   DEFAULT_PORT,
   createPairingCodeUrl,
+  createLocalPairingCodeUrl,
+  createPairingCodeUrlCandidates,
   detectLocalHost,
+  isPairingNetworkError,
+  fetchPairingCodeWithFallback,
   resolvePort
 } = require('../src/services/pairing-code-url');
 
@@ -85,6 +89,90 @@ test('un hôte explicite et un SITE_URL HTTPS conservent le protocole et le port
     PORT: '9443'
   }, LOCAL_INTERFACES));
   assert.equal(siteUrl.origin, 'https://[2001:db8::1]:9443');
+});
+
+test('.code peut demander un nouveau pairing explicite via force=1', () => {
+  const url = new URL(createPairingCodeUrl('50912345678', {
+    PAIRING_HOST: '127.0.0.1',
+    PORT: '3004'
+  }, LOCAL_INTERFACES, { forceFresh: true }));
+  assert.equal(url.searchParams.get('number'), '50912345678');
+  assert.equal(url.searchParams.get('force'), '1');
+});
+
+test('le fallback localhost conserve le port dynamique et la demande force=1', () => {
+  const url = new URL(createLocalPairingCodeUrl('50912345678', {
+    SITE_IP: '69.48.206.15',
+    PORT: '3004'
+  }, { forceFresh: true }));
+  assert.equal(url.origin, 'http://127.0.0.1:3004');
+  assert.equal(url.pathname, '/code');
+  assert.equal(url.searchParams.get('number'), '50912345678');
+  assert.equal(url.searchParams.get('force'), '1');
+});
+
+test('les URL pairing essaient l’hôte configuré avant localhost, sans doublon', () => {
+  const candidates = createPairingCodeUrlCandidates('50912345678', {
+    SITE_IP: '69.48.206.15',
+    PORT: '3004'
+  }, LOCAL_INTERFACES, { forceFresh: true }).map(value => new URL(value));
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].origin, 'http://69.48.206.15:3004');
+  assert.equal(candidates[1].origin, 'http://127.0.0.1:3004');
+  for (const url of candidates) {
+    assert.equal(url.pathname, '/code');
+    assert.equal(url.searchParams.get('force'), '1');
+  }
+
+  const loopbackOnly = createPairingCodeUrlCandidates('50912345678', {
+    PAIRING_HOST: '127.0.0.1',
+    PORT: '3004'
+  }, LOCAL_INTERFACES);
+  assert.equal(loopbackOnly.length, 1);
+});
+
+test('reconnaît les timeouts/erreurs réseau pour autoriser le fallback sans masquer les erreurs HTTP', () => {
+  assert.equal(isPairingNetworkError(Object.assign(new Error('network timeout'), { type: 'request-timeout' })), true);
+  assert.equal(isPairingNetworkError(Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' })), true);
+  assert.equal(isPairingNetworkError(new Error('HTTP 400: Bad Request')), false);
+});
+
+test('réessaie sur localhost après un timeout réseau de l’hôte configuré', async () => {
+  const calls = [];
+  const response = { ok: true, status: 200 };
+  const fallbackNotifications = [];
+  const result = await fetchPairingCodeWithFallback(
+    ['http://site.test:3004/code', 'http://127.0.0.1:3004/code'],
+    async (url, options) => {
+      calls.push({ url, options });
+      if (url.includes('site.test')) {
+        throw Object.assign(new Error('network timeout'), { type: 'request-timeout' });
+      }
+      return response;
+    },
+    { timeout: 120000 },
+    (_error, nextUrl) => fallbackNotifications.push(nextUrl)
+  );
+  assert.deepEqual(calls.map(call => call.url), [
+    'http://site.test:3004/code',
+    'http://127.0.0.1:3004/code'
+  ]);
+  assert.equal(calls[0].options.timeout, 120000);
+  assert.equal(result.response, response);
+  assert.equal(result.usedFallback, true);
+  assert.deepEqual(fallbackNotifications, ['http://127.0.0.1:3004/code']);
+});
+
+test('ne retente pas localhost pour une erreur applicative qui n’est pas réseau', async () => {
+  const calls = [];
+  await assert.rejects(
+    fetchPairingCodeWithFallback(['http://site.test/code', 'http://127.0.0.1/code'], async url => {
+      calls.push(url);
+      throw new Error('HTTP 400');
+    }),
+    /HTTP 400/
+  );
+  assert.deepEqual(calls, ['http://site.test/code']);
 });
 
 test('PAIRING_HOST peut inclure un port explicite qui prévaut sur PORT', () => {

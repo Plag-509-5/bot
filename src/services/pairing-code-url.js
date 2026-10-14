@@ -181,7 +181,7 @@ function resolvePairingTarget(env = process.env, networkInterfaces = os.networkI
  * Build the URL called by `.code` to ask the existing Express `/code` API to
  * issue a Baileys pairing code. The local port is taken from the live PORT env.
  */
-function createPairingCodeUrl(number, env = process.env, networkInterfaces = os.networkInterfaces()) {
+function createPairingCodeUrl(number, env = process.env, networkInterfaces = os.networkInterfaces(), options = {}) {
   const target = resolvePairingTarget(env, networkInterfaces);
   if (!target?.host || !target?.protocol) {
     throw new Error('Impossible de déterminer l’adresse du serveur de pairing.');
@@ -198,7 +198,74 @@ function createPairingCodeUrl(number, env = process.env, networkInterfaces = os.
   const path = prefix.endsWith(VIEW_ROUTE) ? prefix : `${prefix}${VIEW_ROUTE}`;
   url.pathname = path.startsWith('/') ? path : `/${path}`;
   url.searchParams.set('number', String(number || '').replace(/[^0-9]/g, ''));
+  if (options.forceFresh) url.searchParams.set('force', '1');
   return url.toString();
+}
+
+/** Build a same-process HTTP fallback while retaining the app's dynamic port. */
+function createLocalPairingCodeUrl(number, env = process.env, options = {}) {
+  const localEnv = {
+    ...env,
+    PAIRING_API_URL: '',
+    PAIRING_BASE_URL: '',
+    PAIRING_HOST: '127.0.0.1',
+    SITE_IP: '',
+    SITE_URL: '',
+    PAIRING_API_HOST: '',
+    SERVER_IP: '',
+    HOST_IP: '',
+    PAIRING_PROTOCOL: 'http'
+  };
+  return createPairingCodeUrl(number, localEnv, {}, options);
+}
+
+/** Try the configured site URL first and loopback on this same Express port. */
+function createPairingCodeUrlCandidates(number, env = process.env, networkInterfaces = os.networkInterfaces(), options = {}) {
+  const candidates = [];
+  let lastError = null;
+  for (const build of [
+    () => createPairingCodeUrl(number, env, networkInterfaces, options),
+    () => createLocalPairingCodeUrl(number, env, options)
+  ]) {
+    try {
+      const url = build();
+      if (!candidates.includes(url)) candidates.push(url);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (!candidates.length) throw lastError || new Error('Impossible de déterminer l’adresse du serveur de pairing.');
+  return candidates;
+}
+
+function isPairingNetworkError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const type = String(error?.type || '').toLowerCase();
+  if (type === 'request-timeout') return true;
+  if ([
+    'ECONNABORTED', 'ECONNREFUSED', 'ECONNRESET', 'EAI_AGAIN', 'ENETUNREACH',
+    'EHOSTUNREACH', 'ENOTFOUND', 'ESOCKETTIMEDOUT', 'ETIMEDOUT'
+  ].includes(code)) return true;
+  return /network timeout|timed? ?out|fetch failed|socket hang up|econnrefused|ehostunreach|enetunreach/i
+    .test(String(error?.message || error || ''));
+}
+
+async function fetchPairingCodeWithFallback(urls, fetchImpl, options = {}, onFallback) {
+  const candidates = (Array.isArray(urls) ? urls : [urls]).filter(Boolean);
+  if (!candidates.length) throw new Error('Aucune URL de pairing disponible.');
+  if (typeof fetchImpl !== 'function') throw new TypeError('Le client HTTP de pairing est invalide.');
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    try {
+      const response = await fetchImpl(candidates[index], options);
+      return { response, url: candidates[index], usedFallback: index > 0 };
+    } catch (error) {
+      const canFallback = index + 1 < candidates.length && isPairingNetworkError(error);
+      if (!canFallback) throw error;
+      onFallback?.(error, candidates[index + 1]);
+    }
+  }
+  throw new Error('Le serveur de pairing n’a retourné aucune réponse.');
 }
 
 module.exports = {
@@ -209,5 +276,9 @@ module.exports = {
   resolveHost,
   detectLocalHost,
   resolvePairingTarget,
-  createPairingCodeUrl
+  createPairingCodeUrl,
+  createLocalPairingCodeUrl,
+  createPairingCodeUrlCandidates,
+  isPairingNetworkError,
+  fetchPairingCodeWithFallback
 };

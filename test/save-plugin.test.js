@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const savePlugin = require('../src/plugins/tools/save');
 const { executePlugin, loadPlugins } = require('../src/core/pluginLoader');
+const { resolveReactionTargetMessage } = require('../src/services/reaction-target-message');
 
 const selfJid = '50900000000@s.whatsapp.net';
 const requesterJid = '50911111111@s.whatsapp.net';
@@ -86,6 +87,62 @@ test('.save conserve le transfert dans « Vous » et retire le drapeau vue uniqu
   assert.equal(forward.jid, selfJid);
   assert.equal(forward.content.forward.message.imageMessage.viewOnce, false);
   assert.equal(sent.some(event => event.jid === requesterJid && event.content?.forward), false);
+});
+
+test('.save sur réaction récupère un imageMessage direct du chat @lid et le transfère dans « Vous »', async () => {
+  const { socket, sent } = fakeSocket();
+  const targetChat = '246454467731604@lid';
+  const targetMessage = {
+    key: { remoteJid: targetChat, fromMe: false, id: 'A50ABE483971B8A65577A88A72883877', participant: requesterJid },
+    message: {
+      imageMessage: {
+        mimetype: 'image/jpeg',
+        viewOnce: true,
+        caption: 'Vue unique directe',
+        url: 'https://media.example/once.jpg'
+      }
+    }
+  };
+  const targetKey = { ...targetMessage.key };
+  const recovered = await resolveReactionTargetMessage({
+    cachedMessage: targetMessage,
+    socket,
+    targetKey
+  });
+  assert.equal(recovered, targetMessage);
+
+  const syntheticMsg = {
+    key: { remoteJid: targetChat, fromMe: false, id: 'reaction-save', participant: requesterJid },
+    message: {
+      extendedTextMessage: {
+        text: '.save',
+        contextInfo: {
+          remoteJid: targetChat,
+          stanzaId: targetMessage.key.id,
+          participant: requesterJid,
+          quotedMessage: { conversation: 'autre charge utile de test' }
+        }
+      }
+    }
+  };
+  loadPlugins(false);
+  const handled = await executePlugin('save', {
+    socket,
+    msg: syntheticMsg,
+    from: targetChat,
+    sender: requesterJid,
+    command: 'save',
+    quoted: recovered.message
+  });
+  assert.equal(handled, true);
+
+  const forward = sent.find(event => event.content?.forward);
+  assert.ok(forward, 'le média direct cité doit être transféré');
+  assert.equal(forward.jid, selfJid);
+  assert.equal(forward.content.forward.message.imageMessage.viewOnce, false);
+  assert.equal(forward.content.forward.message.imageMessage.caption, 'Vue unique directe');
+  assert.equal(forward.content.forward.key.id, targetMessage.key.id);
+  assert.equal(sent.some(event => event.content?.text?.includes('Réponds à un média')), false);
 });
 
 test('.vv extrait une vue unique via le quote d’un alias de réaction et renvoie le média dans le même groupe', async () => {
