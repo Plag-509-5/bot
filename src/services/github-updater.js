@@ -13,6 +13,11 @@ const GITHUB_API_MAX_PAGES = 10;
 const GITHUB_API_BASE_URL = 'https://api.github.com';
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
 
+function getDefaultRepositoryPath(env = process.env) {
+  const configuredPath = String(env.BOT_REPO_PATH || '').trim();
+  return path.resolve(configuredPath || path.resolve(__dirname, '../..'));
+}
+
 function validateBranchName(value = DEFAULT_UPDATE_BRANCH) {
   const branch = String(value || DEFAULT_UPDATE_BRANCH).trim();
   if (!branch
@@ -66,8 +71,15 @@ function getGitHubToken(env = process.env) {
 }
 
 function getGitAuthEnvironment(token, baseEnv = process.env) {
-  if (!token) return undefined;
-  const env = { ...baseEnv };
+  const env = {
+    ...baseEnv,
+    // Some deployments mount the app and its .git directory on different
+    // filesystems. Git otherwise stops discovery at /home or another mount
+    // boundary and reports a misleading "not a git repository" error.
+    GIT_DISCOVERY_ACROSS_FILESYSTEM: '1'
+  };
+  if (!token) return env;
+
   const parsedCount = Number(env.GIT_CONFIG_COUNT || 0);
   const count = Number.isInteger(parsedCount) && parsedCount >= 0 ? parsedCount : 0;
   env.GIT_CONFIG_COUNT = String(count + 1);
@@ -257,10 +269,21 @@ async function gitRawOutput(run, args, cwd, options) {
 }
 
 async function getOriginRepository({
-  cwd = path.resolve(__dirname, '../..'),
+  cwd = getDefaultRepositoryPath(),
   run = runGit
 } = {}) {
-  const root = await gitOutput(run, ['rev-parse', '--show-toplevel'], cwd);
+  let root;
+  try {
+    root = await gitOutput(run, ['rev-parse', '--show-toplevel'], cwd);
+  } catch (error) {
+    if (/not a git repository|pas un dépôt git/i.test(String(error?.message || error))) {
+      throw new Error(
+        `Dépôt Git introuvable depuis ${cwd}. Vérifie que le dossier déployé contient .git, ` +
+        'ou configure BOT_REPO_PATH vers la racine du clone Git.'
+      );
+    }
+    throw error;
+  }
   if (!root) throw new Error('Ce dossier ne semble pas être un dépôt Git.');
   const remoteUrl = await gitOutput(run, ['remote', 'get-url', 'origin'], root);
   const repository = parseGitHubRepository(remoteUrl);
@@ -321,7 +344,7 @@ function pathsForChangedFiles(files = []) {
 }
 
 async function checkForUpdates({
-  cwd = path.resolve(__dirname, '../..'),
+  cwd = getDefaultRepositoryPath(),
   branch = process.env.BOT_UPDATE_BRANCH || DEFAULT_UPDATE_BRANCH,
   repository,
   token = getGitHubToken(),
@@ -517,6 +540,7 @@ module.exports = {
   validateGitHubRepository,
   getGitHubToken,
   getGitAuthEnvironment,
+  getDefaultRepositoryPath,
   githubApiRequest,
   getGitHubRepositoryInfo,
   listGitHubRepositories,

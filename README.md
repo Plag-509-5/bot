@@ -376,6 +376,8 @@ Configure `BOT_UPDATE_GITHUB_TOKEN` dans `.env` pour que le bot liste les dépô
 
 Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers GitHub. L’application calcule le diff entre le commit installé et la cible, puis restaure uniquement les chemins ajoutés, modifiés, supprimés ou renommés dans ce diff avant d’avancer le pointeur Git en fast-forward. Un changement local sur un fichier également modifié par GitHub est remplacé; les changements locaux hors du diff et les fichiers non suivis tels que `.env` sont conservés. La commande affiche ces cas et ne fait jamais de `reset --hard`. Elle s’arrête si les historiques n’ont pas de base commune ou si les branches ont divergé.
 
+Le détecteur Git autorise la découverte du dépôt à travers les frontières de systèmes de fichiers. Si le code est déployé ailleurs que dans le clone contenant `.git`, configure `BOT_REPO_PATH` avec le chemin absolu de la racine du clone (par exemple `/home/kaido`).
+
 Après la mise à jour, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
 
 ---

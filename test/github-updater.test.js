@@ -164,6 +164,35 @@ test('liste les dépôts et branches GitHub avec le token sans révéler sa vale
   assert.equal(environment.GIT_CONFIG_KEY_1, 'http.https://github.com/.extraheader');
   assert.match(environment.GIT_CONFIG_VALUE_1, /^AUTHORIZATION: basic /);
   assert.equal(environment.GIT_CONFIG_VALUE_1.includes(token), false);
+  assert.equal(environment.GIT_DISCOVERY_ACROSS_FILESYSTEM, '1');
+  assert.equal(updater.getGitAuthEnvironment('', { PATH: '/usr/bin' }).GIT_DISCOVERY_ACROSS_FILESYSTEM, '1');
+});
+
+test('peut pointer le détecteur du dépôt vers BOT_REPO_PATH et explique un clone Git absent', async () => {
+  const previousPath = process.env.BOT_REPO_PATH;
+  try {
+    process.env.BOT_REPO_PATH = '/srv/kaido';
+    const result = await updater.getOriginRepository({
+      run: async (args, cwd) => {
+        assert.equal(cwd, '/srv/kaido');
+        if (args.join(' ') === 'rev-parse --show-toplevel') return { stdout: '/srv/kaido' };
+        if (args.join(' ') === 'remote get-url origin') return { stdout: 'https://github.com/Plag-509-5/bot.git' };
+        throw new Error(`commande inattendue ${args.join(' ')}`);
+      }
+    });
+    assert.equal(result.root, '/srv/kaido');
+    assert.equal(result.repository, 'Plag-509-5/bot');
+  } finally {
+    if (previousPath === undefined) delete process.env.BOT_REPO_PATH;
+    else process.env.BOT_REPO_PATH = previousPath;
+  }
+
+  await assert.rejects(updater.getOriginRepository({
+    cwd: '/home',
+    run: async () => {
+      throw new Error('Échec de Git (rev-parse --show-toplevel) : fatal: not a git repository');
+    }
+  }), /BOT_REPO_PATH/);
 });
 
 test('masque un token dans les erreurs de l’API GitHub', async () => {
