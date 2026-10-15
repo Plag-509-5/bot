@@ -280,22 +280,18 @@ test('la carte audio est animée, brandée et utilise Poppins SemiBold', () => {
     durationSeconds: 65
   });
 
-  assert.equal(audioStatus.BRANDING.title, 'MUGIWARA NO PLAG');
-  assert.equal(audioStatus.BRANDING.subtitle, 'DEVELOPER DE KAIDO MD');
-  assert.match(graph, /showwaves=s=640x300/);
+  assert.equal(audioStatus.BRANDING.title, 'Kaido-MD');
+  assert.equal(audioStatus.BRANDING.subtitle, 'Développeur : PlagTech');
+  assert.equal(audioStatus.BRANDING.tags, 'À LA GLOIRE DE KAIDO');
+  assert.match(graph, /showwaves=s=520x260/);
+  assert.match(graph, /\[1:v\]scale=720:1280/);
   assert.match(graph, /drawtext=fontfile=\/app\/assets\/fonts\/Poppins-SemiBold\.ttf/);
-  assert.match(graph, /0x0B0D19/);
+  assert.match(graph, /0x080A12/);
   assert.match(graph, /alpha='min\(1,max\(0,/);
-  assert.match(graph, /600\*t\/65\.00/);
-  const personalGraph = audioStatus.buildAudioStatusFilterGraph({
-    fontPath: '/app/assets/fonts/Poppins-SemiBold.ttf',
-    textPaths: paths,
-    durationSeconds: 65,
-    design: { background: '0x0B1020', cyan: '0x25D366' }
-  });
-  assert.match(personalGraph, /0x0B1020/);
-  assert.match(personalGraph, /colors=0x25D366/);
-  assert.match(graph, /colors=0x58E1E8/, 'le branding KAIDO reste la valeur par défaut des statuts de groupe');
+  assert.match(graph, /520\*t\/65\.00/);
+  assert.match(graph, /colors=0x72DDF7/, 'le cadre Kaido utilise la même palette pour les statuts personnels et de groupe');
+  assert.equal(audioStatus.DESIGN.fps, 15);
+  assert.ok(fs.existsSync(audioStatus.KAIDO_FRAME_PATH));
   assert.ok(fs.existsSync(audioStatus.FONT_CANDIDATES[0]));
   assert.ok(fs.existsSync(path.join(__dirname, '..', 'assets', 'fonts', 'OFL-Poppins.txt')));
   assert.equal(audioStatus.formatTime(65), '01:05');

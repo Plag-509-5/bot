@@ -30,8 +30,8 @@
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
-  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast`; gère l’audience par session avec `.setstatusviewers`, `.tostatus new group`, `.tostatus add` et `.tostatus export`. `.delstatus` retire la dernière publication suivie. L’audio est converti en vidéo verticale stylisée, avec le branding Toumaï.
-  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** en privé, le propriétaire choisit le groupe cible; dans un groupe ouvert, tous les membres peuvent publier directement sur son statut et reçoivent la confirmation dans ce groupe. Dans un groupe admin-only, le compte du bot doit être administrateur. Les textes ont une palette sombre personnalisée; les audios deviennent une vidéo animée avec waveform, police Poppins et signature « MUGIWARA NO PLAG • DEVELOPER DE KAIDO MD ».
+  - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast`; gère l’audience par session avec `.setstatusviewers`, `.tostatus new group`, `.tostatus add` et `.tostatus export`. `.delstatus` retire la dernière publication suivie. Les statuts audio utilisent un cadre illustré Kaido, une waveform animée et la marque « Kaido-MD — Développeur : PlagTech ».
+  - **Statuts de groupe (`.swgc`, alias `.gcstatus`) :** en privé, le propriétaire choisit le groupe cible; dans un groupe ouvert, tous les membres peuvent publier directement sur son statut et reçoivent la confirmation dans ce groupe. Dans un groupe admin-only, le compte du bot doit être administrateur. Les textes ont une palette sombre personnalisée; les audios utilisent le même cadre Kaido, la même waveform et la même marque que `.tostatus`.
   - Création de Stickers statiques et animés (`.s`, `.sticker`).
   - Traducteur multilingue avec détection automatique (`.tr`, `.translate`).
   - Capture d'écran de pages web en direct (`.ssweb`).
@@ -260,7 +260,7 @@ COBALT_API_KEY=
 PEXELS_API_KEY=
 
 # Facultatif : durée/quota antidelete et limites de .tourl
-ANTIDELETE_STORE_MAX=1500
+ANTIDELETE_STORE_MAX=400
 ANTIDELETE_RETENTION_MS=86400000
 TOURL_MAX_BYTES=104857600
 TOURL_TIMEOUT_MS=60000
@@ -293,7 +293,7 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 - `.ad p` surveille uniquement les discussions privées, y compris celles identifiées par un JID `@lid`.
 - `.ad g` surveille uniquement les groupes; `.ad all` active les deux modes et `.ad off` désactive la fonction.
 - L’alerte indique la personne qui a réellement envoyé la révocation, l’auteur original s’il est différent, puis le nom du contact ou du groupe.
-- Images, vidéos, audios, documents, stickers et médias à vue unique sont téléchargés puis renvoyés directement. Le store conserve les métadonnées 24 heures par défaut au lieu d’être vidé toutes les 20 minutes.
+- Images, vidéos, audios, documents, stickers et médias à vue unique sont téléchargés puis renvoyés directement. Le store conserve les métadonnées 24 heures par défaut; il ne collecte rien quand `.ad` est désactivé et qu’aucune commande réaction n’en a besoin, et reste borné à 400 messages par session (maximum configurable plafonné à 500).
 
 `.tourl` essaie les hébergeurs l’un après l’autre. Une erreur Catbox telle que HTTP 412 déclenche automatiquement le fournisseur suivant plutôt que d’interrompre la commande.
 
@@ -304,9 +304,9 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 - **Groupe fermé (`announce` / admin-only) :** le compte WhatsApp connecté au bot doit être administrateur du groupe pour publier le statut. Si le bot n’est pas admin, WhatsApp bloque le relay; `.swgc` l’indique au lieu de prétendre que la publication a réussi. Les membres qui ne peuvent pas écrire dans le groupe ne peuvent pas y envoyer la commande; un propriétaire peut utiliser le sélecteur privé.
 - Pour le fond d’un statut texte, utilisez une couleur (`violet`, `bleu nuit`, `cyan`, `rose`, `or`, `noir`, `blanc`, etc.) ou un hexadécimal (`#6f42c1`). Sans couleur, un fond sombre est tiré de la palette KAIDO.
 
-Les audios sont convertis en MP4 vertical animé: waveform cyan, progression violette, curseur or, chronomètre et signature « MUGIWARA NO PLAG — DEVELOPER DE KAIDO MD », composée avec Poppins SemiBold. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée.
+Les audios sont convertis en MP4 vertical animé sur le cadre illustré Kaido (Kaido à gauche, dragon à droite), avec waveform cyan, progression violette, curseur or, chronomètre, police Poppins SemiBold et signature « Kaido-MD — Développeur : PlagTech ». `.tostatus` et `.swgc` partagent ce visuel et cette marque. Le plugin utilise `@nyxcore/nyxcoresocket` pour télécharger/générer le contenu et le publie dans `groupStatusMessageV2` par le socket Baileys de la session, sans connexion WhatsApp supplémentaire. La caption déjà présente sur une image ou une vidéo citée est conservée.
 
-Le MP4 de `.swgc` est généré sur le disque persistant du bot dans `./tmp/audio-status` par défaut, pas dans `/tmp` (souvent limité ou monté en mémoire). Il n’a pas de plafond artificiel de taille de sortie et est envoyé en flux; son répertoire temporaire est supprimé après le relay, y compris en cas d’échec. Configure `AUDIO_STATUS_TEMP_DIR` si le volume de données du VPS se trouve ailleurs. Les files et le nombre de conversions FFmpeg simultanées restent bornés pour protéger les autres sessions.
+Le MP4 de `.swgc` et `.tostatus` est généré sur le disque persistant du bot dans `./tmp/audio-status` par défaut, pas dans `/tmp` (souvent limité ou monté en mémoire). Il n’a pas de plafond artificiel de taille de sortie et est envoyé en flux; son répertoire temporaire est supprimé après le relay, y compris en cas d’échec. Configure `AUDIO_STATUS_TEMP_DIR` si le volume de données du VPS se trouve ailleurs. Les files et le nombre de conversions FFmpeg simultanées restent bornés pour protéger les autres sessions.
 
 Le résolveur essaie `FFMPEG_PATH` s’il est défini, puis `ffmpeg-static` et enfin `ffmpeg` système. Si aucun binaire n’inclut `drawtext`, installez FFmpeg avec `libfreetype` ou configurez `FFMPEG_PATH` vers un binaire compatible.
 

@@ -9,23 +9,39 @@ const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
 const BRANDING = Object.freeze({
-  title: 'MUGIWARA NO PLAG',
-  subtitle: 'DEVELOPER DE KAIDO MD',
-  tags: 'KAIDO MD  •  STATUT AUDIO DE GROUPE'
+  title: 'Kaido-MD',
+  subtitle: 'Développeur : PlagTech',
+  tags: 'À LA GLOIRE DE KAIDO'
 });
 
 const DESIGN = Object.freeze({
   width: 720,
   height: 1280,
-  fps: 25,
-  background: '0x0B0D19',
-  panel: '0x15182A',
-  track: '0x282B42',
+  fps: 15,
+  background: '0x080A12',
+  panel: '0x080A12',
+  track: '0x34364A',
   gold: '0xFFD166',
-  cyan: '0x58E1E8',
+  cyan: '0x72DDF7',
   violet: '0xA879FF',
-  muted: '0xB8C0D9'
+  muted: '0xD0D1DC',
+  waveformWidth: 520,
+  waveformHeight: 260,
+  waveformY: 520,
+  waveformPanelX: 78,
+  waveformPanelY: 492,
+  waveformPanelWidth: 564,
+  waveformPanelHeight: 326,
+  progressX: 100,
+  progressY: 880,
+  progressWidth: 520,
+  clockY: 935,
+  titleY: 205,
+  subtitleY: 273,
+  tagsY: 348
 });
+
+const KAIDO_FRAME_PATH = path.join(__dirname, '../../assets/images/kaido-audio-status-frame.png');
 
 const FONT_CANDIDATES = Object.freeze([
   path.join(__dirname, '../../assets/fonts/Poppins-SemiBold.ttf'),
@@ -211,46 +227,59 @@ function createTextFilter(fontPath, textPath, size, color, x, y, extra = '') {
 }
 
 /** Construit le filtre animé à part pour que le rendu puisse être vérifié sans ffmpeg. */
-function buildAudioStatusFilterGraph({ fontPath, textPaths, durationSeconds, design: designOverrides = {} }) {
+function buildAudioStatusFilterGraph({
+  fontPath,
+  textPaths,
+  durationSeconds,
+  design: designOverrides = {},
+  framePath = KAIDO_FRAME_PATH
+}) {
   const design = { ...DESIGN, ...(designOverrides || {}) };
   const duration = safeDuration(durationSeconds, 1).toFixed(2);
-  const titleX = '(w-text_w)/2-560*exp(-3.5*t)+12*sin(2*PI*t/4)*(1-exp(-3*t))';
-  const subtitleY = '270+55*exp(-4*t)';
+  const waveformX = Math.round((design.width - design.waveformWidth) / 2);
+  const titleX = '(w-text_w)/2';
   const subtitleFade = "alpha='min(1,max(0,(t-0.35)/0.85))'";
-  const tagsPulse = "alpha='0.78+0.22*sin(2*PI*t/2.8)'";
+  const tagsPulse = "alpha='0.88+0.12*sin(2*PI*t/2.8)'";
+  const progress = design.progressWidth;
+  const progressX = design.progressX;
+  const progressY = design.progressY;
 
-  // Le fond, le bandeau et le panneau forment une carte sombre avec des accents
-  // violet/cyan. Les textes sont externalisés en fichiers pour conserver accents
-  // et apostrophes sans échapper du filtergraph.
   if (!textPaths || ['title', 'subtitle', 'tags', 'current', 'total'].some(key => !textPaths[key])) {
     throw new Error('Les fichiers de texte du statut audio sont incomplets.');
   }
   const textFiles = textPaths;
-
   const dt = (key, size, color, x, y, extra = '') =>
     createTextFilter(fontPath, textFiles[key], size, color, x, y, extra);
 
+  const base = framePath
+    ? `[1:v]scale=${design.width}:${design.height}:force_original_aspect_ratio=increase,`
+      + `crop=${design.width}:${design.height},setsar=1,format=rgba[art];`
+      + `[art]drawbox=x=${design.waveformPanelX}:y=${design.waveformPanelY}:`
+      + `w=${design.waveformPanelWidth}:h=${design.waveformPanelHeight}:color=${design.background}@0.68:t=fill,`
+      + `drawbox=x=${design.waveformPanelX}:y=${design.waveformPanelY}:`
+      + `w=${design.waveformPanelWidth}:h=${design.waveformPanelHeight}:color=${design.gold}@0.75:t=2,`
+      + `drawbox=x=${progressX}:y=${progressY}:w=${progress}:h=9:color=${design.track}:t=fill[base]`
+    : `color=c=${design.background}:s=${design.width}x${design.height}:r=${design.fps},`
+      + `drawbox=x=${design.waveformPanelX}:y=${design.waveformPanelY}:`
+      + `w=${design.waveformPanelWidth}:h=${design.waveformPanelHeight}:color=${design.panel}:t=fill,`
+      + `drawbox=x=${progressX}:y=${progressY}:w=${progress}:h=9:color=${design.track}:t=fill[base]`;
+
   return [
-    `color=c=${design.background}:s=${design.width}x${design.height}:r=${design.fps},`
-      + `drawbox=x=0:y=0:w=${design.width}:h=9:color=${design.violet}:t=fill,`
-      + `drawbox=x=0:y=${design.height - 9}:w=${design.width}:h=9:color=${design.cyan}:t=fill,`
-      + `drawbox=x=30:y=480:w=660:h=455:color=${design.panel}:t=fill,`
-      + `drawbox=x=30:y=480:w=660:h=4:color=${design.violet}:t=fill,`
-      + `drawbox=x=30:y=931:w=660:h=4:color=${design.cyan}:t=fill[bg]`,
-    `[0:a:0]showwaves=s=640x300:mode=cline:rate=${design.fps}:colors=${design.cyan},`
-      + 'format=rgba,colorkey=0x000000:0.15:0.1[wave]',
-    '[bg][wave]overlay=40:545[b1]',
-    `[b1]${dt('title', 46, design.gold, titleX, '178')},`
-      + `${dt('subtitle', 26, 'white', '(w-text_w)/2', subtitleY, subtitleFade)},`
-      + `${dt('tags', 20, design.cyan, '(w-text_w)/2', '330', tagsPulse)},`
-      + `drawbox=x=60:y=878:w=600:h=10:color=${design.track}:t=fill[b2]`,
-    `color=c=${design.violet}:s=600x10:r=${design.fps}[bar]`,
-    `[b2][bar]overlay=x='60-600+600*t/${duration}':y=878,`
-      + `drawbox=x=0:y=869:w=60:h=28:color=${design.panel}:t=fill[b3]`,
-    `color=c=${design.gold}:s=18x28:r=${design.fps}[knob]`,
-    `[b3][knob]overlay=x='51+600*t/${duration}':y=869[b4]`,
-    `[b4]${dt('current', 28, 'white', '60', '919')},`
-      + `${dt('total', 24, design.muted, '660-text_w', '919')},format=yuv420p[v]`
+    base,
+    `[0:a:0]showwaves=s=${design.waveformWidth}x${design.waveformHeight}:`
+      + `mode=cline:rate=${design.fps}:colors=${design.cyan},format=rgba,`
+      + 'colorkey=0x000000:0.12:0.1[wave]',
+    `[base][wave]overlay=${waveformX}:${design.waveformY}:shortest=1[b1]`,
+    `[b1]${dt('title', 48, design.gold, titleX, String(design.titleY))},`
+      + `${dt('subtitle', 25, 'white', titleX, String(design.subtitleY), subtitleFade)},`
+      + `${dt('tags', 22, design.cyan, titleX, String(design.tagsY), tagsPulse)}[b2]`,
+    `color=c=${design.violet}:s=${progress}x9:r=${design.fps}[bar]`,
+    `[b2][bar]overlay=x='${progressX}-${progress}+${progress}*t/${duration}':y=${progressY}[b3]`,
+    `color=c=${design.gold}:s=20x21:r=${design.fps}[knob]`,
+    `[b3][knob]overlay=x='${progressX}-10+${progress}*t/${duration}':y=${progressY - 6}[b4]`,
+    `[b4]${dt('current', 27, 'white', String(progressX), String(design.clockY))},`
+      + `${dt('total', 24, design.muted, `${progressX + progress}-text_w`, String(design.clockY))},`
+      + 'format=yuv420p[v]'
   ].join(';');
 }
 
@@ -288,7 +317,8 @@ async function renderAudioStatus(source, {
   maxInputBytes = MAX_AUDIO_INPUT_BYTES,
   maxOutputBytes = null,
   branding = BRANDING,
-  design = DESIGN
+  design = DESIGN,
+  framePath = KAIDO_FRAME_PATH
 } = {}, returnFile = false) {
   const ffmpegPath = await resolveFfmpeg();
   const fontPath = findFont();
@@ -317,6 +347,10 @@ async function renderAudioStatus(source, {
       throw new Error(`L’audio dure ${formatTime(duration)}; la limite de conversion est ${formatTime(maxDuration)}.`);
     }
     const durationText = duration.toFixed(2);
+    const visualFramePath = framePath ? path.resolve(framePath) : null;
+    if (visualFramePath && !fs.existsSync(visualFramePath)) {
+      throw new Error(`Le cadre illustré du statut audio est introuvable : ${visualFramePath}`);
+    }
 
     const writeText = async (filename, content) => {
       const fullPath = path.join(tempDir, filename);
@@ -338,14 +372,19 @@ async function renderAudioStatus(source, {
       fontPath,
       textPaths,
       durationSeconds: duration,
-      design
+      design,
+      framePath: visualFramePath
     });
+    const frameInputArgs = visualFramePath
+      ? ['-loop', '1', '-framerate', String(Number(design?.fps) || DESIGN.fps), '-i', visualFramePath]
+      : [];
 
     try {
       await execFileAsync(ffmpegPath, [
         '-hide_banner', '-loglevel', 'error', '-y',
         '-filter_complex_threads', '1',
         '-i', inputPath,
+        ...frameInputArgs,
         '-filter_complex', graph,
         '-map', '[v]', '-map', '0:a:0',
         '-t', durationText,
@@ -412,6 +451,7 @@ function audioToStatusVideoFile(stream, options = {}) {
 module.exports = {
   BRANDING,
   DESIGN,
+  KAIDO_FRAME_PATH,
   FONT_CANDIDATES,
   MAX_AUDIO_INPUT_BYTES,
   MAX_AUDIO_CONCURRENT_JOBS,

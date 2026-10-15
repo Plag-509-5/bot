@@ -36,23 +36,9 @@ const {
 } = require('../../services/group-status-audio');
 const { personalStatus } = require('../../handlers/status');
 
-const PERSONAL_STATUS_BRANDING = Object.freeze({
-  title: 'LE SEIGNEUR DES APPAREILS',
-  subtitle: 'PÈRE FONDATEUR DE TOUMAÏ MD',
-  tags: "EXPERT EN IA  •  PASSIONNÉ D'INFORMATIQUE"
-});
-
-const PERSONAL_STATUS_DESIGN = Object.freeze({
-  ...DESIGN,
-  fps: 15,
-  background: '0x0B1020',
-  panel: '0x151F30',
-  track: '0x1F2937',
-  gold: '0x25D366',
-  cyan: '0x25D366',
-  violet: '0x25D366',
-  muted: '0x9CA3AF'
-});
+// Les statuts personnels et de groupe partagent le même cadre Kaido et la même marque.
+const PERSONAL_STATUS_BRANDING = BRANDING;
+const PERSONAL_STATUS_DESIGN = DESIGN;
 
 function positiveLimitFromEnv(name, fallback, min, max) {
   const value = Number(process.env[name]);

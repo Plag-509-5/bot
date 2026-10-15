@@ -330,7 +330,7 @@ test('conserve une vidéo citée et retire la commande d’une caption de média
   assert.equal(tostatus._test.commandCaptionText('!to+status Texte', '!', 'to+status'), 'Texte');
 });
 
-test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï', async () => {
+test('audio de statut personnel utilise le cadre Kaido partagé avec swgc', async () => {
   resetLog();
   const { socket, sent, relayed } = fakeSocket();
   const audio = { mimetype: 'audio/ogg', ptt: true, seconds: 180, caption: 'mon audio' };
@@ -367,10 +367,12 @@ test('audio de statut devient vidéo mp4 stylisée et utilise le visuel Toumaï'
   assert.equal(statusSend.message.videoMessage.caption, 'mon audio');
   assert.ok(statusSend.message.videoMessage.url || statusSend.message.videoMessage.directPath);
   assert.equal(converterOptions.durationSeconds, 180);
-  assert.equal(converterOptions.branding.title, 'LE SEIGNEUR DES APPAREILS');
-  assert.equal(converterOptions.branding.subtitle, 'PÈRE FONDATEUR DE TOUMAÏ MD');
-  assert.equal(converterOptions.design.cyan, '0x25D366');
-  assert.equal(converterOptions.design.background, '0x0B1020');
+  assert.equal(converterOptions.branding.title, 'Kaido-MD');
+  assert.equal(converterOptions.branding.subtitle, 'Développeur : PlagTech');
+  assert.equal(converterOptions.design.cyan, '0x72DDF7');
+  assert.equal(converterOptions.design.background, '0x080A12');
+  assert.equal(tostatus._test.PERSONAL_STATUS_BRANDING, audioStatus.BRANDING);
+  assert.equal(tostatus._test.PERSONAL_STATUS_DESIGN, audioStatus.DESIGN);
 });
 
 test('nettoie le MP4 temporaire et libère le slot média après un échec de publication', async () => {

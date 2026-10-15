@@ -45,6 +45,7 @@ const {
 const {
   modeAllowsChat,
   normaliseAntideleteMode,
+  shouldCacheIncomingMessage,
   unwrapMessage: unwrapAntideleteMessage,
   resolveOriginalAuthor,
   resolveRevoker,
@@ -61,7 +62,7 @@ const {
 } = require('../services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd');
-const { findReactionCommand, initReactionDb } = require('../features/reaction_cmd');
+const { findReactionCommand, getAllReactionCommands, initReactionDb } = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
 const {
@@ -145,6 +146,7 @@ const {
 } = require('../services/pairing-code-url');
 const { resolvePairingNumber } = require('../services/pairing-code-input');
 const { resolveReactionTargetMessage } = require('../services/reaction-target-message');
+const { createBoundedCache, isBoundedCache } = require('../services/bounded-cache');
 const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
@@ -819,31 +821,29 @@ const otpStore = new Map();
 // ANTIDELETE STORE — Store en mémoire par session
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
-const messageStoreTimes = new Map(); // sessionNumber → Map<msgId, storedAt>
+const messageStoreTimes = new WeakMap(); // msgObject → storedAt (sans deuxième Map de clés par session)
 
-const STORE_MAX_PER_SESSION = Math.max(500, Number(process.env.ANTIDELETE_STORE_MAX) || 1500);
-const STORE_RETENTION_MS = Math.max(20 * 60 * 1000, Number(process.env.ANTIDELETE_RETENTION_MS) || 24 * 60 * 60 * 1000);
+const configuredStoreLimit = Number(process.env.ANTIDELETE_STORE_MAX);
+const STORE_MAX_PER_SESSION = Number.isInteger(configuredStoreLimit) && configuredStoreLimit > 0
+  ? Math.max(50, Math.min(500, configuredStoreLimit))
+  : 400;
+const configuredRetentionMs = Number(process.env.ANTIDELETE_RETENTION_MS);
+const STORE_RETENTION_MS = Number.isFinite(configuredRetentionMs) && configuredRetentionMs > 0
+  ? Math.max(20 * 60 * 1000, configuredRetentionMs)
+  : 24 * 60 * 60 * 1000;
 const STORE_CLEAN_INTERVAL = 20 * 60 * 1000;
 
 function getSessionStore(sessionNumber) {
   if (!messageStores.has(sessionNumber)) messageStores.set(sessionNumber, new Map());
-  if (!messageStoreTimes.has(sessionNumber)) messageStoreTimes.set(sessionNumber, new Map());
   return messageStores.get(sessionNumber);
 }
 
 function deleteStoredMessage(sessionNumber, msgId) {
-  getSessionStore(sessionNumber).delete(msgId);
-  messageStoreTimes.get(sessionNumber)?.delete(msgId);
-}
-
-function clearSessionStore(sessionNumber) {
-  getSessionStore(sessionNumber).clear();
-  messageStoreTimes.get(sessionNumber)?.clear();
+  messageStores.get(sessionNumber)?.delete(msgId);
 }
 
 function deleteSessionStore(sessionNumber) {
   messageStores.delete(sessionNumber);
-  messageStoreTimes.delete(sessionNumber);
 }
 
 function storeMessage(sessionNumber, msg) {
@@ -853,44 +853,62 @@ function storeMessage(sessionNumber, msg) {
   if (unwrapAntideleteMessage(msg.message).message?.protocolMessage?.type === 0) return;
 
   const store = getSessionStore(sessionNumber);
-  const times = messageStoreTimes.get(sessionNumber);
 
-  // Quota dépassé → supprimer les entrées les plus anciennes sans vider les
-  // conversations récentes. Les objets Baileys ne contiennent pas les buffers.
+  // Quota borné pour libérer les plus anciens messages si le cache est actif.
   while (store.size >= STORE_MAX_PER_SESSION) {
     const oldestKey = store.keys().next().value;
     if (!oldestKey) break;
     store.delete(oldestKey);
-    times.delete(oldestKey);
   }
 
   // Réinsérer actualise aussi l'ordre LRU de la Map.
   store.delete(msg.key.id);
   store.set(msg.key.id, msg);
-  times.set(msg.key.id, Date.now());
+  messageStoreTimes.set(msg, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
-  return getSessionStore(sessionNumber).get(msgId) || null;
+  return messageStores.get(sessionNumber)?.get(msgId) || null;
 }
 
-// Nettoyage par TTL : l'ancien code vidait tout toutes les 20 minutes, ce qui
-// rendait impossible la récupération d'un message supprimé plus tard.
+// Nettoyage par TTL : le WeakMap évite une seconde Map de timestamps et ses
+// clés dupliquées. Les objets Baileys ne contiennent pas les blobs media.
 const antideleteCleaner = setInterval(() => {
   const expiresBefore = Date.now() - STORE_RETENTION_MS;
   for (const [sessionNumber, store] of messageStores.entries()) {
-    const times = messageStoreTimes.get(sessionNumber) || new Map();
     let removed = 0;
-    for (const [msgId, storedAt] of times.entries()) {
+    for (const [msgId, message] of store.entries()) {
+      const storedAt = messageStoreTimes.get(message) || 0;
       if (storedAt > expiresBefore) continue;
       store.delete(msgId);
-      times.delete(msgId);
       removed += 1;
     }
     if (removed) console.log(`[ANTIDELETE] ${removed} ancien(s) message(s) nettoyé(s) pour ${sessionNumber}`);
+    if (!store.size) messageStores.delete(sessionNumber);
   }
 }, STORE_CLEAN_INTERVAL);
 antideleteCleaner.unref?.();
+
+const MOVIE_SUBTITLE_CACHE_MAX = 100;
+const MOVIE_SUBTITLE_MAX_CHARS = 8192;
+
+function getMovieSubtitleCache() {
+  if (!isBoundedCache(global.movieSubCache)) {
+    global.movieSubCache = createBoundedCache({ maxEntries: MOVIE_SUBTITLE_CACHE_MAX, maxAgeMs: 6 * 60 * 60 * 1000 });
+  }
+  return global.movieSubCache;
+}
+
+function cacheMovieSubtitles(subjectId, subtitles) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return;
+  const value = typeof subtitles === 'string' ? subtitles.slice(0, MOVIE_SUBTITLE_MAX_CHARS) : 'None';
+  getMovieSubtitleCache().set(String(subjectId).slice(0, 200), value || 'None');
+}
+
+function getCachedMovieSubtitles(subjectId) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return undefined;
+  return getMovieSubtitleCache().get(String(subjectId).slice(0, 200));
+}
 
 // ---------------- helpers kept/adapted ----------------
 
@@ -1557,24 +1575,40 @@ function handleGroupStatusMention(socket, sessionId) {
 }
 // ---------------- command handlers ----------------
 function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', ({ messages }) => withCommandTheme(async () => {
+  socket.ev.on('messages.upsert', ({ messages = [] } = {}) => withCommandTheme(async () => {
+    if (!Array.isArray(messages) || !messages.length) return;
     const msg = messages[0];
-    // ── STORE des messages privés/groupes pour antidelete ──
-  for (const m of messages) {
-    if (m?.key?.id && m?.message && modeAllowsChat('all', m.key.remoteJid)) {
-      // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe est
-      // indispensable pour identifier correctement l'auteur et le suppresseur.
-      storeMessage(number, m);
-    }
-  }
-    
-    // 1. Vérifications de base
-    if (!msg || !msg.message) return;
-    
+    if (!msg?.message || !msg?.key?.remoteJid) return;
+
     const remoteJid = msg.key.remoteJid;
-    if (!remoteJid) return;
     if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
-    
+
+    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
+    const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+    const cfg = await loadSessionConfigMerged(sessionId);
+    const hasReactionCommands = getAllReactionCommands(sanitizedBot).length > 0;
+
+    // Le store n'est utile que pour l'anti-delete activé ou les commandes par
+    // réaction. Auparavant chaque session y gardait tous les messages même si
+    // la fonctionnalité était désactivée.
+    if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommands) {
+      deleteSessionStore(sanitizedBot);
+    } else {
+      for (const incoming of messages) {
+        if (!incoming?.key?.id || !incoming?.message) continue;
+        if (unwrapAntideleteMessage(incoming.message).message?.reactionMessage) continue;
+        if (shouldCacheIncomingMessage({
+          antideleteMode: cfg.antidelete,
+          hasReactionCommands,
+          chatId: incoming.key.remoteJid
+        })) {
+          // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe
+          // permet d'identifier correctement auteur et suppresseur.
+          storeMessage(sanitizedBot, incoming);
+        }
+      }
+    }
+
     // 2. Déterminer le type de message pour extraire le body
     const type = getContentType(msg.message);
     
@@ -1585,14 +1619,13 @@ function setupCommandHandlers(socket, number) {
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
       const emojiReact = reactionMsg.text;
-      const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedReactCmd = findReactionCommand(emojiReact, sanitizedBot);
       if (matchedReactCmd && matchedReactCmd.command) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
         const targetMsg = await resolveReactionTargetMessage({
-          cachedMessage: getStoredMessage(number, targetMsgId),
+          cachedMessage: getStoredMessage(sanitizedBot, targetMsgId),
           socket,
           targetKey: { ...targetKey, remoteJid: targetChat }
         });
@@ -1606,7 +1639,7 @@ function setupCommandHandlers(socket, number) {
         const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
         // Vérifier le mode privé et les droits avec la même source que les commandes texte.
-        const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+        const sessionCfg = cfg;
         const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
         const reactorAccess = resolveAccess({
           identifiers: reactorIdentifiers,
@@ -1725,7 +1758,7 @@ function setupCommandHandlers(socket, number) {
       const stickerSessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedCmd = findStickerCommand(stickerMsgObj, stickerSessionId);
       if (matchedCmd && matchedCmd.command) {
-        const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
+        const stickerCfg = cfg;
         const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
         body = `${cmdPrefix}${matchedCmd.command}`;
         console.log(`🎯 [STICKER-CMD] Sticker identifié ! Déclenchement automatique de : "${body}"`);
@@ -1751,11 +1784,7 @@ function setupCommandHandlers(socket, number) {
     // Normaliser le body
     const normalizedBody = (typeof body === 'string') ? body.trim() : '';
     
-    // --- Chargement de la configuration du bot (persistante) ---
-    // Utiliser le numéro passé en paramètre (identifiant de session)
-    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
-    const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
+    // La configuration de session a été chargée une fois au début de l’upsert.
 
     // Les réponses numériques des sélecteurs `.swgc` et `.tostatus new group`
     // sont traitées avant le routeur de commandes, en distinguant leur intention.
@@ -1964,8 +1993,6 @@ function setupCommandHandlers(socket, number) {
       ? normalizedBotJid
       : (msg.key.participant || remoteJid);
     const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
-    const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
-    const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
     const sessionCfg = cfg;
 
     // WhatsApp utilise parfois un LID dans les groupes. participantAlt fournit
@@ -3387,16 +3414,13 @@ case 'silent': {
         const results = data.results.slice(0, 5); // 5 max pour le carousel WA
         const cards = [];
 
-        // Initialiser le cache des sous-titres si nécessaire
-        if (!global.movieSubCache) global.movieSubCache = {};
-
         for (let i = 0; i < results.length; i++) {
             const movie = results[i];
             const title = (movie.title || "Inconnu").slice(0, 50);
             const isSeries = movie.subjectType === 2; 
 
-            // Stocker les sous-titres dans le cache global
-            global.movieSubCache[movie.subjectId] = movie.subtitles || "None";
+            // Cache LRU borné : les recherches ponctuelles ne font plus grossir le heap sans limite.
+            cacheMovieSubtitles(movie.subjectId, typeof movie.subtitles === 'string' ? movie.subtitles : 'None');
             
             const subText = movie.subtitles ? movie.subtitles.split(',').slice(0, 3).join(', ') + "..." : 'Aucun';
             const desc = `⭐ IMDb: ${movie.imdbRatingValue || 'N/A'}\n` +
@@ -3499,7 +3523,7 @@ case 'smsubs': {
             break;
         }
         
-        const cachedSubs = global.movieSubCache?.[movieId];
+        const cachedSubs = getCachedMovieSubtitles(movieId);
         if (!cachedSubs || cachedSubs === 'None') {
             await socket.sendMessage(sender, { 
                 text: "🩸 Aucun sous-titre disponible pour ce média." 
@@ -6084,7 +6108,7 @@ case 'ad': {
     // ── Sous-commandes ──
     if (sub === 'status') {
       const mode = normaliseAntideleteMode(cfg.antidelete);
-      const storeSize = getSessionStore(sanitized).size;
+      const storeSize = messageStores.get(sanitized)?.size || 0;
       const modeLabel = mode === 'all' ? '🌐 Tout (groupes + privé)'
                       : mode === 'g'   ? '👥 Groupes seulement'
                       : mode === 'p'   ? '💬 Privé seulement'
@@ -6103,7 +6127,9 @@ case 'ad': {
 
     if (sub === 'off') {
       cfg.antidelete = 'off';
-      clearSessionStore(sanitized);
+      // Les anciennes entrées restent utiles si des réactions déclenchent des
+      // commandes; sinon on libère immédiatement le cache de cette session.
+      if (!getAllReactionCommands(sanitized).length) deleteSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {
@@ -9768,14 +9794,16 @@ END:VCARD`
         text: '⚠️ Format de lien invalide.\nAssurez‑vous qu’il ressemble à :\nhttps://whatsapp.com/channel/xxxxxxxxx'
       }, { quoted: shonux });
     }
-    const inviteId = match[1];
+    const inviteId = match[1].slice(0, 128);
 
-    // --- Cache mémoire simple pour éviter appels répétés (TTL 10 minutes)
-    if (!global.__whatsapp_channel_cache) global.__whatsapp_channel_cache = new Map();
+    // Cache LRU borné, avec expiration : le TTL seul laissait les vieilles clés
+    // oubliées en mémoire quand les liens n’étaient consultés qu’une fois.
+    if (!isBoundedCache(global.__whatsapp_channel_cache)) {
+      global.__whatsapp_channel_cache = createBoundedCache({ maxEntries: 128, maxAgeMs: 10 * 60 * 1000 });
+    }
     const cacheKey = `channel_${inviteId}`;
     const cached = global.__whatsapp_channel_cache.get(cacheKey);
-    const now = Date.now();
-    if (cached && (now - cached._ts) < (10 * 60 * 1000)) {
+    if (cached) {
       const metadata = cached.metadata;
       if (process.env.LOG_LEVEL === 'debug') console.debug('[CID] renvoi depuis le cache pour', inviteId);
       const infoTextCached = buildChannelInfoText(metadata, botName);
@@ -9840,15 +9868,26 @@ END:VCARD`
       }, { quoted: shonux });
     }
 
+    const safeMetadataText = (value, maxLength = 256) => {
+      if (value instanceof Date && Number.isFinite(value.getTime())) value = value.toISOString();
+      if (typeof value !== 'string' && typeof value !== 'number') return null;
+      const text = String(value).trim().slice(0, maxLength);
+      return text || null;
+    };
+    const rawPreview = metadata.preview || metadata.thumbnail || metadata.image || null;
+    const preview = typeof rawPreview === 'string'
+      ? rawPreview.slice(0, 2048)
+      : (typeof rawPreview?.url === 'string' ? rawPreview.url.slice(0, 2048) : null);
+    const subscriberCount = Number(metadata.subscribers ?? metadata.subscriberCount ?? metadata.followers);
     const normalized = {
-      id: metadata.id || inviteId,
-      name: metadata.name || metadata.title || null,
-      subscribers: (typeof metadata.subscribers === 'number') ? metadata.subscribers : (metadata.subscriberCount || metadata.followers || null),
-      creation_time: metadata.creation_time || metadata.createdAt || metadata.created_at || null,
-      preview: metadata.preview || metadata.thumbnail || metadata.image || null,
-      description: metadata.description || metadata.about || null,
-      category: metadata.category || null,
-      owner: metadata.owner || metadata.creator || null
+      id: safeMetadataText(metadata.id || inviteId, 256),
+      name: safeMetadataText(metadata.name || metadata.title, 256),
+      subscribers: Number.isFinite(subscriberCount) ? subscriberCount : null,
+      creation_time: safeMetadataText(metadata.creation_time || metadata.createdAt || metadata.created_at, 64),
+      preview,
+      description: safeMetadataText(metadata.description || metadata.about, 1200),
+      category: safeMetadataText(metadata.category, 100),
+      owner: safeMetadataText(metadata.owner || metadata.creator, 256)
     };
 
     // --- Persister dans le cache mémoire
@@ -9879,9 +9918,10 @@ END:VCARD`
     }
 
     function normalizePreviewUrl(preview) {
-      if (!preview) return null;
-      if (preview.startsWith('http')) return preview;
-      return `https://pps.whatsapp.net${preview}`;
+      if (typeof preview !== 'string' || !preview) return null;
+      const value = preview.slice(0, 2048);
+      if (/^https?:\/\//i.test(value)) return value;
+      return `https://pps.whatsapp.net${value.startsWith('/') ? '' : '/'}${value}`;
     }
 
     const infoText = buildChannelInfoText(normalized, botName);

@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const {
   isPrivateChat,
   modeAllowsChat,
+  shouldCacheIncomingMessage,
   unwrapMessage,
   resolveOriginalAuthor,
   resolveRevoker,
@@ -29,6 +30,18 @@ test('.ad p accepte les discussions privées PN et LID mais refuse groupes/statu
   assert.equal(modeAllowsChat('p', '120363000000000@g.us'), false);
   assert.equal(modeAllowsChat('p', 'status@broadcast'), false);
   assert.equal(modeAllowsChat('g', '120363000000000@g.us'), true);
+});
+
+test('ne met en cache les messages que si l’anti-delete ou une commande réaction en a besoin', () => {
+  const group = '120363000000000@g.us';
+  const privateChat = '50922222222@s.whatsapp.net';
+
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'off', chatId: group }), false);
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'g', chatId: group }), true);
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'g', chatId: privateChat }), false);
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'off', hasReactionCommands: true, chatId: group }), true);
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'off', hasReactionCommands: true, chatId: privateChat }), true);
+  assert.equal(shouldCacheIncomingMessage({ antideleteMode: 'all', chatId: 'status@broadcast' }), false);
 });
 
 test('identifie le vrai suppresseur privé depuis le message REVOKE et non le bot', () => {
