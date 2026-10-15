@@ -4,7 +4,60 @@ const crypto = require('node:crypto');
 const { waitForReady } = require('../lib/safe-send');
 
 const PERSONAL_STATUS_JID = 'status@broadcast';
+const STATUS_ACK_GRACE_MS = 1500;
 let nyxHelpersPromise = null;
+
+function createStatusAckMonitor(socket, messageId, graceMs = STATUS_ACK_GRACE_MS) {
+  const eventEmitter = socket?.ev;
+  if (!eventEmitter || typeof eventEmitter.on !== 'function') {
+    return { wait: async () => null, close() {} };
+  }
+
+  let resolveAck;
+  let waitPromise = null;
+  let timer = null;
+  let closed = false;
+  const ackPromise = new Promise(resolve => { resolveAck = resolve; });
+  const listener = updates => {
+    for (const item of Array.isArray(updates) ? updates : [updates]) {
+      if (item?.key?.id !== messageId) continue;
+      const status = item?.update?.status;
+      const code = item?.update?.messageStubParameters?.[0];
+      if (status === 0 || String(status).toUpperCase() === 'ERROR' || code !== undefined) {
+        resolveAck({ code: code === undefined ? '' : String(code) });
+        return;
+      }
+    }
+  };
+
+  eventEmitter.on('messages.update', listener);
+  return {
+    wait() {
+      if (!waitPromise) {
+        waitPromise = new Promise(resolve => {
+          timer = setTimeout(() => resolve(null), Math.max(0, Number(graceMs) || 0));
+          ackPromise.then(result => {
+            if (timer) clearTimeout(timer);
+            timer = null;
+            resolve(result);
+          });
+        });
+      }
+      return waitPromise;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (typeof eventEmitter.off === 'function') {
+        eventEmitter.off('messages.update', listener);
+      } else if (typeof eventEmitter.removeListener === 'function') {
+        eventEmitter.removeListener('messages.update', listener);
+      }
+    }
+  };
+}
 
 function loadNyxHelpers() {
   if (!nyxHelpersPromise) nyxHelpersPromise = import('@nyxcore/nyxcoresocket');
@@ -84,11 +137,30 @@ async function personalStatus(socket, content, options = {}) {
     throw new Error('NYXCORE n’a pas pu construire le statut personnel.');
   }
 
-  await socket.relayMessage(PERSONAL_STATUS_JID, generated.message, {
-    messageId: generated.key.id,
-    statusJidList,
-    useCachedGroupMetadata: false
-  });
+  const ackMonitor = createStatusAckMonitor(socket, generated.key.id);
+  try {
+    await socket.relayMessage(PERSONAL_STATUS_JID, generated.message, {
+      messageId: generated.key.id,
+      statusJidList,
+      useCachedGroupMetadata: false,
+      ...(options.additionalAttributes && typeof options.additionalAttributes === 'object'
+        ? { additionalAttributes: options.additionalAttributes }
+        : {}),
+      ...(typeof options.useUserDevicesCache === 'boolean'
+        ? { useUserDevicesCache: options.useUserDevicesCache }
+        : {})
+    });
+    const ackError = await ackMonitor.wait();
+    if (ackError) {
+      const code = ackError.code ? ` (code ${ackError.code})` : '';
+      const hint = ackError.code === '479'
+        ? ' Vérifie la résolution PN/LID et les destinataires du statut.'
+        : '';
+      throw new Error(`WhatsApp a rejeté le statut${code}.${hint}`);
+    }
+  } finally {
+    ackMonitor.close();
+  }
   // Baileys sendMessage ajoute aussi les messages sortants au flux local. Le
   // relay direct ne le fait pas, donc reproduire cet append sans bloquer l’envoi.
   queueOwnMessageUpsert(socket, generated);
@@ -218,5 +290,7 @@ module.exports = {
   installGroupStatusMethod,
   buildStatusContent,
   isGroupJid,
-  PERSONAL_STATUS_JID
+  PERSONAL_STATUS_JID,
+  STATUS_ACK_GRACE_MS,
+  createStatusAckMonitor
 };

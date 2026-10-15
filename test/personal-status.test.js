@@ -6,7 +6,9 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable } = require('node:stream');
+const { EventEmitter } = require('node:events');
 const { getStatusMediaQueueStats } = require('../src/services/status-media-queue');
+const { createStatusAckMonitor } = require('../src/handlers/status');
 const audioStatus = require('../src/services/group-status-audio');
 const audience = require('../src/services/status-audience');
 const statusLog = require('../src/services/status-log');
@@ -242,6 +244,104 @@ test('publie un statut texte avec statusJidList, option de fond et journal de su
   assert.equal(upserted[0].message.key.id, statusSend.options.messageId);
   assert.match(sent.at(-1).content.text, /Statut 📝 Texte publié/);
   assert.match(sent.at(-1).content.text, /\.delstatus/);
+});
+
+test('un compte migré publie uniquement vers des LID et conserve le routage pour delstatus', async () => {
+  resetLog();
+  const relayed = [];
+  const { socket, sent } = fakeSocket({
+    authState: {
+      creds: {
+        me: {
+          id: '50900000000:0@s.whatsapp.net',
+          lid: 'self-lid:4@lid'
+        }
+      }
+    },
+    signalRepository: {
+      lidMapping: {
+        async getLIDsForPNs(pns) {
+          assert.deepEqual(pns, [
+            '50922222222@s.whatsapp.net',
+            '50933333333@s.whatsapp.net'
+          ]);
+          return [
+            { pn: '50922222222@s.whatsapp.net', lid: 'contact-222:2@lid' },
+            { pn: '50933333333@s.whatsapp.net', lid: 'contact-333:1@lid' }
+          ];
+        }
+      }
+    }
+  });
+
+  await tostatus._test.executeToStatus(ownerContext(socket, {
+    sessionCfg: { STATUS_VIEWERS: ['50922222222', '50933333333'] },
+    args: ['LID routing']
+  }), { publishPersonalStatus: testStatusPublisher(relayed) });
+
+  const statusSend = relayed.find(event => event.jid === 'status@broadcast');
+  assert.deepEqual(
+    [...statusSend.options.statusJidList].sort(),
+    ['self-lid@lid', 'contact-222@lid', 'contact-333@lid'].sort()
+  );
+  assert.deepEqual(statusSend.options.additionalAttributes, { addressing_mode: 'lid' });
+  assert.equal(statusSend.options.useUserDevicesCache, undefined);
+  assert.equal(statusLog.getLatest('50900000000').addressingMode, 'lid');
+  assert.match(sent.at(-1).content.text, /visible par 2 destinataire/);
+
+  await tostatus._test.executeToStatus(ownerContext(socket, { command: 'delstatus', args: [] }));
+  const revoke = sent.find(event => event.jid === 'status@broadcast' && event.content.delete);
+  assert.deepEqual(
+    [...revoke.options.statusJidList].sort(),
+    ['self-lid@lid', 'contact-222@lid', 'contact-333@lid'].sort()
+  );
+  assert.deepEqual(revoke.options.additionalAttributes, { addressing_mode: 'lid' });
+  assert.equal(revoke.options.useUserDevicesCache, undefined);
+});
+
+test('annule la publication complète si une entrée de la liste n’a pas de mapping LID', async () => {
+  resetLog();
+  const relayed = [];
+  const { socket, sent } = fakeSocket({
+    authState: {
+      creds: {
+        me: {
+          id: '50900000000@s.whatsapp.net',
+          lid: 'self-lid@lid'
+        }
+      }
+    },
+    signalRepository: {
+      lidMapping: {
+        async getLIDsForPNs() {
+          return [{ pn: '50922222222@s.whatsapp.net', lid: 'contact-222@lid' }];
+        }
+      }
+    }
+  });
+
+  await tostatus._test.executeToStatus(ownerContext(socket, {
+    sessionCfg: { STATUS_VIEWERS: ['50922222222', '50933333333'] },
+    args: ['no partial status']
+  }), { publishPersonalStatus: testStatusPublisher(relayed) });
+
+  assert.equal(relayed.some(event => event.jid === 'status@broadcast'), false);
+  assert.equal(statusLog.getLatest('50900000000'), null);
+  assert.match(sent.at(-1).content.text, /Publication annulée/);
+  assert.match(sent.at(-1).content.text, /50933333333/);
+});
+
+test('surveille les erreurs de relay correspondant à l’identifiant du statut', async () => {
+  const ev = new EventEmitter();
+  const monitor = createStatusAckMonitor({ ev }, 'status-123', 100);
+  const resultPromise = monitor.wait();
+  ev.emit('messages.update', [
+    { key: { id: 'another-status' }, update: { status: 0, messageStubParameters: ['479'] } },
+    { key: { id: 'status-123' }, update: { status: 0, messageStubParameters: ['479'] } }
+  ]);
+  assert.deepEqual(await resultPromise, { code: '479' });
+  monitor.close();
+  assert.equal(ev.listenerCount('messages.update'), 0);
 });
 
 test('ne publie pas un statut adressé uniquement au propre compte du bot', async () => {

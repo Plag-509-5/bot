@@ -27,10 +27,127 @@ function normalizedUserJid(value) {
   const withoutDevice = raw.replace(/:\d+(?=@)/, '');
   if (/^\d{6,15}$/.test(withoutDevice)) return `${withoutDevice}@s.whatsapp.net`;
 
-  const match = withoutDevice.match(/^([^@]+)@(s\.whatsapp\.net|lid)$/);
+  const match = withoutDevice.match(/^([^@]+)@(s\.whatsapp\.net|hosted|lid|hosted\.lid)$/);
   if (!match) return '';
-  if (match[2] === 's.whatsapp.net' && !/^\d{6,15}$/.test(match[1])) return '';
+  if (['s.whatsapp.net', 'hosted'].includes(match[2]) && !/^\d{6,15}$/.test(match[1])) return '';
   return `${match[1]}@${match[2]}`;
+}
+
+function isPhoneNumberJid(jid) {
+  return typeof jid === 'string' && /@(?:s\.whatsapp\.net|hosted)$/.test(jid);
+}
+
+function isLidJid(jid) {
+  return typeof jid === 'string' && /@(?:lid|hosted\.lid)$/.test(jid);
+}
+
+async function getStatusJidMappings(mapping, sourceJids, direction) {
+  const resolved = new Map();
+  if (!sourceJids.length) return resolved;
+
+  const [bulkMethod, singleMethod, sourceProperty, targetProperty] = direction === 'pn-to-lid'
+    ? ['getLIDsForPNs', 'getLIDForPN', 'pn', 'lid']
+    : ['getPNsForLIDs', 'getPNForLID', 'lid', 'pn'];
+
+  let pairs;
+  if (typeof mapping?.[bulkMethod] === 'function') {
+    pairs = await mapping[bulkMethod](sourceJids);
+  } else if (typeof mapping?.[singleMethod] === 'function') {
+    pairs = await Promise.all(sourceJids.map(async source => {
+      const target = await mapping[singleMethod](source);
+      if (!target) return null;
+      return typeof target === 'string'
+        ? { [sourceProperty]: source, [targetProperty]: target }
+        : target;
+    }));
+  } else {
+    throw new Error('Le socket Baileys ne fournit pas le mapping PN/LID nécessaire.');
+  }
+
+  for (const pair of Array.isArray(pairs) ? pairs : []) {
+    const source = normalizedUserJid(pair?.[sourceProperty]);
+    const target = normalizedUserJid(pair?.[targetProperty]);
+    if (source && target) resolved.set(source, target);
+  }
+  return resolved;
+}
+
+/**
+ * Baileys 7 rc14 resolves status recipients using the sender's addressing
+ * mode. On LID-migrated accounts a PN-only statusJidList can therefore omit
+ * recipients (the server rejects it with ack 479). Route every recipient into
+ * the sender's address space before relay, never send a mixed PN/LID list.
+ */
+async function resolveStatusRelayAudience(socket, statusJidList = []) {
+  const ownPn = normalizedUserJid(socket?.authState?.creds?.me?.id || socket?.user?.id);
+  const ownLid = normalizedUserJid(socket?.authState?.creds?.me?.lid || socket?.user?.lid);
+  const useLidAddressing = Boolean(ownLid);
+  const ownJid = useLidAddressing ? ownLid : ownPn;
+  const candidates = [...new Set((Array.isArray(statusJidList) ? statusJidList : [])
+    .map(normalizedUserJid)
+    .filter(Boolean))];
+  const mapping = socket?.signalRepository?.lidMapping;
+  const outgoingByInput = new Map();
+
+  if (useLidAddressing) {
+    const pnToLid = new Map();
+    if (ownPn && ownLid) pnToLid.set(ownPn, ownLid);
+    const pendingPns = candidates.filter(jid => isPhoneNumberJid(jid) && !pnToLid.has(jid));
+    try {
+      const mapped = await getStatusJidMappings(mapping, pendingPns, 'pn-to-lid');
+      for (const [pn, lid] of mapped) {
+        if (isPhoneNumberJid(pn) && isLidJid(lid)) pnToLid.set(pn, lid);
+      }
+    } catch (error) {
+      throw new Error(`Impossible de résoudre les destinataires PN en LID : ${error?.message || error}`);
+    }
+
+    for (const jid of candidates) {
+      const target = isLidJid(jid) ? jid : pnToLid.get(jid);
+      if (target && isLidJid(target)) outgoingByInput.set(jid, target);
+    }
+  } else {
+    const lidToPn = new Map();
+    if (ownPn && ownLid) lidToPn.set(ownLid, ownPn);
+    const pendingLids = candidates.filter(jid => isLidJid(jid) && !lidToPn.has(jid));
+    try {
+      const mapped = await getStatusJidMappings(mapping, pendingLids, 'lid-to-pn');
+      for (const [lid, pn] of mapped) {
+        if (isLidJid(lid) && isPhoneNumberJid(pn)) lidToPn.set(lid, pn);
+      }
+    } catch (error) {
+      throw new Error(`Impossible de résoudre les destinataires LID en PN : ${error?.message || error}`);
+    }
+
+    for (const jid of candidates) {
+      const target = isPhoneNumberJid(jid) ? jid : lidToPn.get(jid);
+      if (target && isPhoneNumberJid(target)) outgoingByInput.set(jid, target);
+    }
+  }
+
+  const outgoing = [];
+  const seen = new Set();
+  const unresolvedJids = [];
+  for (const jid of candidates) {
+    const target = outgoingByInput.get(jid);
+    if (!target) {
+      // A PN and its LID can both be present in the source audience. If one
+      // resolved address already covers the other exact JID, it is not missing.
+      if (!seen.has(jid)) unresolvedJids.push(jid);
+      continue;
+    }
+    if (!seen.has(target)) {
+      seen.add(target);
+      outgoing.push(target);
+    }
+  }
+
+  return {
+    statusJidList: outgoing,
+    ownJid,
+    addressingMode: useLidAddressing ? 'lid' : null,
+    unresolvedJids
+  };
 }
 
 function parseStatusViewerNumbers(input) {
@@ -95,11 +212,11 @@ function participantLids(participant) {
     const normalized = raw.includes('@')
       ? normalizedUserJid(raw)
       : (/^\d+(?::\d+)?$/.test(raw) ? `${raw.split(':')[0]}@lid` : '');
-    if (normalized.endsWith('@lid') && !lids.includes(normalized)) lids.push(normalized);
+    if (isLidJid(normalized) && !lids.includes(normalized)) lids.push(normalized);
   }
   for (const value of [participant?.id, participant?.jid, participant?.participantAlt, participant?.remoteJidAlt]) {
     const normalized = normalizedUserJid(value);
-    if (normalized.endsWith('@lid') && !lids.includes(normalized)) lids.push(normalized);
+    if (isLidJid(normalized) && !lids.includes(normalized)) lids.push(normalized);
   }
   return lids;
 }
@@ -117,7 +234,7 @@ function participantPhoneNumber(participant) {
     const parsed = parseStatusViewerNumbers([value]);
     if (parsed.numbers.length) return parsed.numbers[0];
     const normalized = normalizedUserJid(value);
-    if (normalized.endsWith('@s.whatsapp.net')) return normalized.split('@')[0];
+    if (isPhoneNumberJid(normalized)) return normalized.split('@')[0];
   }
   return '';
 }
@@ -166,7 +283,7 @@ async function getGroupParticipantNumbers(socket, participants = []) {
   for (const item of mappings) {
     const lid = normalizedUserJid(item?.lid);
     const pn = normalizedUserJid(item?.pn);
-    if (lid.endsWith('@lid') && pn.endsWith('@s.whatsapp.net')) {
+    if (isLidJid(lid) && isPhoneNumberJid(pn)) {
       phoneByLid.set(lid, pn.split('@')[0]);
     }
   }
@@ -239,7 +356,7 @@ function contactEntries(contacts) {
 
 async function getStatusJidList(socket, configuredViewers = []) {
   if (!socket) throw new Error('Socket WhatsApp indisponible.');
-  const ownJid = normalizedUserJid(socket.user?.id);
+  const ownJid = normalizedUserJid(socket.authState?.creds?.me?.id || socket.user?.id);
   const hasCustomAudience = Array.isArray(configuredViewers)
     ? configuredViewers.length > 0
     : typeof configuredViewers === 'string' && Boolean(configuredViewers.trim());
@@ -327,5 +444,6 @@ module.exports = {
   getGroupParticipantNumbers,
   appendGroupParticipantsToStatusAudience,
   getStatusJidList,
+  resolveStatusRelayAudience,
   _test: { groupEntries, contactEntries, participantLids, participantPhoneNumber, defaultAudienceCache }
 };

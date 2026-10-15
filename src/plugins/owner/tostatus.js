@@ -7,6 +7,7 @@ const {
   normalizeSessionId: normalizeStatusSessionId,
   getStatusJidList,
   normalizedUserJid,
+  resolveStatusRelayAudience,
   parseStatusViewerNumbers,
   mergeStatusViewerNumbers,
   appendGroupParticipantsToStatusAudience,
@@ -238,9 +239,11 @@ async function deleteLatestStatus(context) {
       '📭 Aucun statut récent de cette session n’est disponible pour suppression. Les statuts journalisés expirent après 24 h et le journal est en mémoire.');
   }
 
-  await socket.sendMessage(STATUS_JID, { delete: latest.key }, {
-    statusJidList: latest.statusJidList
-  });
+  const revokeOptions = { statusJidList: latest.statusJidList };
+  if (latest.addressingMode === 'lid') {
+    revokeOptions.additionalAttributes = { addressing_mode: 'lid' };
+  }
+  await socket.sendMessage(STATUS_JID, { delete: latest.key }, revokeOptions);
   statusLog.removeLatest(sessionId, latest.key.id);
   return sendReply(socket, from, msg, `✅ Dernier statut supprimé (${latest.label || 'publication'}).`);
 }
@@ -571,17 +574,39 @@ async function executeToStatus(context, dependencies = {}) {
   let mediaDownloadSourceRef = null;
   let mediaUploadStreamRef = null;
   try {
-    if (image || video || audio) releaseMediaSlot = await acquireStatusMediaSlot();
     await reactToCommand(socket, from, msg, '⏳');
 
-    const statusJidList = await (dependencies.getStatusJidList || getStatusJidList)(
+    const configuredStatusJidList = await (dependencies.getStatusJidList || getStatusJidList)(
       socket,
       sessionCfg.STATUS_VIEWERS || []
     );
-    const ownJid = normalizedUserJid(socket.user?.id);
-    if (!statusJidList.length || statusJidList.every(jid => jid === ownJid)) {
-      throw new Error('Aucun autre destinataire trouvé. Utilise .setstatusviewers pour en ajouter.');
+    const relayAudience = await (dependencies.resolveStatusRelayAudience || resolveStatusRelayAudience)(
+      socket,
+      configuredStatusJidList
+    );
+    const {
+      statusJidList,
+      ownJid,
+      addressingMode,
+      unresolvedJids = []
+    } = relayAudience;
+    const recipientCount = statusJidList.filter(jid => jid !== ownJid).length;
+    if (unresolvedJids.length) {
+      const examples = unresolvedJids.slice(0, 5).map(jid => jid.split('@')[0]).join(', ');
+      const more = unresolvedJids.length > 5 ? ', …' : '';
+      throw new Error(
+        `Publication annulée : ${unresolvedJids.length} destinataire(s) n’ont pas de correspondance PN/LID fiable` +
+        `${examples ? ` (${examples}${more})` : ''}. Aucun statut n’a été envoyé. ` +
+        'Corrige la liste avec .setstatusviewers ou réimporte les membres du groupe.'
+      );
     }
+    if (!statusJidList.length || recipientCount === 0) {
+      throw new Error('Aucun autre destinataire résolvable. Utilise .setstatusviewers pour corriger la liste.');
+    }
+
+    // Vérifier l’audience avant de réserver la file média, afin que les recherches
+    // PN/LID n’occupent pas un slot de rendu si la publication doit être annulée.
+    if (image || video || audio) releaseMediaSlot = await acquireStatusMediaSlot();
 
     let content;
     let label;
@@ -680,6 +705,9 @@ async function executeToStatus(context, dependencies = {}) {
     }
 
     const messageOptions = { statusJidList, broadcast: true };
+    if (addressingMode === 'lid') {
+      messageOptions.additionalAttributes = { addressing_mode: 'lid' };
+    }
     if (content.text) {
       messageOptions.backgroundColor = '#000000';
       messageOptions.font = 0;
@@ -701,13 +729,14 @@ async function executeToStatus(context, dependencies = {}) {
         id: sent.key.id
       },
       statusJidList,
+      addressingMode,
       label,
       preview
     });
 
     await reactToCommand(socket, from, msg, '✅');
     return sendReply(socket, from, msg,
-      `✅ Statut ${label} publié, visible par ${statusJidList.length} destinataire(s).\n` +
+      `✅ Statut ${label} publié, visible par ${recipientCount} destinataire(s).\n` +
       `Pour le retirer : ${prefix}delstatus`);
   } catch (error) {
     const errorMessage = error?.message || String(error);

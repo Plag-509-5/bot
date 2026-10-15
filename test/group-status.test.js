@@ -477,6 +477,8 @@ test('Baileys classe correctement les médias après déballage du statut de gro
     /const getMediaType = \(message\) => \{\s+message = normalizeMessageContent\(message\) \|\| message;/,
     'le relay ne détecte pas le type du média à travers groupStatusMessageV2'
   );
+  assert.match(relaySource, /additionalAttributes: \{ \.\.\.\(options\.additionalAttributes \|\| \{\}\), \.\.\.additionalAttributes \}/);
+  assert.match(relaySource, /useUserDevicesCache: options\.useUserDevicesCache/);
   assert.deepEqual(patchRelaySource(relaySource), { source: relaySource, changed: false });
 
   const packageJson = require('../package.json');
@@ -496,12 +498,19 @@ test('le postinstall corrige le relay rc14 une seule fois', () => {
     '        if (message.imageMessage) {',
     "            return 'image';",
     '        }',
-    '    };'
+    '    };',
+    'await relayMessage(jid, fullMsg.message, {',
+    '    messageId: fullMsg.key.id,',
+    '    additionalAttributes,',
+    '    statusJidList: options.statusJidList',
+    '});'
   ].join('\n');
 
   const first = patchRelaySource(source);
   assert.equal(first.changed, true);
   assert.match(first.source, /message = normalizeMessageContent\(message\) \|\| message;/);
+  assert.match(first.source, /additionalAttributes: \{ \.\.\.\(options\.additionalAttributes \|\| \{\}\), \.\.\.additionalAttributes \}/);
+  assert.match(first.source, /useUserDevicesCache: options\.useUserDevicesCache/);
   const second = patchRelaySource(first.source);
   assert.equal(second.changed, false);
   assert.equal(second.source, first.source);
