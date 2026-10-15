@@ -1,7 +1,7 @@
 'use strict';
 
 const DEFAULT_SELECTION_TTL_MS = 5 * 60 * 1000;
-const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus']);
+const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus', 'style']);
 const pendingSelections = new Map();
 const selectedGroups = new Map();
 
@@ -20,6 +20,10 @@ function isPublicGroupStatusCommand(remoteJid, command) {
 
 function selectionKey(sessionId, actorId) {
   return `${normalizeSessionId(sessionId)}::${normalizeActorId(actorId)}`;
+}
+
+function selectedGroupKey(sessionId, actorId, purpose = 'swgc') {
+  return `${selectionKey(sessionId, actorId)}::${String(purpose || 'swgc').toLowerCase()}`;
 }
 
 function identityTokens(...values) {
@@ -146,28 +150,36 @@ function resolveGroupSelection(sessionId, actorId, input, options = {}) {
   const pendingKeys = pending.keys || [key];
   for (const pendingKey of pendingKeys) {
     pendingSelections.delete(pendingKey);
-    if (purpose === 'swgc') selectedGroups.set(pendingKey, group);
+    if (purpose === 'swgc' || purpose === 'style') {
+      selectedGroups.set(`${pendingKey}::${purpose}`, group);
+    }
   }
   return { status: 'selected', group, purpose };
 }
 
-function getSelectedGroup(sessionId, actorId) {
-  return selectedGroups.get(selectionKey(sessionId, actorId)) || null;
+function getSelectedGroup(sessionId, actorId, purpose = 'swgc') {
+  return selectedGroups.get(selectedGroupKey(sessionId, actorId, purpose)) || null;
 }
 
-function clearSelectedGroup(sessionId, actorId) {
-  return selectedGroups.delete(selectionKey(sessionId, actorId));
+function clearSelectedGroup(sessionId, actorId, purpose = 'swgc') {
+  return selectedGroups.delete(selectedGroupKey(sessionId, actorId, purpose));
 }
 
-function renderGroupSelectionList(groups, prefix = '.') {
+function renderGroupSelectionList(groups, prefix = '.', command = 'swgc') {
+  const isStyleMode = String(command || '').toLowerCase() === 'style';
+  const nextStep = isStyleMode
+    ? `Après la sélection : réponds à un audio avec ${prefix}style pour publier sa version vidéo stylisée.`
+    : `Après la sélection : ${prefix}swgc <texte>[, couleur] ou réponds à une image, une vidéo ou un audio brut avec ${prefix}swgc.`;
   const lines = [
     '👥 *CHOISIS LE GROUPE CIBLE*',
     '',
     ...groups.map((group, index) => `${index + 1}. ${cleanGroupName(group.subject)}${group.size ? ` — ${group.size} membres` : ''}`),
     '',
     'Réponds simplement avec le numéro du groupe.',
-    `Après la sélection : ${prefix}swgc <texte>[, couleur] ou réponds à un média avec ${prefix}swgc.`,
-    `Couleurs : nuit, noir, blanc, rouge, vert, bleu, jaune, violet, orange, rose, gris, cyan, turquoise, bleu nuit, or/doré ou #rrggbb. Alias : ${prefix}gcstatus.`,
+    nextStep,
+    ...(isStyleMode ? [] : [
+      `Couleurs : nuit, noir, blanc, rouge, vert, bleu, jaune, violet, orange, rose, gris, cyan, turquoise, bleu nuit, or/doré ou #rrggbb. Alias : ${prefix}gcstatus.`
+    ]),
     '',
     'MUGIWARA NO PLAG • developer de Kaido MD'
   ];
@@ -189,6 +201,7 @@ module.exports = {
   normalizeActorId,
   isPublicGroupStatusCommand,
   selectionKey,
+  selectedGroupKey,
   identityTokens,
   participantMatches,
   cleanGroupName,

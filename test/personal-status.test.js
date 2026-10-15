@@ -430,7 +430,7 @@ test('conserve une vidéo citée et retire la commande d’une caption de média
   assert.equal(tostatus._test.commandCaptionText('!to+status Texte', '!', 'to+status'), 'Texte');
 });
 
-test('audio de statut personnel utilise le cadre Kaido partagé avec swgc', async () => {
+test('audio de statut personnel conserve le cadre Kaido réutilisé par style', async () => {
   resetLog();
   const { socket, sent, relayed } = fakeSocket();
   const audio = { mimetype: 'audio/ogg', ptt: true, seconds: 180, caption: 'mon audio' };

@@ -12,15 +12,29 @@ const {
 } = require('../../services/group-status-selector');
 const { buildGroupStatusPayload } = require('../../services/group-status-content');
 const { isBotAdmin } = require('../../services/group-admins');
+const { BRANDING } = require('../../services/group-status-audio');
 
 function groupStatusConfirmation(type, subject) {
   const labels = {
     text: 'texte',
     image: 'image',
     video: 'vidéo',
-    audio: 'audio stylisé en vidéo'
+    audio: 'audio',
+    styledAudio: 'audio stylisé en vidéo'
   };
   return `Statut ${labels[type] || type} posté sur : ${subject}`;
+}
+
+function formatRawAudioStatusCaption(originalCaption, addedText) {
+  const original = String(originalCaption || '').trim();
+  const added = String(addedText || '').trim();
+  const watermark = `\n\n━━━━━━━━━━━━━━\n✨ *Publié par* ✨\n🐉 *${BRANDING.title} — ${BRANDING.subtitle}* 🐉`;
+  if (original && added) {
+    return `📝 *Caption originale* 📝\n❝ ${original} ❞\n\n💬 *Texte ajouté* 💬\n❝ ${added} ❞${watermark}`;
+  }
+  if (original) return `📝 *Caption* 📝\n❝ ${original} ❞${watermark}`;
+  if (added) return `💬 *Texte* 💬\n❝ ${added} ❞${watermark}`;
+  return `✨ *Statut audio du groupe* ✨${watermark}`;
 }
 
 async function sendContextReply(context, content) {
@@ -77,7 +91,10 @@ function ensureBotCanPublishStatus(metadata, socket) {
   }
 }
 
-async function executeSwgc(context, dependencies = {}) {
+async function executeGroupStatus(context, dependencies = {}, mode = {}) {
+  const commandName = mode.commandName || 'swgc';
+  const selectionPurpose = mode.selectionPurpose || 'swgc';
+  const audioMode = mode.audioMode || 'raw';
   const {
     socket,
     msg,
@@ -117,10 +134,9 @@ async function executeSwgc(context, dependencies = {}) {
   try {
     const target = isGroupCommand
       ? { jid: from, subject: 'ce groupe' }
-      : getSelectedGroup(sessionNumber, actorId);
+      : getSelectedGroup(sessionNumber, actorId, selectionPurpose);
 
-    // En privé, `.swgc` seul ouvre le sélecteur et permet aussi de changer un
-    // groupe déjà mémorisé. La réponse reste dans cette conversation privée.
+    // En privé, la commande choisit son groupe cible dans le contexte de cette session.
     if (!isGroupCommand && !quotedMsg && !textInput) {
       const groups = await listUserGroups(socket, identifiers);
       if (!groups.length) {
@@ -128,9 +144,9 @@ async function executeSwgc(context, dependencies = {}) {
           text: '❌ Aucun groupe commun n’a été trouvé entre cette session et ton compte.'
         });
       }
-      beginGroupSelection(sessionNumber, actorId, groups);
+      beginGroupSelection(sessionNumber, actorId, groups, Date.now(), selectionPurpose);
       return sendContextReply(context, {
-        text: renderGroupSelectionList(groups, prefix)
+        text: renderGroupSelectionList(groups, prefix, commandName)
       });
     }
 
@@ -141,9 +157,12 @@ async function executeSwgc(context, dependencies = {}) {
           text: '❌ Aucun groupe commun n’a été trouvé entre cette session et ton compte.'
         });
       }
-      beginGroupSelection(sessionNumber, actorId, groups);
+      beginGroupSelection(sessionNumber, actorId, groups, Date.now(), selectionPurpose);
+      const instruction = commandName === 'style'
+        ? `Choisis un groupe, puis réponds à l’audio avec ${prefix}style.`
+        : `Choisis d’abord le groupe, puis renvoie ta publication avec ${prefix}swgc.`;
       return sendContextReply(context, {
-        text: `⚠️ Choisis d’abord le groupe, puis renvoie ta publication.\n\n${renderGroupSelectionList(groups, prefix)}`
+        text: `⚠️ ${instruction}\n\n${renderGroupSelectionList(groups, prefix, commandName)}`
       });
     }
 
@@ -153,21 +172,24 @@ async function executeSwgc(context, dependencies = {}) {
     if (!isGroupCommand) {
       const stillMember = await ensureMembership(socket, target, identifiers, targetMetadata);
       if (!stillMember) {
-        clearSelectedGroup(sessionNumber, actorId);
+        clearSelectedGroup(sessionNumber, actorId, selectionPurpose);
         return sendContextReply(context, {
-          text: `❌ Tu ne fais plus partie de « ${target.subject} ». Relance ${prefix}swgc pour choisir un autre groupe.`
+          text: `❌ Tu ne fais plus partie de « ${target.subject} ». Relance ${prefix}${commandName} pour choisir un autre groupe.`
         });
       }
     }
 
     let downloadContent = dependencies.downloadContent;
     if (!downloadContent) {
-      const nyxBaileys = await import('@nyxcore/nyxcoresocket');
-      downloadContent = nyxBaileys.downloadContentFromMessage;
+      downloadContent = async (...parameters) => {
+        const nyxBaileys = await import('@nyxcore/nyxcoresocket');
+        return nyxBaileys.downloadContentFromMessage(...parameters);
+      };
     }
     builtStatus = await buildGroupStatusPayload({
       quotedMessage: quotedMsg,
       textInput,
+      audioMode,
       downloadContent,
       audioToStatusVideo: dependencies.audioToStatusVideo,
       audioToStatusVideoFile: dependencies.audioToStatusVideoFile
@@ -186,11 +208,17 @@ async function executeSwgc(context, dependencies = {}) {
     const sendOptions = targetMetadata?.announce ? { useCachedGroupMetadata: false } : undefined;
     await sendGroupStatus(target.jid, builtStatus.payload, sendOptions);
 
+    if (builtStatus.type === 'audio') {
+      await sendContextReply(context, {
+        text: formatRawAudioStatusCaption(builtStatus.originalCaption, builtStatus.textInput)
+      });
+    }
+
     return sendContextReply(context, {
       text: groupStatusConfirmation(builtStatus.type, target.subject)
     });
   } catch (error) {
-    console.error('[SWGC ERROR]', error);
+    console.error(`[${commandName.toUpperCase()} ERROR]`, error);
     return sendContextReply(context, {
       text: `❌ Publication impossible : ${error?.message || error}`
     });
@@ -198,9 +226,25 @@ async function executeSwgc(context, dependencies = {}) {
     try { builtStatus?.payload?.video?.stream?.destroy?.(); } catch {}
     if (typeof builtStatus?.cleanup === 'function') {
       try { await builtStatus.cleanup(); }
-      catch (error) { console.warn('[SWGC] Nettoyage du média temporaire échoué:', error?.message || error); }
+      catch (error) { console.warn(`[${commandName.toUpperCase()}] Nettoyage du média temporaire échoué:`, error?.message || error); }
     }
   }
+}
+
+async function executeSwgc(context, dependencies = {}) {
+  return executeGroupStatus(context, dependencies, {
+    commandName: 'swgc',
+    selectionPurpose: 'swgc',
+    audioMode: 'raw'
+  });
+}
+
+async function executeStyledAudioStatus(context, dependencies = {}) {
+  return executeGroupStatus(context, dependencies, {
+    commandName: 'style',
+    selectionPurpose: 'style',
+    audioMode: 'stylized'
+  });
 }
 
 module.exports = {
@@ -210,13 +254,18 @@ module.exports = {
   description: 'Publie un statut dans le groupe courant ou choisit un groupe en privé',
   usage: '.swgc [texte][, couleur] | répondre à un média avec .swgc',
   execute: executeSwgc,
+  executeStyledAudioStatus,
+  quotedMessageFromContext,
   _test: {
     groupStatusConfirmation,
+    formatRawAudioStatusCaption,
     sendContextReply,
     quotedMessageFromContext,
     ensureMembership,
     getGroupStatusMetadata,
     ensureBotCanPublishStatus,
-    executeSwgc
+    executeGroupStatus,
+    executeSwgc,
+    executeStyledAudioStatus
   }
 };

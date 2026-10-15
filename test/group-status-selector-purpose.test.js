@@ -34,3 +34,20 @@ test('le sélecteur swgc conserve son comportement historique par défaut', () =
   assert.equal(selection.purpose, 'swgc');
   assert.equal(selector.getSelectedGroup('5091', 'user-a').jid, '222@g.us');
 });
+
+test('le sélecteur style garde une cible distincte et autorise les commandes en groupe', () => {
+  clearPending();
+  selector.beginGroupSelection(
+    '5091',
+    'user-a',
+    [{ jid: '333@g.us', subject: 'Style' }],
+    1000,
+    'style'
+  );
+  const selection = selector.resolveGroupSelection('5091', 'user-a', '1', { now: 1001 });
+
+  assert.equal(selection.purpose, 'style');
+  assert.equal(selector.getSelectedGroup('5091', 'user-a'), null, 'la cible swgc reste indépendante');
+  assert.equal(selector.getSelectedGroup('5091', 'user-a', 'style').jid, '333@g.us');
+  assert.equal(selector.isPublicGroupStatusCommand('333@g.us', 'style'), true);
+});

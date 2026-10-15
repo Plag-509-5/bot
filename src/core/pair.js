@@ -1786,14 +1786,17 @@ function setupCommandHandlers(socket, number) {
     
     // La configuration de session a été chargée une fois au début de l’upsert.
 
-    // Les réponses numériques des sélecteurs `.swgc` et `.tostatus new group`
-    // sont traitées avant le routeur de commandes, en distinguant leur intention.
+    // Les réponses numériques des sélecteurs `.swgc`, `.style` et
+    // `.tostatus new group` sont distinguées avant le routeur de commandes.
     if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
       const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
       const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
       if (selection.status !== 'none') {
         const isStatusAudienceSelection = selection.purpose === STATUS_AUDIENCE_SELECTION_PURPOSE;
-        const selectionCommand = isStatusAudienceSelection ? 'tostatus' : 'swgc';
+        const isStyledAudioSelection = selection.purpose === 'style';
+        const selectionCommand = isStatusAudienceSelection
+          ? 'tostatus'
+          : isStyledAudioSelection ? 'style' : 'swgc';
         const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
         activateCommandTheme(selectionCommand, isOniThemeEnabled(cfg.THEME));
         await wakeForCommand(socket, msg, cfg);
@@ -1819,11 +1822,16 @@ function setupCommandHandlers(socket, number) {
               text: `❌ Ajout du groupe impossible : ${error?.message || error}`
             }, { quoted: msg });
           }
+        } else if (selection.status === 'selected' && isStyledAudioSelection) {
+          await socket.sendMessage(remoteJid, {
+            text: `✅ Groupe ciblé pour les audios stylisés : *${selection.group.subject}*\n\n` +
+              `Réponds à un audio avec ${selectedPrefix}style pour publier sa vidéo Kaido sur le statut de ce groupe.`
+          }, { quoted: msg });
         } else if (selection.status === 'selected') {
           await socket.sendMessage(remoteJid, {
             text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
               `Tu peux utiliser ${selectedPrefix}swgc <texte>[, couleur] ` +
-              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou audio.\n` +
+              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou un audio brut.\n` +
               'Couleurs : violet, bleu nuit, cyan, rose, or ou #rrggbb.'
           }, { quoted: msg });
         } else if (selection.status === 'invalid') {
@@ -1833,7 +1841,7 @@ function setupCommandHandlers(socket, number) {
         } else if (selection.status === 'expired') {
           const retry = isStatusAudienceSelection
             ? `${selectedPrefix}tostatus new group`
-            : `${selectedPrefix}swgc`;
+            : isStyledAudioSelection ? `${selectedPrefix}style` : `${selectedPrefix}swgc`;
           await socket.sendMessage(remoteJid, {
             text: `⌛ La sélection a expiré. Relance ${retry}.`
           }, { quoted: msg });
@@ -2025,8 +2033,8 @@ function setupCommandHandlers(socket, number) {
     const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
 
     // En mode privé, les propriétaires et admins Mongo restent autorisés.
-    // L’usage public de `.swgc` dans son groupe reste toutefois ouvert à tous
-    // les membres, comme le prévoit le mode groupe de cette commande.
+    // L’usage de `.swgc` et du mode audio `.style` dans un groupe reste ouvert
+    // à tous les membres, comme le prévoit le mode groupe de ces commandes.
     const publicGroupStatusCommand = isPublicGroupStatusCommand(from, command);
     if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged && !publicGroupStatusCommand) {
       await handleIgnoredMessage(socket, msg, sessionCfg);
@@ -8863,6 +8871,7 @@ case 'menu': {
 > ・ .mute
 > ・ .unmute
 > ・ .swgc / .gcstatus
+> ・ .style (audio stylisé / Fancy Text)
 > ・ .setgpp
 > ・ .listadmin
 > ・ .creategroup
@@ -8961,7 +8970,7 @@ ${footer}
           `.add, .kick, .creategroup\n` +
           `.save, .tovn, .vv\n` +
           `.play, .bible, .code\n` +
-          `.upch, .swgc / .gcstatus, .img\n` +
+          `.upch, .swgc / .gcstatus, .style, .img\n` +
           `\nUtilise .help [commande] pour plus d'info`
       }, { quoted: msg });
     } catch (e) {}
@@ -8970,8 +8979,8 @@ ${footer}
 }
 
 
-// `.swgc` / `.gcstatus` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
-// avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
+// `.swgc` / `.gcstatus` et le mode audio de `.style` sont implémentés dans les
+// plugins de groupe. Ils s’exécutent avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
 // le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
 // ==================== DOWNLOAD MENU ====================
@@ -9024,7 +9033,8 @@ case 'help': {
 ・ .tagall               → Mentionne tous les membres du groupe.
 ・ .mute                 → Restreint l'envoi aux admins (admins).
 ・ .unmute               → Réactive l'envoi pour tous.
-・ .swgc / .gcstatus     → Publie en privé un statut de groupe (texte, média ou audio stylisé).
+・ .swgc / .gcstatus     → Publie un statut de groupe (audio brut, texte, image ou vidéo).
+・ .style                → Répond à un audio pour publier la vidéo Kaido stylisée; avec du texte, Fancy Text.
 ・ .listadmin            → Liste les admins du groupe.
 ・ .creategroup          → Crée un nouveau groupe via le bot.
 ・ .listactive           → Liste les membres actifs.

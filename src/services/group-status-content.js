@@ -96,6 +96,12 @@ function randomStatusColor(random = Math.random) {
   return STATUS_BACKGROUND_PALETTE[Math.floor(safeValue * STATUS_BACKGROUND_PALETTE.length)];
 }
 
+function randomStatusColorValue(random = Math.random) {
+  const value = Number(random());
+  const safeValue = Number.isFinite(value) ? Math.max(0, Math.min(value, 0.999999999)) : 0;
+  return Math.floor(safeValue * 0xFFFFFF);
+}
+
 async function streamToBuffer(stream) {
   const chunks = [];
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
@@ -106,6 +112,7 @@ async function buildGroupStatusPayload({
   quotedMessage,
   textInput = '',
   colorInput = '',
+  audioMode = 'stylized',
   downloadContent,
   audioToStatusVideo,
   audioToStatusVideoFile,
@@ -126,7 +133,8 @@ async function buildGroupStatusPayload({
     if (!media) continue;
     if (typeof downloadContent !== 'function') throw new Error('Téléchargement média indisponible');
     const stream = await downloadContent(media, downloadType);
-    const caption = String(media.caption || '').trim() || requestedText;
+    const originalCaption = String(media.caption || '').trim();
+    const caption = originalCaption || requestedText;
 
     if (downloadType === 'image' || downloadType === 'video') {
       const buffer = await streamToBuffer(stream);
@@ -150,6 +158,22 @@ async function buildGroupStatusPayload({
           };
     }
 
+    if (audioMode === 'raw') {
+      const buffer = await streamToBuffer(stream);
+      if (!buffer.length) throw new Error('Le média cité est vide');
+      return {
+        type: 'audio',
+        payload: {
+          audio: buffer,
+          mimetype: media.mimetype || 'audio/mp4',
+          backgroundColor: textColor || randomStatusColorValue(random)
+        },
+        caption,
+        originalCaption,
+        textInput: requestedText
+      };
+    }
+
     // Compatibilité des appels qui injectent un convertisseur Buffer. Le chemin
     // normal reste en flux de fichier pour éviter de conserver deux MP4 en RAM.
     if (typeof audioToStatusVideo === 'function') {
@@ -162,7 +186,7 @@ async function buildGroupStatusPayload({
         throw new Error('La conversion audio → vidéo a produit un fichier vide.');
       }
       return {
-        type: 'audio',
+        type: 'styledAudio',
         payload: {
           video,
           mimetype: 'video/mp4',
@@ -184,7 +208,7 @@ async function buildGroupStatusPayload({
     const videoStream = fs.createReadStream(converted.path);
     let cleaned = false;
     return {
-      type: 'audio',
+      type: 'styledAudio',
       payload: {
         video: { stream: videoStream },
         mimetype: 'video/mp4',
@@ -225,6 +249,7 @@ module.exports = {
   parseStatusColor,
   splitTextAndColor,
   randomStatusColor,
+  randomStatusColorValue,
   streamToBuffer,
   buildGroupStatusPayload
 };

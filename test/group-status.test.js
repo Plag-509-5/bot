@@ -16,6 +16,8 @@ const {
 } = require('../src/services/group-status-content');
 const audioStatus = require('../src/services/group-status-audio');
 const swgc = require('../src/plugins/group/swgc');
+const stylePlugin = require('../src/plugins/group/style');
+const pluginLoader = require('../src/core/pluginLoader');
 const { groupStatus, isGroupJid } = require('../src/handlers/status');
 
 function resetSelections() {
@@ -82,6 +84,9 @@ test('liste seulement les groupes dont l’utilisateur fait partie et les trie',
   assert.match(list, /Réponds simplement avec le numéro/);
   assert.match(list, /MUGIWARA NO PLAG/);
   assert.match(list, /gcstatus/);
+  const styleList = selector.renderGroupSelectionList(groups, '.', 'style');
+  assert.match(styleList, /réponds à un audio avec \.style/);
+  assert.doesNotMatch(styleList, /Couleurs/);
 });
 
 test('reconnaît les identités PN/LID et leurs champs alternatifs', () => {
@@ -123,8 +128,8 @@ test('expire proprement une sélection qui attend trop longtemps', () => {
   assert.equal(selector.getSelectedGroup('5091', 'user'), null);
 });
 
-test('les alias swgc sont publics uniquement lorsqu’ils sont lancés dans un groupe', () => {
-  for (const command of ['swgc', 'gcstatus', 'groupstatus', 'statusgroup']) {
+test('les commandes publiques de statut de groupe ne le sont que dans un groupe', () => {
+  for (const command of ['swgc', 'gcstatus', 'groupstatus', 'statusgroup', 'style']) {
     assert.equal(selector.isPublicGroupStatusCommand('111@g.us', command), true);
   }
   assert.equal(selector.isPublicGroupStatusCommand('50911111111@s.whatsapp.net', 'swgc'), false);
@@ -160,7 +165,7 @@ test('les textes utilisent la nouvelle police et la palette sombre personnalisé
   assert.equal(defaultText.payload.font, 2);
 });
 
-test('construit les statuts image/vidéo et transforme les audios en vidéo de marque', async () => {
+test('construit les statuts image/vidéo et garde le chemin audio stylisé en vidéo de marque', async () => {
   const downloadContent = async function * download(media) {
     yield Buffer.from(media.bytes);
   };
@@ -199,11 +204,35 @@ test('construit les statuts image/vidéo et transforme les audios en vidéo de m
       return Buffer.from('mp4-video');
     }
   });
-  assert.equal(audio.type, 'audio');
+  assert.equal(audio.type, 'styledAudio');
   assert.equal(audio.payload.video.toString(), 'mp4-video');
   assert.equal(audio.payload.mimetype, 'video/mp4');
   assert.equal(audio.payload.caption, 'note audio');
   assert.deepEqual(conversionOptions, { durationSeconds: 41 });
+
+  const rawAudio = await buildGroupStatusPayload({
+    quotedMessage: { audioMessage: { bytes: 'raw-audio', mimetype: 'audio/ogg', caption: 'caption originale' } },
+    textInput: 'texte ajouté, violet',
+    audioMode: 'raw',
+    downloadContent,
+    random: () => 0,
+    audioToStatusVideo: async () => { throw new Error('le mode brut ne doit pas convertir en vidéo'); }
+  });
+  assert.equal(rawAudio.type, 'audio');
+  assert.equal(rawAudio.payload.audio.toString(), 'raw-audio');
+  assert.equal(rawAudio.payload.video, undefined);
+  assert.equal(rawAudio.payload.mimetype, 'audio/ogg');
+  assert.equal(rawAudio.payload.backgroundColor, '#5537A8');
+  assert.equal(rawAudio.caption, 'caption originale');
+  assert.equal(rawAudio.originalCaption, 'caption originale');
+  assert.equal(rawAudio.textInput, 'texte ajouté');
+  const randomColorAudio = await buildGroupStatusPayload({
+    quotedMessage: { audioMessage: { bytes: 'raw-audio', mimetype: 'audio/mp4' } },
+    audioMode: 'raw',
+    downloadContent,
+    random: () => 0.5
+  });
+  assert.equal(randomColorAudio.payload.backgroundColor, Math.floor(0.5 * 0xFFFFFF));
   assert.equal(unwrapMessage({ ephemeralMessage: { message: { conversation: 'ok' } } }).conversation, 'ok');
 });
 
@@ -231,7 +260,7 @@ test('le chemin audio par défaut diffuse le MP4 temporaire et expose son nettoy
       }
     });
 
-    assert.equal(built.type, 'audio');
+    assert.equal(built.type, 'styledAudio');
     assert.ok(built.payload.video.stream, 'la vidéo doit rester en flux, pas en buffer');
     assert.equal((await fs.promises.readFile(videoPath)).toString(), 'large-enough-mp4');
     const uploadedChunks = [];
@@ -517,13 +546,17 @@ test('le postinstall corrige le relay rc14 une seule fois', () => {
 });
 
 test('les confirmations swgc restent concises pour chaque type', () => {
-  const labels = { image: 'image', video: 'vidéo', audio: 'audio stylisé en vidéo', text: 'texte' };
+  const labels = { image: 'image', video: 'vidéo', audio: 'audio', styledAudio: 'audio stylisé en vidéo', text: 'texte' };
   for (const [type, label] of Object.entries(labels)) {
     assert.equal(
       swgc._test.groupStatusConfirmation(type, 'Amis'),
       `Statut ${label} posté sur : Amis`
     );
   }
+  const rawAudioCaption = swgc._test.formatRawAudioStatusCaption('caption d’origine', 'texte ajouté');
+  assert.match(rawAudioCaption, /caption d’origine/);
+  assert.match(rawAudioCaption, /texte ajouté/);
+  assert.match(rawAudioCaption, /Kaido-MD — Développeur : PlagTech/);
   assert.ok(swgc.alias.includes('gcstatus'));
 });
 
@@ -597,6 +630,69 @@ test('workflow privé: liste, sélectionne puis publie sans sendMessage dans le 
   assert.equal(fixture.sent.filter(event => event.jid.endsWith('@g.us')).length, 0);
   assert.equal(fixture.sent.at(-1).jid, fixture.context.from);
   assert.equal(fixture.sent.at(-1).content.text, 'Statut texte posté sur : Amis');
+});
+
+test('.style en privé sélectionne un groupe, puis publie la vidéo stylisée vers cette cible', async () => {
+  resetSelections();
+  const fixture = privateFixture();
+  await stylePlugin._test.executeStyle(fixture.context);
+
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0].jid, fixture.context.from);
+  assert.match(fixture.sent[0].content.text, /réponds à un audio avec \.style/);
+  const selected = selector.resolveGroupSelection('50900000000', fixture.context.from, '1');
+  assert.equal(selected.status, 'selected');
+  assert.equal(selected.purpose, 'style');
+
+  const published = [];
+  const audioContext = {
+    ...fixture.context,
+    args: [],
+    quotedMsg: { audioMessage: { mimetype: 'audio/ogg', seconds: 12, caption: 'voix du groupe' } }
+  };
+  await stylePlugin._test.executeStyle(audioContext, {
+    async *downloadContent(_media, type) {
+      assert.equal(type, 'audio');
+      yield Buffer.from('audio-source');
+    },
+    async audioToStatusVideo(source) {
+      assert.equal(source.toString(), 'audio-source');
+      return Buffer.from('styled-video');
+    },
+    async publishGroupStatus(_socket, jid, payload) {
+      published.push({ jid, payload });
+    }
+  });
+
+  assert.equal(published.length, 1);
+  assert.equal(published[0].jid, '111@g.us');
+  assert.equal(published[0].payload.video.toString(), 'styled-video');
+  assert.equal(fixture.sent.at(-1).jid, fixture.context.from);
+  assert.match(fixture.sent.at(-1).content.text, /audio stylisé en vidéo posté sur : Amis/);
+});
+
+test('.style <texte> conserve le comportement Fancy Text', async () => {
+  const fixture = privateFixture();
+  await stylePlugin._test.executeStyle({ ...fixture.context, args: ['Kaido', 'MD'] });
+
+  assert.equal(fixture.sent.length, 1);
+  assert.equal(fixture.sent[0].jid, fixture.context.from);
+  assert.match(fixture.sent[0].content.text, /TEXTES STYLISÉS POUR/);
+  assert.match(fixture.sent[0].content.text, /Kaido MD/);
+});
+
+test('pluginLoader enregistre .style pour les statuts et conserve Fancy Text', () => {
+  pluginLoader.loadPlugins(false);
+  const commands = pluginLoader.getPlugins();
+  const style = commands.get('style');
+  const fancy = commands.get('fancy');
+
+  assert.ok(style);
+  assert.equal(style.name, 'style');
+  assert.equal(style.category, 'group');
+  assert.equal(commands.get('fancytext'), fancy);
+  assert.notEqual(style, fancy);
+  assert.equal(fancy.aliases.includes('style'), false);
 });
 
 test('une commande lancée dans un groupe publie et confirme dans le même groupe', async () => {
@@ -722,9 +818,15 @@ test('swgc publie image, vidéo et audio dans un groupe admin-only quand le bot 
         assert.equal(mediaType, item.type);
         yield Buffer.from(`${item.type}-source`);
       },
-      async audioToStatusVideo(audio) {
-        assert.equal(audio.toString(), 'audio-source');
-        return Buffer.from('audio-converted-to-video');
+      async publishGroupStatus(_socket, jid, payload, options) {
+        const mediaType = payload.image ? 'image' : payload.video ? 'video' : payload.audio ? 'audio' : 'text';
+        const messageKey = mediaType === 'text' ? 'extendedTextMessage' : `${mediaType}Message`;
+        uploaded.push({ mediaType });
+        relayed.push({
+          jid,
+          message: { groupStatusMessageV2: { message: { [messageKey]: payload } } },
+          options
+        });
       }
     });
   }
@@ -732,19 +834,21 @@ test('swgc publie image, vidéo et audio dans un groupe admin-only quand le bot 
   assert.equal(relayed.length, 3);
   assert.ok(relayed.every(event => event.options.useCachedGroupMetadata === false), 'le relay d’un groupe fermé doit utiliser des métadonnées fraîches');
   assert.equal(uploaded.length, 3);
-  assert.deepEqual(uploaded.map(item => item.mediaType), ['image', 'video', 'video']);
+  assert.deepEqual(uploaded.map(item => item.mediaType), ['image', 'video', 'audio']);
   assert.ok(relayed[0].message.groupStatusMessageV2.message.imageMessage);
   assert.equal(relayed[0].message.groupStatusMessageV2.message.imageMessage.caption, 'photo du groupe');
   assert.ok(relayed[1].message.groupStatusMessageV2.message.videoMessage);
   assert.equal(relayed[1].message.groupStatusMessageV2.message.videoMessage.caption, 'vidéo du groupe');
-  assert.ok(relayed[2].message.groupStatusMessageV2.message.videoMessage);
-  assert.equal(relayed[2].message.groupStatusMessageV2.message.videoMessage.caption, 'audio du groupe');
-  assert.equal(sent.length, 3);
-  assert.ok(sent.every(event => event.jid === metadata.id), 'les confirmations doivent rester dans le groupe fermé');
-  assert.ok(sent.every(event => /posté sur : ce groupe/.test(event.content.text)));
+  assert.ok(relayed[2].message.groupStatusMessageV2.message.audioMessage);
+  assert.equal(relayed[2].message.groupStatusMessageV2.message.audioMessage.mimetype, 'audio/ogg');
+  assert.equal(sent.length, 4, 'le statut audio reçoit un message de caption et une confirmation');
+  assert.ok(sent.every(event => event.jid === metadata.id), 'les réponses doivent rester dans le groupe fermé');
+  assert.match(sent[2].content.text, /audio du groupe/);
+  assert.match(sent[2].content.text, /Kaido-MD — Développeur : PlagTech/);
+  assert.match(sent[3].content.text, /Statut audio posté sur : ce groupe/);
 });
 
-test('swgc supprime le MP4 temporaire après la fin du relay, même si la publication échoue', async () => {
+test('.style supprime le MP4 temporaire après la fin du relay, même si la publication échoue', async () => {
   for (const shouldFail of [false, true]) {
     resetSelections();
     const fixture = privateFixture();
@@ -758,6 +862,9 @@ test('swgc supprime le MP4 temporaire après la fin du relay, même si la public
       from: '111@g.us',
       sender: '50911111111@s.whatsapp.net',
       args: [],
+      isOwner: false,
+      isSessionOwner: false,
+      isSudo: false,
       quotedMsg: { audioMessage: audio },
       msg: {
         key: { remoteJid: '111@g.us', participant: '50911111111@s.whatsapp.net', id: `audio-${shouldFail}` },
@@ -766,7 +873,7 @@ test('swgc supprime le MP4 temporaire après la fin du relay, même si la public
     };
 
     try {
-      await swgc._test.executeSwgc(context, {
+      await stylePlugin._test.executeStyle(context, {
         async *downloadContent(_media, type) {
           assert.equal(type, 'audio');
           yield Buffer.from('audio-source');
@@ -841,6 +948,7 @@ test('swgc refuse un groupe admin-only si le compte du bot n’en est pas admini
 test('le handler intercepte la réponse numérique et l’ancien case swgc bruyant a disparu', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
   assert.match(source, /resolveGroupSelection\(sessionId, selectionActor, normalizedBody\)/);
+  assert.match(source, /selection\.purpose === 'style'/);
   assert.match(source, /isPublicGroupStatusCommand\(from, command\)/);
   assert.doesNotMatch(source, /case 'swgc':/);
   const pluginSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'plugins', 'group', 'swgc.js'), 'utf8');

@@ -41,7 +41,7 @@ const LEGACY_GROUPS = {
   ]),
   group: new Set([
     'admin', 'unadmin', 'admins', 'promote', 'demote', 'kick', 'kickall',
-    'mute', 'unmute', 'tagall', 'hidetag', 'cgroup', 'creategroup', 'grouplist',
+    'mute', 'unmute', 'tagall', 'hidetag', 'cgroup', 'creategroup', 'grouplist', 'style',
     'groupjid', 'gjid', 'welcome', 'goodbye', 'leave', 'fullpp', 'setgpp'
   ]),
   download: new Set([
@@ -51,7 +51,7 @@ const LEGACY_GROUPS = {
   ]),
   tools: new Set([
     'tourl', 'tolink', 'upload', 'tovn', 'sticker', 's', 'take', 'save', 'vv',
-    'rvo', 'readviewonce', 'img', 'fancy', 'fancytext', 'style', 'translate',
+    'rvo', 'readviewonce', 'img', 'fancy', 'fancytext', 'translate',
     'tr', 'trt', 'ssweb', 'upscale', 'lyrics', 'shazam', 'whatmusic',
     'findmusic', 'quemusica', 'detect', 'getpp', 'setpp', 'setppfull', 'setlang',
     'jid', 'cid', 'chr', 'bible', 'verset', 'bibleai', 'bratvid', 'bratvideo'
@@ -223,7 +223,8 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}hidetag / ${p}h
 > ・ ${p}mute
 > ・ ${p}unmute
-> ・ ${p}swgc / ${p}gcstatus (statut de groupe privé)
+> ・ ${p}swgc / ${p}gcstatus (audio brut et statut de groupe)
+> ・ ${p}style (répondre à un audio pour créer la vidéo Kaido)
 > ・ ${p}setgpp
 > ・ ${p}listadmin
 > ・ ${p}creategroup
