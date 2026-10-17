@@ -16,6 +16,7 @@ const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPlug
 const {
   resolveSessionPrefix,
   parseCommandInput,
+  shouldRouteToChatbot,
   extractMainCommandNames
 } = require('../services/command-routing');
 const {
@@ -24,6 +25,8 @@ const {
   wakeForCommand,
   applyAlwaysOnlineSetting
 } = require('../services/presence-mode');
+const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
+const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
   collectMessageIdentifiers,
@@ -62,7 +65,11 @@ const {
 } = require('../services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd');
-const { findReactionCommand, getAllReactionCommands, initReactionDb } = require('../features/reaction_cmd');
+const {
+  findReactionCommand,
+  hasReactionCommands: sessionHasReactionCommands,
+  initReactionDb
+} = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
 const {
@@ -218,6 +225,7 @@ const DEFAULT_SESSION_CONFIG = {
   MODE: 'public',
   THEME: 'onigashima',
   SUDO_USERS: [],
+  CHATBOT_ENABLED: false,
   STATUS_REPLY_FORWARD_ENABLED: false,
   STATUS_REPLY_KEYWORDS: []
 };
@@ -1574,6 +1582,61 @@ function handleGroupStatusMention(socket, sessionId) {
   });
 }
 // ---------------- command handlers ----------------
+async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig, sessionNumber, input }) {
+  if (!input || !configEnabled(sessionConfig?.CHATBOT_ENABLED, false) || msg?.key?.fromMe) return false;
+
+  if (sessionConfig?.MODE === 'private') {
+    const senderJid = msg.key.participant || remoteJid;
+    const senderNumber = String(senderJid || '').split('@')[0].split(':')[0];
+    const identifiers = collectMessageIdentifiers(msg, senderJid, senderNumber);
+    const access = resolveAccess({
+      identifiers,
+      ownerValue: config.OWNER_NUMBER,
+      adminEntries: await loadAdminsFromMongo(),
+      sudoEntries: sessionConfig.SUDO_USERS || [],
+      sessionNumber
+    });
+    if (!access.isPrivileged) {
+      await handleIgnoredMessage(socket, msg, sessionConfig);
+      return true;
+    }
+  }
+
+  let presenceStarted = false;
+  try {
+    const result = await respondToAi({
+      sessionNumber,
+      chatJid: remoteJid,
+      senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
+      text: input,
+      isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
+      onStart: async () => {
+        presenceStarted = true;
+        await wakeForCommand(socket, msg, sessionConfig, { sleepAfterMs: 60_000 });
+        if (!configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket.sendPresenceUpdate === 'function') {
+          await socket.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+        }
+      }
+    });
+    if (result.cancelled) return true;
+    await socket.sendMessage(remoteJid, {
+      text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
+    }, { quoted: msg });
+  } catch (error) {
+    console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
+    try {
+      await socket.sendMessage(remoteJid, { text: `❌ ${formatAiError(error)}` }, { quoted: msg });
+    } catch (sendError) {
+      console.warn('[AI CHATBOT] Envoi de l’erreur impossible :', sendError?.message || sendError);
+    }
+  } finally {
+    if (presenceStarted && typeof socket.sendPresenceUpdate === 'function') {
+      await socket.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+    }
+  }
+  return true;
+}
+
 function setupCommandHandlers(socket, number) {
   socket.ev.on('messages.upsert', ({ messages = [] } = {}) => withCommandTheme(async () => {
     if (!Array.isArray(messages) || !messages.length) return;
@@ -1586,12 +1649,12 @@ function setupCommandHandlers(socket, number) {
     const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
     const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
     const cfg = await loadSessionConfigMerged(sessionId);
-    const hasReactionCommands = getAllReactionCommands(sanitizedBot).length > 0;
+    const hasReactionCommandMappings = sessionHasReactionCommands(sanitizedBot);
 
     // Le store n'est utile que pour l'anti-delete activé ou les commandes par
     // réaction. Auparavant chaque session y gardait tous les messages même si
     // la fonctionnalité était désactivée.
-    if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommands) {
+    if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommandMappings) {
       deleteSessionStore(sanitizedBot);
     } else {
       for (const incoming of messages) {
@@ -1599,7 +1662,7 @@ function setupCommandHandlers(socket, number) {
         if (unwrapAntideleteMessage(incoming.message).message?.reactionMessage) continue;
         if (shouldCacheIncomingMessage({
           antideleteMode: cfg.antidelete,
-          hasReactionCommands,
+          hasReactionCommands: hasReactionCommandMappings,
           chatId: incoming.key.remoteJid
         })) {
           // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe
@@ -1610,10 +1673,14 @@ function setupCommandHandlers(socket, number) {
     }
 
     // 2. Déterminer le type de message pour extraire le body
-    const type = getContentType(msg.message);
-    
-    // Gérer les messages éphémères
-    msg.message = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
+    let type = getContentType(msg.message);
+
+    // Déballer les messages éphémères puis recalculer le type interne afin que
+    // les commandes continuent de passer avant le chatbot.
+    if (type === 'ephemeralMessage') {
+      msg.message = msg.message.ephemeralMessage.message;
+      type = getContentType(msg.message);
+    }
 
     // ── INTERCEPTION DES RÉACTIONS EMOJIS ASSOCIÉES À DES COMMANDES (.setcmd <cmd>, <emoji>) ──
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
@@ -1961,8 +2028,12 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Si le message ne contient pas de texte, il est ignoré sans accusé de lecture.
-    if (!body || typeof body !== 'string') {
+    // En mode chatbot, les messages média sont décrits sans téléverser leurs
+    // octets; hors mode chatbot ils restent ignorés comme auparavant.
+    const autoChatbotInput = configEnabled(cfg.CHATBOT_ENABLED, false) && !msg.key.fromMe
+      ? getChatbotInput(msg, body)
+      : null;
+    if ((!body || typeof body !== 'string') && !autoChatbotInput) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
@@ -1985,7 +2056,25 @@ function setupCommandHandlers(socket, number) {
     // "prefixless" et impose une validation du premier mot dans le registre.
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
-    if (!parsedCommand) {
+    const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
+    const shouldUseChatbot = shouldRouteToChatbot({
+      enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
+      fromMe: msg.key.fromMe,
+      parsedCommand,
+      isKnownCommand: isKnownCommandName
+    });
+    if (shouldUseChatbot) {
+      const handledByChatbot = await handleAutoChatbotMessage({
+        socket,
+        msg,
+        remoteJid,
+        sessionConfig: cfg,
+        sessionNumber: sanitizedBot,
+        input: autoChatbotInput || getChatbotInput(msg, body)
+      });
+      if (handledByChatbot) return;
+    }
+    if (!isRegisteredCommand) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
@@ -2044,14 +2133,11 @@ function setupCommandHandlers(socket, number) {
     // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
     // explicitement marquée comme lue et réveille temporairement la présence.
     await wakeForCommand(socket, msg, sessionCfg);
-    // DEBUG: Afficher les informations pour le débogage
-    console.log('DEBUG Command Handler:');
-    console.log('- Remote JID:', remoteJid);
-    console.log('- Is group?', remoteJid.endsWith('@g.us'));
-    console.log('- Command:', command);
-    console.log('- Body:', body);
-    console.log('- From:', from);
-    console.log('- Sender:', nowsender);
+    // Évite les écritures de logs synchrones et l’exposition du contenu privé
+    // à chaque commande; le détail n’est activé qu’en mode debug.
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[COMMAND]', command, remoteJid.endsWith('@g.us') ? 'group' : 'private');
+    }
     
     // 6. Maintenant, traiter les commandes
     // helper: download quoted media into buffer
@@ -6137,7 +6223,7 @@ case 'ad': {
       cfg.antidelete = 'off';
       // Les anciennes entrées restent utiles si des réactions déclenchent des
       // commandes; sinon on libère immédiatement le cache de cette session.
-      if (!getAllReactionCommands(sanitized).length) deleteSessionStore(sanitized);
+      if (!sessionHasReactionCommands(sanitized)) deleteSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {

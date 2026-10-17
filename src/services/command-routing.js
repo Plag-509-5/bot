@@ -51,6 +51,11 @@ function parseCommandInput(body, prefix, isKnownCommand = () => true) {
   };
 }
 
+function shouldRouteToChatbot({ enabled = false, fromMe = false, parsedCommand, isKnownCommand = () => false } = {}) {
+  if (!enabled || fromMe) return false;
+  return !parsedCommand || !isKnownCommand(parsedCommand.command);
+}
+
 function extractLegacyCommands(source) {
   const commands = new Set();
   const text = String(source || '');
@@ -82,6 +87,7 @@ module.exports = {
   normalisePrefix,
   resolveSessionPrefix,
   parseCommandInput,
+  shouldRouteToChatbot,
   extractLegacyCommands,
   extractMainCommandNames,
   formatPrefix

@@ -138,7 +138,7 @@ test('le dashboard n’affiche pas « Indisponible » silencieusement', () => {
 });
 
 test('la commande .code utilise l’hôte local/site et le port dynamique, sans URL fixe', () => {
-  assert.match(code, /createPairingCodeUrl\(cleanNumber\)/);
+  assert.match(code, /createPairingCodeUrlCandidates\(\s*cleanNumber/);
   assert.match(code, /timeout: PAIRING_CODE_HTTP_TIMEOUT_MS/);
   assert.doesNotMatch(code, /https:\/\/kaidomd-byplag\.mooo\.com\/code\?/);
 });

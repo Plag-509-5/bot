@@ -26,7 +26,7 @@
   - TikTok (Sans filigrane / No Watermark)
   - Instagram (Reels, Vidéos, Carrousels)
   - Facebook (Vidéos HD/SD)
-- **🧠 Intelligence Artificielle :** Assistant IA conversationnel intégré (`.ai`, `.gpt`).
+- **🧠 Intelligence Artificielle :** Chatbot Kaido activable par session (`.chatbot on|off`), mémoire courte partagée entre fournisseurs et commandes `.ai` / `.gpt`.
 - **🛠️ Outils & Utilitaires :**
   - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
@@ -267,7 +267,9 @@ TOURL_TIMEOUT_MS=60000
 CATBOX_USER_HASH=
 ```
 
-Chaque socket Baileys envoie déjà une **IQ ping-pong toutes les 30 secondes** via sa connexion WhatsApp existante. Le watchdog vérifie le vrai état `isOpen` de chaque session toutes les 30 secondes; si un socket reste fermé 90 secondes, il ne relance que cette session avec l’ordonnanceur de reconnexion existant. Les sockets sains ne sont pas redémarrés toutes les heures : cela provoquerait des interruptions et des reconnexions simultanées sans bénéfice par rapport au keepalive natif.
+Chaque socket Baileys envoie déjà une **IQ ping-pong toutes les 30 secondes** via sa connexion WhatsApp existante. Le watchdog vérifie le vrai état `isOpen` de chaque session toutes les 30 secondes; si un socket reste fermé 90 secondes, il ne relance que cette session avec l’ordonnanceur de reconnexion existant. Les sockets sains ne sont pas redémarrés périodiquement par défaut. Une planification explicite `.sr <minutes>` redémarre néanmoins tout le processus; vérifie `.sr status` et utilise `.sr stop` si des redémarrages fréquents provoquent des périodes d’inactivité.
+
+Le chemin de messages évite maintenant les mises à jour `unavailable` répétées pour un même chat pendant cinq secondes, vérifie en temps constant s’il existe des commandes par réaction pour la session et n’écrit les détails de commande dans les logs qu’avec `LOG_LEVEL=debug`. Ces changements et la file IA bornée réduisent le travail inutile sans ajouter de socket WhatsApp.
 
 > La page publique `t.me/addstickers/...` ne contient plus les fichiers `.tgs`. La commande `.tgs` utilise donc l’API officielle Telegram (`getStickerSet` puis `getFile`), ce qui nécessite `TELEGRAM_BOT_TOKEN`. Le token reste côté serveur et n’est jamais envoyé dans les messages ou les logs d’erreur.
 
@@ -386,6 +388,28 @@ Après la mise à jour, redémarre le bot pour charger complètement les nouveau
 
 ---
 
+## 🧠 Chatbot Kaido et routeur IA
+
+Le chatbot est **désactivé par défaut et configuré par session**. Le propriétaire de la session, le propriétaire du bot, un admin Mongo ou un sudo peut utiliser :
+
+```text
+.chatbot on
+.chatbot off
+.chatbot status
+.chatbot clear
+.ai <question>
+```
+
+`on` transmet les messages ordinaires et les messages à préfixe qui ne correspondent à aucune commande connue; les commandes enregistrées du bot restent prioritaires pour que `.chatbot off` et les autres contrôles fonctionnent toujours. En `MODE=private`, seuls les propriétaires, admins Mongo et sudo de la session reçoivent une réponse automatique. En mode public, Kaido répond dans le chat d’origine, y compris les groupes. Les messages envoyés par le compte du bot sont ignorés pour éviter une boucle de réponses.
+
+`.ai` / `.gpt` utilisent le même routeur et la même mémoire que le mode automatique. L’historique est partagé entre les fournisseurs **dans la même conversation et la même session**, limité en durée, nombre de conversations, messages et caractères; il reste uniquement en RAM, n’est pas écrit dans MongoDB et disparaît au redémarrage. `.chatbot clear` efface le chat courant; `.chatbot off` efface toute la mémoire de cette session.
+
+Le routeur essaie dans l’ordre les fournisseurs configurés (`GEMINI_API_KEY`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`), puis un endpoint OpenAI-compatible facultatif. Configure uniquement des modèles gratuits si tu souhaites éviter tout coût : quotas et modèles changent selon les fournisseurs. Les textes et légendes transmis sont envoyés au fournisseur externe sélectionné; dans un groupe, le nom d’affichage WhatsApp de l’expéditeur est aussi inclus pour distinguer les interlocuteurs. Les octets des fichiers image/audio/vidéo ne sont pas téléversés. Pour un média sans légende, Kaido reçoit uniquement son type (les coordonnées d’une position et les données d’un contact ne sont pas transmises).
+
+Les valeurs par défaut bornent la charge à **2 requêtes simultanées**, **12 en attente**, **2 en attente par chat**, 8 s par tentative, 12 messages d’historique et 300 conversations en RAM. Les clés restent dans `.env`, jamais dans le code ni MongoDB. Consulte le bloc « IA Kaido » de `.env.example`; les modèles par défaut sont modifiables avec `GEMINI_MODEL`, `GROQ_MODEL` et `OPENROUTER_MODEL`.
+
+---
+
 ## 📴 Présence et mode sans préfixe
 
 Chaque session peut être configurée directement dans WhatsApp par le propriétaire :
@@ -395,6 +419,8 @@ Chaque session peut être configurée directement dans WhatsApp par le propriét
 .config alwaysonline off
 .config setprefix !
 .config setprefix off
+.chatbot on
+.chatbot off
 .mode public
 .mode private
 .changetheme 1
@@ -404,13 +430,13 @@ Chaque session peut être configurée directement dans WhatsApp par le propriét
 ```
 
 - `alwaysonline on` garde la présence du compte disponible.
-- `alwaysonline off` applique la présence `unavailable`. Un message ordinaire est ignoré sans appel à `readMessages`; une commande reconnue est marquée comme lue, réveille temporairement le bot, puis celui-ci repasse hors ligne.
-- `setprefix off` enregistre un préfixe vide. Dans ce mode, le bot examine uniquement le premier mot : `menu` est exécuté, tandis que `bonjour menu` ou un mot inconnu sont ignorés silencieusement.
+- `alwaysonline off` applique la présence `unavailable`. Quand le chatbot est OFF, un message ordinaire est ignoré sans appel à `readMessages`; une commande reconnue ou un message traité par le chatbot est marqué comme lu, réveille temporairement le bot, puis celui-ci repasse hors ligne.
+- `setprefix off` enregistre un préfixe vide. Dans ce mode, les commandes enregistrées sont exécutées dès le premier mot; `bonjour menu` n’est pas une commande. Les textes inconnus sont ignorés si le chatbot est OFF et transmis à Kaido s’il est ON.
 - Pour réactiver le point depuis le mode sans préfixe : `config setprefix .`.
 - `.mode public|private` est enregistré par numéro de session et restauré après redémarrage.
 - `.changetheme 1` utilise les réponses classiques; `.changetheme 2` applique Onigashima. Le menu et `.ping` suivent immédiatement le choix de chaque session.
 - `.sudo`, `.delsudo` et `.listsudo` gèrent une liste persistante d’opérateurs propre à chaque session.
-- `.config show` affiche les valeurs actives de la session, y compris le mode, le thème et le nombre de sudo.
+- `.config show` affiche les valeurs actives de la session, y compris le mode, le thème, l’état du chatbot et le nombre de sudo.
 
 > **Limite WhatsApp :** un seul coche signifie que le message n’a pas encore été livré au compte/appareil connecté. Le bot doit recevoir le message pour savoir si son premier mot est une commande; il ne peut donc pas garantir un seul coche tout en effectuant cette détection. En mode OFF, il évite l’accusé de **lecture** des textes ordinaires, mais WhatsApp peut tout de même afficher deux coches grises de livraison. Les coches bleues dépendent aussi des réglages de confidentialité WhatsApp.
 

@@ -122,6 +122,7 @@ module.exports = {
         `• PREFIX : ${formatPrefix(currentPrefix)}`,
         `• MODE : ${next.MODE || 'public'}`,
         `• THEME : ${next.THEME || 'onigashima'}`,
+        `• CHATBOT : ${configEnabled(next.CHATBOT_ENABLED, false) ? 'ON' : 'OFF'}`,
         `• SUDO_USERS : ${Array.isArray(next.SUDO_USERS) ? next.SUDO_USERS.length : 0}`
       ].join('\n'));
     }

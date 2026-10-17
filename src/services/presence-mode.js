@@ -1,6 +1,9 @@
 'use strict';
 
 const idleTimers = new WeakMap();
+const presenceStates = new WeakMap();
+const PRESENCE_DUPLICATE_TTL_MS = 5_000;
+const PRESENCE_CACHE_MAX_JIDS = 64;
 
 function configEnabled(value, fallback = false) {
   if (typeof value === 'boolean') return value;
@@ -13,8 +16,30 @@ function configEnabled(value, fallback = false) {
 }
 
 async function setSessionPresence(socket, online, jid) {
-  if (!socket || typeof socket.sendPresenceUpdate !== 'function') return;
-  await socket.sendPresenceUpdate(online ? 'available' : 'unavailable', jid).catch(() => {});
+  if (!socket || typeof socket.sendPresenceUpdate !== 'function') return false;
+  const presence = online ? 'available' : 'unavailable';
+  const key = String(jid || '');
+  const now = Date.now();
+  let cache = presenceStates.get(socket);
+  if (!cache) {
+    cache = new Map();
+    presenceStates.set(socket, cache);
+  }
+
+  const previous = cache.get(key);
+  if (previous?.presence === presence && now - previous.updatedAt < PRESENCE_DUPLICATE_TTL_MS) {
+    return false;
+  }
+
+  try {
+    await socket.sendPresenceUpdate(presence, jid);
+    cache.delete(key);
+    cache.set(key, { presence, updatedAt: now });
+    while (cache.size > PRESENCE_CACHE_MAX_JIDS) cache.delete(cache.keys().next().value);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function clearIdleTimer(socket) {
@@ -70,5 +95,9 @@ module.exports = {
   handleIgnoredMessage,
   wakeForCommand,
   applyAlwaysOnlineSetting,
-  _test: { clearIdleTimer, scheduleOffline }
+  _test: {
+    clearIdleTimer,
+    scheduleOffline,
+    clearPresenceCache(socket) { presenceStates.delete(socket); }
+  }
 };

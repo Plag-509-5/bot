@@ -27,6 +27,17 @@ test('un message ordinaire en mode offline ne déclenche aucun accusé de lectur
   assert.deepEqual(socket.events, [['presence', 'unavailable', 'chat@s.whatsapp.net']]);
 });
 
+test('les messages ignorés répétés ne renvoient pas inutilement la même présence offline', async () => {
+  const socket = fakeSocket();
+  await handleIgnoredMessage(socket, msg, { AUTO_ONLINE: false });
+  await handleIgnoredMessage(socket, msg, { AUTO_ONLINE: false });
+  await handleIgnoredMessage(socket, { key: { ...msg.key, remoteJid: 'other@s.whatsapp.net' } }, { AUTO_ONLINE: false });
+  assert.deepEqual(socket.events, [
+    ['presence', 'unavailable', 'chat@s.whatsapp.net'],
+    ['presence', 'unavailable', 'other@s.whatsapp.net']
+  ]);
+});
+
 test('une commande réveille le bot et marque uniquement cette commande comme lue', async () => {
   const socket = fakeSocket();
   await wakeForCommand(socket, msg, { AUTO_ONLINE: false, AUTO_RECORDING: false }, { sleepAfterMs: 60_000 });
