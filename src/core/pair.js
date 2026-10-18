@@ -77,7 +77,10 @@ const {
   setupTranslationWrapper,
   saveSessionLanguage
 } = require('../features/translation');
-const { configureGitHubUpdateSettings } = require('../services/github-update-settings');
+const githubUpdater = require('../services/github-updater');
+const githubUpdateSettings = require('../services/github-update-settings');
+const { createGitHubAutoUpdater } = require('../services/github-auto-updater');
+const { configureGitHubUpdateSettings } = githubUpdateSettings;
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
 const { getGroupAdminsInfo } = require('../lib/normalize');
@@ -333,6 +336,14 @@ configureTranslationStorage({
 configureGitHubUpdateSettings({
   initMongo,
   getDb: () => mongoDB
+});
+const githubAutoUpdater = createGitHubAutoUpdater({
+  env: process.env,
+  updater: githubUpdater,
+  settings: githubUpdateSettings,
+  // Le handler SIGTERM vide les creds Baileys/MongoDB avant que le superviseur
+  // de l’hébergeur ne relance le processus avec les nouveaux fichiers.
+  restart: () => process.kill(process.pid, 'SIGTERM')
 });
 
 // État d'authentification actif par numéro (cache mémoire d'exécution seulement).
@@ -11793,6 +11804,7 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   sessionHealthWatcher.stop();
+  githubAutoUpdater.stop();
   console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
   const socketsToClose = new Set([...activeSockets.values(), ...pairingSockets.values()]);
   socketsToClose.forEach((socket) => {
@@ -11844,6 +11856,7 @@ async function bootstrapMongoSessions() {
     await initMongo();
     await restoreRestartSchedule();
     await restoreSessionsOnBoot();
+    githubAutoUpdater.start();
   } catch (error) {
     // Le serveur HTTP reste joignable pour afficher le diagnostic, mais aucun
     // socket WhatsApp ne démarre sans la source de vérité MongoDB.

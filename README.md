@@ -384,7 +384,20 @@ Le bot doit être installé depuis un **clone Git** dont `origin` pointe vers Gi
 
 Le détecteur Git autorise la découverte du dépôt à travers les frontières de systèmes de fichiers. Si le code est déployé ailleurs que dans le clone contenant `.git`, configure `BOT_REPO_PATH` avec le chemin absolu de la racine du clone (par exemple `/home/kaido`).
 
-Après la mise à jour, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. Le plugin ne redémarre pas le processus automatiquement.
+Après une mise à jour manuelle, redémarre le bot pour charger complètement les nouveaux modules. Si `package.json` ou le lockfile a changé, exécute aussi `npm install` avant le redémarrage. La commande `.update` ne redémarre pas le processus automatiquement.
+
+#### Auto-update périodique (opt-in)
+
+Pour que le bot vérifie et applique lui-même les mises à jour GitHub, configure dans `.env` :
+
+```env
+BOT_AUTO_UPDATE_ENABLED=true
+BOT_AUTO_UPDATE_INTERVAL_MS=3600000
+```
+
+Le premier contrôle démarre 60 secondes après la restauration des sessions, puis se répète selon l’intervalle (1 heure par défaut; minimum 5 minutes, maximum 7 jours). Il suit le dépôt et la branche choisis avec `.update repo` / `.update branch`, ou `BOT_UPDATE_REPO` / `BOT_UPDATE_BRANCH`. L’auto-updater n’applique que les fast-forward sans changements locaux suivis; il ignore aussi les mises à jour qui modifient `package.json` ou un lockfile, afin de ne pas redémarrer avec des dépendances manquantes. Dans ce cas, applique la mise à jour manuellement, lance `npm install`, puis redémarre.
+
+Après une mise à jour automatique, le bot envoie un `SIGTERM` pour fermer proprement ses sockets et synchroniser MongoDB. **L’hébergeur doit relancer le processus après sa sortie** (politique `restart always` de PM2, systemd, Docker ou du panel); sans superviseur configuré, le bot s’arrête et doit être relancé manuellement. L’option reste désactivée par défaut.
 
 ---
 
