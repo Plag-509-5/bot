@@ -103,10 +103,11 @@ test('un socket résiduel est fermé avant d’en ouvrir un nouveau', () => {
   assert.ok(leftoverAt < makeSocketAt);
 });
 
-test('chaque envoi passe par le garde-fou de connexion', () => {
+test('chaque envoi passe par le garde-fou avant toute traduction ou mise en thème', () => {
   const safeAt = source.indexOf('installSafeSend(socket)');
+  const translationAt = source.indexOf('setupTranslationWrapper(socket, sanitizedNumber)');
   const themeAt = source.indexOf('setupCommandThemeWrapper(socket)');
-  assert.ok(safeAt > 0 && themeAt > safeAt);
+  assert.ok(translationAt > 0 && themeAt > translationAt && safeAt > themeAt);
 });
 
 test('la suppression de session retire MongoDB via un point d’entrée unique', () => {

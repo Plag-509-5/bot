@@ -165,6 +165,7 @@ const {
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
+const { processMessageBatch } = require('../services/message-batch');
 const {
   SESSION_KEEPALIVE_INTERVAL_MS,
   SESSION_HEALTH_CHECK_INTERVAL_MS,
@@ -807,6 +808,26 @@ const pairingGuard = createPairingGuard({
   lockTtlMs: Math.max(30000, Number(process.env.PAIRING_LOCK_TTL_MS) || 3 * 60 * 1000)
 });
 const lastConnectionActivity = new Map();
+const messageProcessingStats = new Map();
+
+function getMessageProcessingStats(number) {
+  const key = String(number || '').replace(/[^0-9]/g, '');
+  if (!key) return null;
+  let stats = messageProcessingStats.get(key);
+  if (!stats) {
+    stats = {
+      received: 0,
+      processed: 0,
+      errors: 0,
+      lastReceivedAt: null,
+      lastProcessedAt: null,
+      lastError: null,
+      lastErrorAt: null
+    };
+    messageProcessingStats.set(key, stats);
+  }
+  return stats;
+}
 
 const socketCreationTime = new Map();
 
@@ -1646,10 +1667,15 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
 }
 
 function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', ({ messages = [] } = {}) => withCommandTheme(async () => {
+  socket.ev.on('messages.upsert', ({ messages = [] } = {}) => {
     if (!Array.isArray(messages) || !messages.length) return;
-    const msg = messages[0];
-    if (!msg?.message || !msg?.key?.remoteJid) return;
+    const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
+    if (batchStats) {
+      batchStats.received += messages.length;
+      batchStats.lastReceivedAt = Date.now();
+    }
+    void processMessageBatch(messages, msg => withCommandTheme(async () => {
+      if (!msg?.message || !msg?.key?.remoteJid) return;
 
     const remoteJid = msg.key.remoteJid;
     if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
@@ -1665,7 +1691,7 @@ function setupCommandHandlers(socket, number) {
     if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommandMappings) {
       deleteSessionStore(sanitizedBot);
     } else {
-      for (const incoming of messages) {
+      for (const incoming of [msg]) {
         if (!incoming?.key?.id || !incoming?.message) continue;
         if (unwrapAntideleteMessage(incoming.message).message?.reactionMessage) continue;
         if (shouldCacheIncomingMessage({
@@ -10745,8 +10771,22 @@ case 'resetconfig': {
       console.error('Command handler error:', err);
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
-
-  }));
+    }), (error, { index, message }) => {
+      if (batchStats) {
+        batchStats.errors += 1;
+        batchStats.lastErrorAt = Date.now();
+        batchStats.lastError = String(error?.message || error).slice(0, 300);
+      }
+      console.error(
+        `[SESSION ${number || 'inconnue'}] traitement messages.upsert #${index} (${message?.key?.id || 'sans id'}) :`,
+        error?.stack || error
+      );
+    }, () => {
+      if (!batchStats) return;
+      batchStats.processed += 1;
+      batchStats.lastProcessedAt = Date.now();
+    });
+  });
 }
 
 // ---------------- message handlers ----------------
@@ -10777,6 +10817,7 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     pairingSockets.delete(sanitized);
     socketCreationTime.delete(sanitized);
     lastConnectionActivity.delete(sanitized);
+    messageProcessingStats.delete(sanitized);
     connectionLifecycles.delete(sanitized);
     socketRuntimeMetadata.delete(sanitized);
     deleteSessionStore(sanitized);
@@ -10836,6 +10877,7 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   activeSockets.delete(sanitized);
   socketCreationTime.delete(sanitized);
   lastConnectionActivity.delete(sanitized);
+  messageProcessingStats.delete(sanitized);
   connectionLifecycles.delete(sanitized);
   socketRuntimeMetadata.delete(sanitized);
   deleteSessionStore(sanitized);
@@ -11209,11 +11251,11 @@ const pairingReadyResult = socket.authState.creds.registered
       () => ({ ok: true }),
       (error) => ({ ok: false, error })
     );
-// Garde-fou d'envoi : installé avant les handlers métier pour que tous les
-// `socket.sendMessage` du bot vérifient la connexion réelle.
-installSafeSend(socket);
+// Les wrappers fonctionnels sont installés avant le garde-fou afin que
+// safe-send vérifie l'état Baileys avant toute traduction ou autre travail.
 await setupTranslationWrapper(socket, sanitizedNumber);
 setupCommandThemeWrapper(socket);
+installSafeSend(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
@@ -11710,9 +11752,9 @@ router.get('/api/active', async (req, res) => {
 });
 
 /**
- * Diagnostic des sessions : source de l'état d'authentification, nombre de clés
- * Signal, écritures en attente, état de la websocket et statistiques d'envoi.
- * C'est l'endroit où regarder quand une réponse ne part pas.
+ * Diagnostic des sessions : source auth, clés Signal, websocket, messages reçus
+ * et traités, erreurs du handler et statistiques d'envoi. C'est l'endroit où
+ * localiser un cas où le téléphone affiche le compte connecté sans réponse du bot.
  */
 router.get('/api/session/health', async (req, res) => {
   try {
@@ -11727,6 +11769,7 @@ router.get('/api/session/health', async (req, res) => {
         clesSignal: auth ? auth.keyCount() : null,
         ecrituresEnAttente: auth ? auth.pendingWrites() : null,
         envois: typeof getSendStats === 'function' ? getSendStats(socket) : null,
+        traitementMessages: { ...getMessageProcessingStats(number) },
         derniereActivite: lastConnectionActivity.get(number) || null,
         runtimeBaileys: socketRuntimeMetadata.get(number) || null,
         cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null

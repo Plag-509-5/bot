@@ -124,7 +124,10 @@ par les sessions sans afficher l'URI ni le mot de passe.
 
 **Diagnostic en direct** : `GET /api/session/health` (dashboard authentifié)
 indique `stockageSessions: "mongodb"`, l'état de la connexion, le nombre de clés
-Signal, les écritures en attente et l'état de chaque websocket.
+Signal, les écritures en attente et l'état de chaque websocket. `traitementMessages`
+compte les upserts reçus/traités et les erreurs; `envois` donne les envois réussis
+ou échoués. Si `received` n'augmente pas après un message WhatsApp, le défaut est
+avant le routeur de commandes; `lastError` aide à localiser une panne du handler.
 
 ---
 
