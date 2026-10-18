@@ -221,7 +221,7 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_RECORDING: false,
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
   PREFIX: '.',
-  AUTO_ONLINE: false,
+  AUTO_ONLINE: true,
   ANTI_TAG_MODE: 'off',
   antistatusmention: false,
   antistatusmention_threshold: 2,
@@ -1181,11 +1181,8 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     const cfg = await loadSessionConfigMerged(sessionId);
 
     try {
-      if (configEnabled(cfg.AUTO_ONLINE, false)) {
-        await socket.sendPresenceUpdate('available', message.key.remoteJid);
-      }
-
-      if (configEnabled(cfg.AUTO_ONLINE, false) && configEnabled(cfg.AUTO_RECORDING, false)) {
+      await applyAlwaysOnlineSetting(socket, true, message.key.remoteJid);
+      if (configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
 
@@ -1623,7 +1620,7 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
       isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
       onStart: async () => {
         presenceStarted = true;
-        await wakeForCommand(socket, msg, sessionConfig, { sleepAfterMs: 60_000 });
+        await wakeForCommand(socket, msg, sessionConfig);
         if (!configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket.sendPresenceUpdate === 'function') {
           await socket.sendPresenceUpdate('composing', remoteJid).catch(() => {});
         }
@@ -2141,8 +2138,8 @@ function setupCommandHandlers(socket, number) {
       return;
     }
 
-    // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
-    // explicitement marquée comme lue et réveille temporairement la présence.
+    // Les commandes peuvent être marquées comme lues; la présence reste déjà
+    // disponible et n'est plus basculée hors ligne après leur exécution.
     await wakeForCommand(socket, msg, sessionCfg);
     // Évite les écritures de logs synchrones et l’exposition du contenu privé
     // à chaque commande; le détail n’est activé qu’en mode debug.
@@ -4276,12 +4273,18 @@ case 'config': {
       case 'online': {
         const val = (args[1] || '').toLowerCase();
         if (val === 'on' || val === 'off') {
-          cfg.AUTO_ONLINE = val === 'on';
+          // Ancienne option conservée pour compatibilité : le mode indisponible
+          // après une commande a été retiré, et la session reste toujours en ligne.
+          cfg.AUTO_ONLINE = true;
           await setUserConfigInMongo(sanitized, cfg);
-          await applyAlwaysOnlineSetting(socket, cfg.AUTO_ONLINE, sender);
-          await socket.sendMessage(sender, { text: `✅ ALWAYS_ONLINE : ${val.toUpperCase()}` }, { quoted: msg });
+          await applyAlwaysOnlineSetting(socket, true, sender);
+          await socket.sendMessage(sender, {
+            text: val === 'off'
+              ? 'ℹ️ Le mode hors ligne a été retiré. La session reste disponible en permanence.'
+              : '✅ Présence en ligne permanente activée.'
+          }, { quoted: msg });
         } else {
-          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off` }, { quoted: msg });
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off (off est conservé pour compatibilité)` }, { quoted: msg });
         }
         break;
       }
@@ -4327,7 +4330,7 @@ case 'config': {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
-          AUTO_ONLINE: typeof cfg.AUTO_ONLINE === 'undefined' ? false : cfg.AUTO_ONLINE,
+          AUTO_ONLINE: true,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
           PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
@@ -4337,7 +4340,7 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
-          `AUTO_ONLINE: ${merged.AUTO_ONLINE}`,
+          `AUTO_ONLINE: ON (permanent) — le mode OFFLINE est retiré`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
           `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
@@ -4353,7 +4356,7 @@ case 'config': {
           '.config autoview on|off',
           '.config autolike on|off',
           '.config autorec on|off',
-          '.config alwaysonline on|off',
+          '.config alwaysonline on|off (off conservé pour compatibilité)',
           '.config setlikeemoji <emoji1> <emoji2> ...',
           '.config setprefix <prefix|off>',
           '.config show'
@@ -10749,9 +10752,8 @@ case 'resetconfig': {
 // ---------------- message handlers ----------------
 
 function setupMessageHandlers() {
-  // La présence et les accusés de lecture sont gérés après reconnaissance de la
-  // commande dans setupCommandHandlers. Ne rien envoyer ici évite de réveiller
-  // le compte pour un message ordinaire lorsque AUTO_ONLINE est désactivé.
+  // La disponibilité est maintenue à l'ouverture du socket Baileys. Ce handler
+  // ne doit ni envoyer unavailable ni modifier la présence des messages ignorés.
 }
 
 // ---------------- cleanup helper ----------------
@@ -11179,7 +11181,7 @@ async function EmpirePair(number, res, options = {}) {
       printQRInTerminal: false,
       logger,
       keepAliveIntervalMs: SESSION_KEEPALIVE_INTERVAL_MS,
-      markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
+      markOnlineOnConnect: true,
       browser: WA_BROWSER
     });
 
@@ -11317,8 +11319,7 @@ handleMessageRevocation(socket, sanitizedNumber);
           await auth.saveCreds();
           await addNumberToMongo(sanitizedNumber);
 
-          const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, true);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -11404,7 +11405,7 @@ Le bot est maintenant connecté et fonctionnel.`,
             console.error('Failed during connect-message edit sequence:', e);
           }
 
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, true);
 
         } catch (e) {
           // Ne JAMAIS redémarrer tout le processus ici : ça tuerait toutes les

@@ -166,7 +166,8 @@ Le navigateur est construit avec `Browsers.ubuntu('Chrome')`. Ce tuple produit
 les libellés canoniques `Chrome (Ubuntu)` exigés plus strictement par le flux
 pairing-code ; l'ancien troisième champ artisanal `20.0.04` n'est plus utilisé.
 `markOnlineOnConnect` ne participe pas au handshake d'appairage (Baileys ne le
-consulte qu'après `connection=open`) et reste donc piloté par `AUTO_ONLINE`.
+consulte qu'après `connection=open`) et reste activé pour chaque socket afin que
+la présence disponible ne dépende pas de l'exécution d'une commande.
 
 Si l'hébergeur bloque exceptionnellement la lecture de `sw.js`, définir
 `WA_WEB_VERSION=2.3000.xxxxxxxxxx` avec une révision actuelle. Laisser la variable
@@ -442,8 +443,9 @@ Chaque session peut être configurée directement dans WhatsApp par le propriét
 .delsudo 509XXXXXXXX
 ```
 
-- `alwaysonline on` garde la présence du compte disponible.
-- `alwaysonline off` applique la présence `unavailable`. Quand le chatbot est OFF, un message ordinaire est ignoré sans appel à `readMessages`; une commande reconnue ou un message traité par le chatbot est marqué comme lu, réveille temporairement le bot, puis celui-ci repasse hors ligne.
+- La présence du socket reste `available` après la connexion; elle n’est plus basculée sur `unavailable` entre les commandes. Cela ne remplace pas les IQ ping-pong et le watchdog qui surveillent réellement le socket.
+- `.config alwaysonline on|off` reste reconnu pour compatibilité avec les anciennes configurations; `off` ne désactive plus la présence.
+- Quand le chatbot est OFF, un message ordinaire reste ignoré sans appel à `readMessages`; une commande reconnue ou un message traité par le chatbot est marqué comme lu, sans mettre la session hors ligne ensuite.
 - `setprefix off` enregistre un préfixe vide. Dans ce mode, les commandes enregistrées sont exécutées dès le premier mot; `bonjour menu` n’est pas une commande. Les textes inconnus sont ignorés si le chatbot est OFF et transmis à Kaido s’il est ON.
 - Pour réactiver le point depuis le mode sans préfixe : `config setprefix .`.
 - `.mode public|private` est enregistré par numéro de session et restauré après redémarrage.
