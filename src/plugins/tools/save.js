@@ -216,7 +216,8 @@ module.exports = {
       const quotedContext = getQuotedMessageFromContext(msg);
       const source = statusQuote?.message || quoted;
       const viewOnceMedia = extractViewOnceMedia(source);
-      if (viewOnceMedia?.isViewOnce && typeof context.downloadContentFromMessage === 'function') {
+      if ((viewOnceMedia?.isViewOnce || context.isReactionCommand) && viewOnceMedia
+          && typeof context.downloadContentFromMessage === 'function') {
         const stream = await context.downloadContentFromMessage(viewOnceMedia.content, viewOnceMedia.type);
         const buffer = await collectMediaStream(stream);
         if (!buffer.length) throw new Error('Le flux view-once téléchargé est vide.');

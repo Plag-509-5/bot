@@ -19,6 +19,15 @@ function unwrapMessage(message) {
   return current || {};
 }
 
+function snapshotMessageEnvelope(message) {
+  if (!message || typeof message !== 'object') return message;
+  return {
+    ...message,
+    ...(message.key && typeof message.key === 'object' ? { key: { ...message.key } } : {}),
+    message: message.message
+  };
+}
+
 function getImageMessage(message) {
   const content = unwrapMessage(message?.message || message);
   return content.imageMessage || null;
@@ -53,6 +62,7 @@ function createMediaAlbumStore({
     const isAlbumParent = Boolean(content.albumMessage);
     const parentId = association?.id || (isAlbumParent ? message.key.id : null);
     if (!parentId || (!isAlbumParent && !getImageMessage(message))) return false;
+    const stableMessage = snapshotMessageEnvelope(message);
 
     prune();
     const key = `${remoteJid}\u0000${parentId}`;
@@ -70,7 +80,7 @@ function createMediaAlbumStore({
       album.expectedImageCount = Math.max(album.expectedImageCount, expected);
     } else if (getImageMessage(message)) {
       album.messages.delete(message.key.id);
-      album.messages.set(message.key.id, message);
+      album.messages.set(message.key.id, stableMessage);
       while (album.messages.size > maxMessagesPerAlbum) {
         album.messages.delete(album.messages.keys().next().value);
       }
@@ -99,6 +109,7 @@ function createMediaAlbumStore({
 
 module.exports = {
   createMediaAlbumStore,
+  snapshotMessageEnvelope,
   unwrapMessage,
   getImageMessage,
   albumAssociation

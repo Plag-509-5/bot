@@ -2,7 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createMediaAlbumStore, getImageMessage, albumAssociation } = require('../src/services/media-album-store');
+const {
+  createMediaAlbumStore,
+  snapshotMessageEnvelope,
+  getImageMessage,
+  albumAssociation
+} = require('../src/services/media-album-store');
 
 function mediaMessage({ id, parentId, remoteJid = '120@g.us', timestamp = 100, mime = 'image/jpeg' }) {
   return {
@@ -38,6 +43,18 @@ test('album cache indexes media by Baileys parentMessageKey and isolates chats',
 
   clock += 501;
   assert.equal(store.getImages('120@g.us', 'album-1').messages.length, 0);
+});
+
+test('message snapshots retain ephemeral wrappers when the live message is unwrapped in place', () => {
+  const original = {
+    key: { id: 'once-1', remoteJid: '246454467731604@lid' },
+    message: { ephemeralMessage: { message: { viewOnceMessageV2: { message: { imageMessage: {} } } } } }
+  };
+  const snapshot = snapshotMessageEnvelope(original);
+  original.message = original.message.ephemeralMessage.message;
+  assert.ok(snapshot.message.ephemeralMessage);
+  assert.ok(snapshot.message.ephemeralMessage.message.viewOnceMessageV2);
+  assert.notEqual(snapshot.key, original.key);
 });
 
 test('sticker pack metadata is encoded as EXIF and reuses the supplied pack id', async () => {
@@ -117,14 +134,18 @@ test('spack converts and sends each cached album photo with shared pack metadata
     store.record('120@g.us', second);
 
     const sent = [];
+    const parentMessage = {
+      key: { id: 'album-1', remoteJid: '120@g.us' },
+      message: { albumMessage: { expectedImageCount: 2 } }
+    };
     const msg = {
       key: { id: 'command-1', remoteJid: '120@g.us' },
       message: {
         extendedTextMessage: {
           text: '.spack Vacances | Plag by Kᴀɪᴅᴏ ᴍD',
           contextInfo: {
-            stanzaId: 'photo-1',
-            quotedMessage: first.message
+            stanzaId: 'album-1',
+            quotedMessage: parentMessage.message
           }
         }
       }

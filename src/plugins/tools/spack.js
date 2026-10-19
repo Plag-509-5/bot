@@ -2,7 +2,7 @@
 
 const { createStickerFromMedia } = require('../../lib/s-utils');
 const { addStickerPackMetadata, createStickerPackId } = require('../../lib/sticker-pack');
-const { getImageMessage, albumAssociation } = require('../../services/media-album-store');
+const { getImageMessage, albumAssociation, unwrapMessage } = require('../../services/media-album-store');
 
 const DEFAULT_AUTHOR = 'Kᴀɪᴅᴏ ᴍD';
 const MAX_ALBUM_IMAGES = 30;
@@ -23,7 +23,7 @@ async function readMediaBuffer(downloadContentFromMessage, imageMessage) {
   return Buffer.concat(chunks);
 }
 
-function quotedImageRecord(msg, from) {
+function quotedRecord(msg, from) {
   const contextInfo = msg.message?.extendedTextMessage?.contextInfo
     || msg.message?.imageMessage?.contextInfo
     || msg.message?.documentMessage?.contextInfo
@@ -44,33 +44,43 @@ module.exports = {
   alias: ['stickerpack'],
   category: 'tools',
   description: 'Convertit un album WhatsApp en stickers avec le même nom de pack et auteur',
-  usage: '.spack nom | auteur by Kᴀɪᴅᴏ ᴍD (en réponse à une photo de l’album)',
+  usage: '.spack nom | auteur by Kᴀɪᴅᴏ ᴍD (en répondant au message album)',
   parsePackDetails,
   async execute({ socket, msg, from, args, downloadContentFromMessage, getAlbumImages }) {
-    const targetRecord = quotedImageRecord(msg, from);
+    const targetRecord = quotedRecord(msg, from);
     const currentImage = getImageMessage(msg);
+    const record = targetRecord || (currentImage ? msg : null);
     const targetMessage = targetRecord?.message || (currentImage ? msg.message : null);
+    const targetContent = unwrapMessage(targetMessage);
     const targetImage = getImageMessage(targetMessage);
-    if (!targetImage) {
+    const isAlbumMessage = Boolean(targetContent.albumMessage);
+    const parentMessageId = isAlbumMessage
+      ? targetRecord?.key?.id
+      : albumAssociation(record)?.id;
+
+    if (!targetImage && !isAlbumMessage) {
       await socket.sendMessage(from, {
-        text: '❌ Réponds à une photo de l’album avec `.spack nom | auteur by Kᴀɪᴅᴏ ᴍD`.'
+        text: '❌ Réponds directement au message album (pas à une photo séparée) avec `.spack nom | auteur by Kᴀɪᴅᴏ ᴍD`.'
       }, { quoted: msg });
       return true;
     }
 
     const details = parsePackDetails(args);
-    const record = targetRecord || (currentImage ? msg : null);
-    const association = albumAssociation(record ? { ...record, message: targetRecord?.message || msg.message } : null);
-    let images = [{ key: record?.key || msg.key, message: record?.message || msg.message }];
-    let expectedImageCount = 0;
-    if (association?.id && typeof getAlbumImages === 'function') {
-      const stored = getAlbumImages(from, association.id, images[0]);
+    let images = [];
+    let expectedImageCount = Number(targetContent.albumMessage?.expectedImageCount) || 0;
+    if (parentMessageId && typeof getAlbumImages === 'function') {
+      const stored = getAlbumImages(from, parentMessageId, targetRecord || record);
       if (stored && Array.isArray(stored.messages)) images = stored.messages;
-      expectedImageCount = Number(stored?.expectedImageCount) || 0;
+      expectedImageCount = Math.max(expectedImageCount, Number(stored?.expectedImageCount) || 0);
+    } else if (targetImage && record) {
+      images = [record];
     }
     images = images.filter(item => getImageMessage(item)).slice(0, MAX_ALBUM_IMAGES);
     if (!images.length) {
-      await socket.sendMessage(from, { text: '❌ Aucune photo exploitable trouvée dans cet album.' }, { quoted: msg });
+      const text = isAlbumMessage
+        ? '❌ J’ai bien détecté le message album, mais ses photos ne sont pas disponibles dans le cache de cette session. Réessaie juste après la réception complète de l’album.'
+        : '❌ Aucune photo exploitable trouvée dans cet album.';
+      await socket.sendMessage(from, { text }, { quoted: msg });
       return true;
     }
 

@@ -171,7 +171,7 @@ const {
   DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
   DEFAULT_MESSAGE_QUEUE_LIMIT
 } = require('../services/message-batch');
-const { createMediaAlbumStore } = require('../services/media-album-store');
+const { createMediaAlbumStore, snapshotMessageEnvelope } = require('../services/media-album-store');
 const {
   SESSION_KEEPALIVE_INTERVAL_MS,
   SESSION_HEALTH_CHECK_INTERVAL_MS,
@@ -1005,10 +1005,14 @@ function storeMessage(sessionNumber, msg) {
     store.delete(oldestKey);
   }
 
+  // Le routeur déplie parfois `msg.message` en place après le stockage. Une
+  // enveloppe séparée conserve les wrappers ephemeral/view-once pour les alias
+  // de réaction qui relisent le message cité plus tard.
+  const storedMessage = snapshotMessageEnvelope(msg);
   // Réinsérer actualise aussi l'ordre LRU de la Map.
   store.delete(msg.key.id);
-  store.set(msg.key.id, msg);
-  messageStoreTimes.set(msg, Date.now());
+  store.set(msg.key.id, storedMessage);
+  messageStoreTimes.set(storedMessage, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
@@ -1960,6 +1964,9 @@ function setupCommandHandlers(socket, number) {
           quoted: quotedPayload,
           quotedMsg: quotedPayload,
           quotedSender: quotedParticipant,
+          isReactionCommand: true,
+          getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+            mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage),
           activeSockets,
           loadUserConfigFromMongo,
           setUserConfigInMongo,

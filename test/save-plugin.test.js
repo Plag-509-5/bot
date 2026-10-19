@@ -89,7 +89,7 @@ test('.save conserve le transfert dans « Vous » et retire le drapeau vue uniqu
   assert.equal(sent.some(event => event.jid === requesterJid && event.content?.forward), false);
 });
 
-test('.save sur réaction récupère un imageMessage direct du chat @lid et le transfère dans « Vous »', async () => {
+test('.save sur réaction télécharge un média direct @lid même si le marqueur view-once a été perdu', async () => {
   const { socket, sent } = fakeSocket();
   const targetChat = '246454467731604@lid';
   const targetMessage = {
@@ -97,7 +97,6 @@ test('.save sur réaction récupère un imageMessage direct du chat @lid et le t
     message: {
       imageMessage: {
         mimetype: 'image/jpeg',
-        viewOnce: true,
         caption: 'Vue unique directe',
         url: 'https://media.example/once.jpg'
       }
@@ -132,16 +131,21 @@ test('.save sur réaction récupère un imageMessage direct du chat @lid et le t
     from: targetChat,
     sender: requesterJid,
     command: 'save',
-    quoted: recovered.message
+    quoted: recovered.message,
+    isReactionCommand: true,
+    downloadContentFromMessage: async (media, type) => {
+      assert.equal(media, targetMessage.message.imageMessage);
+      assert.equal(type, 'image');
+      return Readable.from([Buffer.from('saved from reaction')]);
+    }
   });
   assert.equal(handled, true);
 
-  const forward = sent.find(event => event.content?.forward);
-  assert.ok(forward, 'le média direct cité doit être transféré');
-  assert.equal(forward.jid, selfJid);
-  assert.equal(forward.content.forward.message.imageMessage.viewOnce, false);
-  assert.equal(forward.content.forward.message.imageMessage.caption, 'Vue unique directe');
-  assert.equal(forward.content.forward.key.id, targetMessage.key.id);
+  const saved = sent.find(event => event.jid === selfJid && event.content?.image);
+  assert.ok(saved, 'le média cité doit être téléchargé puis enregistré dans « Vous »');
+  assert.equal(saved.content.image.toString(), 'saved from reaction');
+  assert.equal(saved.content.caption, 'Vue unique directe');
+  assert.equal(sent.some(event => event.content?.forward), false);
   assert.equal(sent.some(event => event.content?.text?.includes('Réponds à un média')), false);
 });
 
@@ -182,6 +186,7 @@ test('.save via une réaction déballée envoie une vue unique éphémère vers 
     from: targetChat,
     command: 'save',
     quotedMsg: targetMessage.message,
+    isReactionCommand: true,
     downloadContentFromMessage: async (content, mediaType) => {
       assert.equal(content, image);
       assert.equal(mediaType, 'image');
