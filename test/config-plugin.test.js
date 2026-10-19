@@ -55,7 +55,7 @@ test('en mode prefixless, config setprefix . réactive immédiatement le point',
   assert.match(fixture.sent.at(-1).content.text, /\.menu/);
 });
 
-test('.config alwaysonline on/off persiste et applique la présence', async () => {
+test('.config alwaysonline off reste compatible mais maintient la session disponible', async () => {
   const on = createContext(['alwaysonline', 'on']);
   await plugin.execute(on.context);
   assert.equal(on.saved[0].config.AUTO_ONLINE, true);
@@ -63,8 +63,9 @@ test('.config alwaysonline on/off persiste et applique la présence', async () =
 
   const off = createContext(['alwaysonline', 'off']);
   await plugin.execute(off.context);
-  assert.equal(off.saved[0].config.AUTO_ONLINE, false);
-  assert.equal(off.presence[0].value, 'unavailable');
+  assert.equal(off.saved[0].config.AUTO_ONLINE, true);
+  assert.equal(off.presence[0].value, 'available');
+  assert.match(off.sent.at(-1).content.text, /mode hors ligne a été retiré/i);
 });
 
 test('un utilisateur non propriétaire ne peut pas changer la configuration', async () => {

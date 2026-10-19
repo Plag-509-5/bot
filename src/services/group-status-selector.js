@@ -1,6 +1,7 @@
 'use strict';
 
 const DEFAULT_SELECTION_TTL_MS = 5 * 60 * 1000;
+const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus', 'style']);
 const pendingSelections = new Map();
 const selectedGroups = new Map();
 
@@ -9,11 +10,20 @@ function normalizeSessionId(value) {
 }
 
 function normalizeActorId(value) {
-  return String(value || '').trim().toLowerCase() || 'unknown';
+  return String(value || '').trim().toLowerCase().replace(/:\d+(?=@)/, '') || 'unknown';
+}
+
+function isPublicGroupStatusCommand(remoteJid, command) {
+  return String(remoteJid || '').endsWith('@g.us')
+    && PUBLIC_GROUP_STATUS_COMMANDS.has(String(command || '').toLowerCase());
 }
 
 function selectionKey(sessionId, actorId) {
   return `${normalizeSessionId(sessionId)}::${normalizeActorId(actorId)}`;
+}
+
+function selectedGroupKey(sessionId, actorId, purpose = 'swgc') {
+  return `${selectionKey(sessionId, actorId)}::${String(purpose || 'swgc').toLowerCase()}`;
 }
 
 function identityTokens(...values) {
@@ -90,13 +100,29 @@ async function listUserGroups(socket, userIdentifiers = []) {
     .sort((left, right) => left.subject.localeCompare(right.subject, 'fr', { sensitivity: 'base' }));
 }
 
-function beginGroupSelection(sessionId, actorId, groups, now = Date.now()) {
+function beginGroupSelection(sessionId, actorId, groups, now = Date.now(), purpose = 'swgc') {
   const safeGroups = (groups || []).map(group => ({
     jid: String(group.jid || ''),
     subject: cleanGroupName(group.subject),
     size: Number(group.size || 0)
   })).filter(group => group.jid.endsWith('@g.us'));
-  pendingSelections.set(selectionKey(sessionId, actorId), { groups: safeGroups, createdAt: now });
+  const keys = [...new Set((Array.isArray(actorId) ? actorId : [actorId])
+    .filter(Boolean)
+    .map(value => selectionKey(sessionId, value)))];
+  const pending = {
+    groups: safeGroups,
+    createdAt: now,
+    purpose: String(purpose || 'swgc'),
+    keys
+  };
+  for (const key of keys) {
+    const previous = pendingSelections.get(key);
+    if (!previous) continue;
+    for (const previousKey of previous.keys || [key]) {
+      if (pendingSelections.get(previousKey) === previous) pendingSelections.delete(previousKey);
+    }
+  }
+  for (const key of keys) pendingSelections.set(key, pending);
   return safeGroups;
 }
 
@@ -108,40 +134,52 @@ function resolveGroupSelection(sessionId, actorId, input, options = {}) {
   const now = options.now ?? Date.now();
   const ttlMs = options.ttlMs ?? DEFAULT_SELECTION_TTL_MS;
   if (now - pending.createdAt > ttlMs) {
-    pendingSelections.delete(key);
-    return { status: 'expired' };
+    for (const pendingKey of pending.keys || [key]) pendingSelections.delete(pendingKey);
+    return { status: 'expired', purpose: pending.purpose };
   }
 
   const raw = String(input || '').trim();
-  if (!/^\d+$/.test(raw)) return { status: 'waiting' };
+  if (!/^\d+$/.test(raw)) return { status: 'waiting', purpose: pending.purpose };
   const index = Number(raw) - 1;
   if (!Number.isSafeInteger(index) || index < 0 || index >= pending.groups.length) {
-    return { status: 'invalid', min: 1, max: pending.groups.length };
+    return { status: 'invalid', min: 1, max: pending.groups.length, purpose: pending.purpose };
   }
 
   const group = pending.groups[index];
-  pendingSelections.delete(key);
-  selectedGroups.set(key, group);
-  return { status: 'selected', group };
+  const purpose = pending.purpose || 'swgc';
+  const pendingKeys = pending.keys || [key];
+  for (const pendingKey of pendingKeys) {
+    pendingSelections.delete(pendingKey);
+    if (purpose === 'swgc' || purpose === 'style') {
+      selectedGroups.set(`${pendingKey}::${purpose}`, group);
+    }
+  }
+  return { status: 'selected', group, purpose };
 }
 
-function getSelectedGroup(sessionId, actorId) {
-  return selectedGroups.get(selectionKey(sessionId, actorId)) || null;
+function getSelectedGroup(sessionId, actorId, purpose = 'swgc') {
+  return selectedGroups.get(selectedGroupKey(sessionId, actorId, purpose)) || null;
 }
 
-function clearSelectedGroup(sessionId, actorId) {
-  return selectedGroups.delete(selectionKey(sessionId, actorId));
+function clearSelectedGroup(sessionId, actorId, purpose = 'swgc') {
+  return selectedGroups.delete(selectedGroupKey(sessionId, actorId, purpose));
 }
 
-function renderGroupSelectionList(groups, prefix = '.') {
+function renderGroupSelectionList(groups, prefix = '.', command = 'swgc') {
+  const isStyleMode = String(command || '').toLowerCase() === 'style';
+  const nextStep = isStyleMode
+    ? `Après la sélection : réponds à un audio avec ${prefix}style pour publier sa version vidéo stylisée.`
+    : `Après la sélection : ${prefix}swgc <texte>[, couleur] ou réponds à une image, une vidéo ou un audio brut avec ${prefix}swgc.`;
   const lines = [
     '👥 *CHOISIS LE GROUPE CIBLE*',
     '',
     ...groups.map((group, index) => `${index + 1}. ${cleanGroupName(group.subject)}${group.size ? ` — ${group.size} membres` : ''}`),
     '',
     'Réponds simplement avec le numéro du groupe.',
-    `Après la sélection : ${prefix}swgc <texte>[, couleur] ou réponds à un média avec ${prefix}swgc.`,
-    `Couleurs : nuit, noir, blanc, rouge, vert, bleu, jaune, violet, orange, rose, gris, cyan, turquoise, bleu nuit, or/doré ou #rrggbb. Alias : ${prefix}gcstatus.`,
+    nextStep,
+    ...(isStyleMode ? [] : [
+      `Couleurs : nuit, noir, blanc, rouge, vert, bleu, jaune, violet, orange, rose, gris, cyan, turquoise, bleu nuit, or/doré ou #rrggbb. Alias : ${prefix}gcstatus.`
+    ]),
     '',
     'MUGIWARA NO PLAG • developer de Kaido MD'
   ];
@@ -158,9 +196,12 @@ function actorIdFromMessage(socket, msg, remoteJid) {
 
 module.exports = {
   DEFAULT_SELECTION_TTL_MS,
+  PUBLIC_GROUP_STATUS_COMMANDS,
   normalizeSessionId,
   normalizeActorId,
+  isPublicGroupStatusCommand,
   selectionKey,
+  selectedGroupKey,
   identityTokens,
   participantMatches,
   cleanGroupName,

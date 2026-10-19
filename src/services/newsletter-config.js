@@ -5,8 +5,70 @@ const DEFAULT_NEWSLETTER_EMOJIS = ['🐉', '🔥', '💀', '👑', '💪', '😎
 function normaliseNewsletterJid(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
-  const match = raw.match(/^(\d{6,30})(?:@newsletter)?$/i);
+  // Les JID peuvent être numériques (120363…@newsletter) ou issus d'un lien
+  // d'invitation WhatsApp, par exemple 0029Vb…@newsletter.
+  const match = raw.match(/^([a-z0-9._-]{6,128})(?:@newsletter)?$/i);
   return match ? `${match[1]}@newsletter` : '';
+}
+
+function parseNewsletterMessageReference(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const urlMatch = raw.match(/^(?:https?:\/\/)?(?:www\.)?whatsapp\.com\/channel\/([^/?#\s]+)\/([^/?#\s,]+)(?:[?#].*)?$/i);
+  if (/^(?:https?:\/\/|www\.|whatsapp\.com\/)/i.test(raw) && !urlMatch) return null;
+  let channel = '';
+  let serverId = '';
+  if (urlMatch) {
+    channel = urlMatch[1];
+    serverId = urlMatch[2];
+  } else {
+    const parts = raw.split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      channel = parts[parts.length - 2];
+      serverId = parts[parts.length - 1];
+    }
+  }
+
+  serverId = String(serverId || '').replace(/[?#].*$/, '').trim();
+  const jid = normaliseNewsletterJid(channel);
+  if (!jid || !/^[a-z0-9._-]{1,128}$/i.test(serverId)) return null;
+  return { jid, serverId };
+}
+
+function extractNewsletterServerId(message) {
+  const value = message?.key?.server_id
+    ?? message?.key?.serverId
+    ?? message?.newsletterServerId;
+  return value === undefined || value === null ? '' : String(value).trim();
+}
+
+async function reactToNewsletterMessage(socket, jid, serverId, reaction, options = {}) {
+  const normalizedJid = normaliseNewsletterJid(jid);
+  const normalizedServerId = String(serverId || '').trim();
+  const emoji = String(reaction || '').trim();
+  if (!normalizedJid) throw new Error('JID de chaîne invalide');
+  if (!normalizedServerId) throw new Error('Identifiant server_id de publication manquant');
+  if (!emoji) throw new Error('Emoji de réaction manquant');
+  if (typeof socket?.newsletterReactMessage !== 'function') {
+    throw new Error('newsletterReactMessage indisponible sur le socket NYXCORE');
+  }
+
+  if (options.ensureFollow && typeof socket.newsletterFollow === 'function') {
+    let followed = false;
+    try {
+      await socket.newsletterFollow(normalizedJid);
+      followed = true;
+    } catch {
+      // La chaîne peut déjà être suivie; la réaction reste la vérification finale.
+    }
+    if (followed && Number(options.followDelayMs) > 0) {
+      await new Promise(resolve => setTimeout(resolve, Number(options.followDelayMs)));
+    }
+  }
+
+  await socket.newsletterReactMessage(normalizedJid, normalizedServerId, emoji);
+  return { jid: normalizedJid, serverId: normalizedServerId, reaction: emoji };
 }
 
 function normaliseEmojiList(value, limit = 20) {
@@ -68,5 +130,8 @@ module.exports = {
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  parseNewsletterMessageReference,
+  extractNewsletterServerId,
+  reactToNewsletterMessage,
   syncNewsletterSockets
 };

@@ -1,6 +1,8 @@
 'use strict';
 
-const idleTimers = new WeakMap();
+const presenceStates = new WeakMap();
+const PRESENCE_DUPLICATE_TTL_MS = 5_000;
+const PRESENCE_CACHE_MAX_JIDS = 64;
 
 function configEnabled(value, fallback = false) {
   if (typeof value === 'boolean') return value;
@@ -12,56 +14,56 @@ function configEnabled(value, fallback = false) {
   return fallback;
 }
 
-async function setSessionPresence(socket, online, jid) {
-  if (!socket || typeof socket.sendPresenceUpdate !== 'function') return;
-  await socket.sendPresenceUpdate(online ? 'available' : 'unavailable', jid).catch(() => {});
+async function setSessionPresence(socket, online = true, jid) {
+  // Keep the existing Baileys socket available. WhatsApp presence is separate
+  // from the websocket connection, so an unavailable update must never be used
+  // as an idle/offline policy for this session.
+  if (!online || !socket || typeof socket.sendPresenceUpdate !== 'function') return false;
+  const key = String(jid || '');
+  const now = Date.now();
+  let cache = presenceStates.get(socket);
+  if (!cache) {
+    cache = new Map();
+    presenceStates.set(socket, cache);
+  }
+
+  const previous = cache.get(key);
+  if (previous && now - previous.updatedAt < PRESENCE_DUPLICATE_TTL_MS) return true;
+
+  try {
+    await socket.sendPresenceUpdate('available', jid);
+    cache.delete(key);
+    cache.set(key, { updatedAt: now });
+    while (cache.size > PRESENCE_CACHE_MAX_JIDS) cache.delete(cache.keys().next().value);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
-function clearIdleTimer(socket) {
-  const current = idleTimers.get(socket);
-  if (current) clearTimeout(current);
-  idleTimers.delete(socket);
+// Messages that are not commands must not toggle WhatsApp availability. The
+// socket stays online from connection-open until Baileys reports a real close.
+async function handleIgnoredMessage() {
+  return false;
 }
 
-function scheduleOffline(socket, jid, delayMs = 30_000) {
-  clearIdleTimer(socket);
-  const timer = setTimeout(() => {
-    setSessionPresence(socket, false, jid).catch(() => {});
-    idleTimers.delete(socket);
-  }, delayMs);
-  timer.unref?.();
-  idleTimers.set(socket, timer);
-}
-
-async function handleIgnoredMessage(socket, msg, sessionConfig = {}) {
-  if (configEnabled(sessionConfig.AUTO_ONLINE, false)) return;
-  await setSessionPresence(socket, false, msg?.key?.remoteJid);
-}
-
-async function wakeForCommand(socket, msg, sessionConfig = {}, options = {}) {
-  const alwaysOnline = configEnabled(sessionConfig.AUTO_ONLINE, false);
-  const autoRecording = configEnabled(sessionConfig.AUTO_RECORDING, false);
+async function wakeForCommand(socket, msg, sessionConfig = {}) {
   const jid = msg?.key?.remoteJid;
 
-  if (!alwaysOnline && !msg?.key?.fromMe && msg?.key) {
-    // Une commande est le seul message explicitement marqué comme lu par ce handler.
-    await socket.readMessages?.([msg.key]).catch(() => {});
+  if (!msg?.key?.fromMe && msg?.key && typeof socket?.readMessages === 'function') {
+    try { await socket.readMessages([msg.key]); } catch (_) {}
   }
 
-  if (autoRecording) {
-    await socket.sendPresenceUpdate?.('recording', jid).catch(() => {});
-  } else {
-    await setSessionPresence(socket, true, jid);
+  await setSessionPresence(socket, true, jid);
+  if (configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket?.sendPresenceUpdate === 'function') {
+    try { await socket.sendPresenceUpdate('recording', jid); } catch (_) {}
   }
-
-  if (!alwaysOnline) scheduleOffline(socket, jid, options.sleepAfterMs || 30_000);
 }
 
-async function applyAlwaysOnlineSetting(socket, enabled, jid) {
-  const online = configEnabled(enabled, false);
-  clearIdleTimer(socket);
-  await setSessionPresence(socket, online, jid);
-  return online;
+async function applyAlwaysOnlineSetting(socket, _enabled, jid) {
+  // Backward-compatible entry point for the old `alwaysonline on|off` option.
+  // The offline mode was removed; `off` is intentionally treated as online.
+  return setSessionPresence(socket, true, jid);
 }
 
 module.exports = {
@@ -70,5 +72,7 @@ module.exports = {
   handleIgnoredMessage,
   wakeForCommand,
   applyAlwaysOnlineSetting,
-  _test: { clearIdleTimer, scheduleOffline }
+  _test: {
+    clearPresenceCache(socket) { presenceStates.delete(socket); }
+  }
 };

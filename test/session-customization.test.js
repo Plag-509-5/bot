@@ -67,7 +67,7 @@ test('les alias sticker sont isolés par numéro de session', () => {
 });
 
 test('les alias emoji sont isolés par numéro de session', () => {
-  reactionStore._test.reactionCmds.clear();
+  reactionStore._test.clearReactionCache();
   reactionStore._test.cacheReaction({ emoji: '🔥', command: 'ping', sessionId: '50911111111' });
   reactionStore._test.cacheReaction({ emoji: '🔥', command: 'menu', sessionId: '50922222222' });
 
@@ -75,6 +75,8 @@ test('les alias emoji sont isolés par numéro de session', () => {
   assert.equal(reactionStore.findReactionCommand('🔥', '50922222222').command, 'menu');
   assert.equal(reactionStore.findReactionCommand('🔥', '50933333333'), null);
   assert.equal(reactionStore.getAllReactionCommands('50922222222').length, 1);
+  assert.equal(reactionStore.hasReactionCommands('50911111111'), true);
+  assert.equal(reactionStore.hasReactionCommands('50933333333'), false);
 });
 
 test('les index Mongo des alias sont composés avec la session et rechargent les documents', async () => {

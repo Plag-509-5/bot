@@ -1,15 +1,63 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { waitForReady } = require('../lib/safe-send');
 
-const GROUP_STATUS_MESSAGE_TYPES = [
-  'extendedTextMessage',
-  'imageMessage',
-  'videoMessage',
-  'audioMessage'
-];
-
+const PERSONAL_STATUS_JID = 'status@broadcast';
+const STATUS_ACK_GRACE_MS = 1500;
 let nyxHelpersPromise = null;
+
+function createStatusAckMonitor(socket, messageId, graceMs = STATUS_ACK_GRACE_MS) {
+  const eventEmitter = socket?.ev;
+  if (!eventEmitter || typeof eventEmitter.on !== 'function') {
+    return { wait: async () => null, close() {} };
+  }
+
+  let resolveAck;
+  let waitPromise = null;
+  let timer = null;
+  let closed = false;
+  const ackPromise = new Promise(resolve => { resolveAck = resolve; });
+  const listener = updates => {
+    for (const item of Array.isArray(updates) ? updates : [updates]) {
+      if (item?.key?.id !== messageId) continue;
+      const status = item?.update?.status;
+      const code = item?.update?.messageStubParameters?.[0];
+      if (status === 0 || String(status).toUpperCase() === 'ERROR' || code !== undefined) {
+        resolveAck({ code: code === undefined ? '' : String(code) });
+        return;
+      }
+    }
+  };
+
+  eventEmitter.on('messages.update', listener);
+  return {
+    wait() {
+      if (!waitPromise) {
+        waitPromise = new Promise(resolve => {
+          timer = setTimeout(() => resolve(null), Math.max(0, Number(graceMs) || 0));
+          ackPromise.then(result => {
+            if (timer) clearTimeout(timer);
+            timer = null;
+            resolve(result);
+          });
+        });
+      }
+      return waitPromise;
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (typeof eventEmitter.off === 'function') {
+        eventEmitter.off('messages.update', listener);
+      } else if (typeof eventEmitter.removeListener === 'function') {
+        eventEmitter.removeListener('messages.update', listener);
+      }
+    }
+  };
+}
 
 function loadNyxHelpers() {
   if (!nyxHelpersPromise) nyxHelpersPromise = import('@nyxcore/nyxcoresocket');
@@ -20,24 +68,109 @@ function isGroupJid(jid) {
   return typeof jid === 'string' && jid.endsWith('@g.us');
 }
 
-function markInnerMessageAsGroupStatus(message) {
-  const next = { ...(message || {}) };
-  const messageType = GROUP_STATUS_MESSAGE_TYPES.find(type => next[type]);
-  if (!messageType) return next;
-  next[messageType] = {
-    ...next[messageType],
-    contextInfo: {
-      ...(next[messageType].contextInfo || {}),
-      isGroupStatus: true
-    }
-  };
-  return next;
+function queueOwnMessageUpsert(socket, message) {
+  if (typeof socket?.upsertMessage !== 'function') return;
+  process.nextTick(() => {
+    Promise.resolve().then(() => {
+      const upsert = () => socket.upsertMessage(message, 'append');
+      return typeof socket.messageMutex?.mutex === 'function'
+        ? socket.messageMutex.mutex(upsert)
+        : upsert();
+    }).catch(error => {
+      socket.logger?.warn?.({ error, messageId: message?.key?.id }, 'Failed to add relayed status to the local message stream');
+    });
+  });
 }
 
 /**
- * Generate with NYXCORE's Baileys utilities, but keep the project's authenticated
- * session socket for media upload and relay. This lets the plugin use
- * sendGroupStatus() without opening a second WhatsApp connection.
+ * Publie un statut personnel via le relay du socket Baileys de la session.
+ * NYXCORE construit le WAMessage; le JID status@broadcast et l'audience sont
+ * ensuite remis explicitement à relayMessage, qui chiffre et distribue le
+ * statut sans ouvrir une autre connexion WhatsApp.
+ */
+async function personalStatus(socket, content, options = {}) {
+  if (!socket || typeof socket.relayMessage !== 'function') {
+    throw new Error('Socket WhatsApp invalide.');
+  }
+  if (!content || typeof content !== 'object') {
+    throw new Error('Contenu de statut invalide.');
+  }
+
+  const userJid = socket.authState?.creds?.me?.id || socket.user?.id;
+  if (!userJid) {
+    throw new Error('Le socket doit être connecté avant de publier un statut personnel.');
+  }
+  const statusJidList = [...new Set((Array.isArray(options.statusJidList) ? options.statusJidList : [])
+    .map(jid => String(jid || '').trim())
+    .filter(Boolean))];
+  if (!statusJidList.length) {
+    throw new Error('La liste des destinataires du statut est vide.');
+  }
+
+  const readiness = await waitForReady(socket);
+  if (!readiness.ready) {
+    throw new Error(`Connexion WhatsApp indisponible (${readiness.reason}).`);
+  }
+
+  const { backgroundColor: contentBackgroundColor, font: contentFont, ...payload } = content;
+  const upload = typeof socket.waUploadToServer === 'function'
+    ? socket.waUploadToServer.bind(socket)
+    : undefined;
+  const hasMedia = ['image', 'video', 'audio', 'document', 'sticker']
+    .some(mediaType => Object.hasOwn(payload, mediaType));
+  if (hasMedia && !upload) {
+    throw new Error('Téléversement média indisponible sur ce socket WhatsApp.');
+  }
+
+  const { generateWAMessage, generateMessageIDV2 } = await loadNyxHelpers();
+  const generated = await generateWAMessage(PERSONAL_STATUS_JID, payload, {
+    logger: options.logger || socket.logger,
+    userJid,
+    upload,
+    backgroundColor: options.backgroundColor ?? contentBackgroundColor,
+    font: options.font ?? contentFont,
+    messageId: generateMessageIDV2(userJid),
+    ...options
+  });
+
+  if (!generated?.message || !generated?.key?.id) {
+    throw new Error('NYXCORE n’a pas pu construire le statut personnel.');
+  }
+
+  const ackMonitor = createStatusAckMonitor(socket, generated.key.id);
+  try {
+    await socket.relayMessage(PERSONAL_STATUS_JID, generated.message, {
+      messageId: generated.key.id,
+      statusJidList,
+      useCachedGroupMetadata: false,
+      ...(options.additionalAttributes && typeof options.additionalAttributes === 'object'
+        ? { additionalAttributes: options.additionalAttributes }
+        : {}),
+      ...(typeof options.useUserDevicesCache === 'boolean'
+        ? { useUserDevicesCache: options.useUserDevicesCache }
+        : {})
+    });
+    const ackError = await ackMonitor.wait();
+    if (ackError) {
+      const code = ackError.code ? ` (code ${ackError.code})` : '';
+      const hint = ackError.code === '479'
+        ? ' Vérifie la résolution PN/LID et les destinataires du statut.'
+        : '';
+      throw new Error(`WhatsApp a rejeté le statut${code}.${hint}`);
+    }
+  } finally {
+    ackMonitor.close();
+  }
+  // Baileys sendMessage ajoute aussi les messages sortants au flux local. Le
+  // relay direct ne le fait pas, donc reproduire cet append sans bloquer l’envoi.
+  queueOwnMessageUpsert(socket, generated);
+  return generated;
+}
+
+/**
+ * Publie un statut de groupe avec le socket Baileys déjà authentifié par la
+ * session MongoDB. Le wrapper est le même que celui utilisé par NYXCORE;
+ * surtout, les paquets média doivent rester identifiables par le relay Baileys.
  */
 async function groupStatus(socket, jid, content, options = {}) {
   if (!socket || typeof socket.relayMessage !== 'function') {
@@ -59,9 +192,6 @@ async function groupStatus(socket, jid, content, options = {}) {
     font: contentFont,
     ...payload
   } = content;
-  const { backgroundColor: optionBackgroundColor, font: optionFont, ...relayOptions } = options || {};
-  const backgroundColor = optionBackgroundColor ?? contentBackgroundColor;
-  const font = optionFont ?? contentFont;
   const upload = typeof socket.waUploadToServer === 'function'
     ? socket.waUploadToServer.bind(socket)
     : undefined;
@@ -71,48 +201,35 @@ async function groupStatus(socket, jid, content, options = {}) {
     throw new Error('Téléversement média indisponible sur ce socket WhatsApp.');
   }
 
-  const generated = await generateWAMessage(
-    jid,
-    {
-      ...payload,
-      contextInfo: {
-        ...(payload.contextInfo || {}),
-        isGroupStatus: true
-      }
-    },
-    {
-      logger: options?.logger || socket.logger,
-      userJid: socket.user.id,
-      upload,
-      backgroundColor,
-      font,
-      messageId: generateMessageIDV2(socket.user.id),
-      ...relayOptions
-    }
-  );
+  const generated = await generateWAMessage(jid, payload, {
+    logger: options?.logger || socket.logger,
+    userJid: socket.user.id,
+    upload,
+    backgroundColor: options?.backgroundColor ?? contentBackgroundColor,
+    font: options?.font ?? contentFont,
+    messageId: generateMessageIDV2(socket.user.id),
+    ...options
+  });
 
   if (!generated?.message || !generated?.key?.id) {
     throw new Error('NYXCORE n’a pas pu construire le statut de groupe.');
   }
 
-  const messageSecret = crypto.randomBytes(32);
-  const inside = markInnerMessageAsGroupStatus(generated.message);
+  // groupStatusMessageV2 transporte l’image/vidéo/audio original dans le corps
+  // chiffré. Les drapeaux `isGroupStatus` et le nœud XML `meta` ajoutés par
+  // l’ancienne version ne font pas partie de l’enveloppe NYXCORE et n’aident pas
+  // à classifier le média.
   const wrappedMessage = {
-    groupStatusMessageV2: { message: inside },
+    groupStatusMessageV2: { message: generated.message },
     messageContextInfo: {
-      ...(inside.messageContextInfo || {}),
-      messageSecret
+      ...(generated.message.messageContextInfo || {}),
+      messageSecret: crypto.randomBytes(32)
     }
   };
 
   await socket.relayMessage(jid, wrappedMessage, {
     messageId: generated.key.id,
-    ...relayOptions,
-    additionalNodes: [{
-      tag: 'meta',
-      attrs: { is_group_status: 'true' },
-      content: undefined
-    }]
+    useCachedGroupMetadata: options?.useCachedGroupMetadata
   });
   return { ...generated, message: wrappedMessage };
 }
@@ -168,9 +285,12 @@ async function buildStatusContent(m, socket, prefix, command) {
 }
 
 module.exports = {
+  personalStatus,
   groupStatus,
   installGroupStatusMethod,
   buildStatusContent,
   isGroupJid,
-  markInnerMessageAsGroupStatus
+  PERSONAL_STATUS_JID,
+  STATUS_ACK_GRACE_MS,
+  createStatusAckMonitor
 };

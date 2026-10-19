@@ -21,7 +21,8 @@ function disconnect(statusCode, message = `status ${statusCode}`) {
 function fakeSocket(registered = false) {
   return {
     authState: { creds: { registered } },
-    ev: new EventEmitter()
+    ev: new EventEmitter(),
+    ws: new EventEmitter()
   };
 }
 
@@ -167,7 +168,7 @@ test('une panne MongoDB empêche le redémarrage 515 immédiat', async () => {
   assert.match(received.persistenceError.message, /mongo down/);
 });
 
-test('waitForPairingReady attend réellement le premier update.qr', async () => {
+test('waitForPairingReady conserve update.qr comme signal de compatibilité', async () => {
   const socket = fakeSocket(false);
   let resolved = false;
   const ready = waitForPairingReady(socket, { timeoutMs: 1000 }).then(() => { resolved = true; });
@@ -182,7 +183,24 @@ test('waitForPairingReady attend réellement le premier update.qr', async () => 
   assert.equal(socket.ev.listenerCount('connection.update'), 0);
 });
 
-test('waitForPairingReady rejette une fermeture avant le stanza pair-device', async () => {
+test('waitForPairingReady accepte le premier stanza déchiffré sans aucun update.qr', async () => {
+  const socket = fakeSocket(false);
+  let resolved = false;
+  const ready = waitForPairingReady(socket, { timeoutMs: 1000 }).then(() => { resolved = true; });
+
+  socket.ev.emit('connection.update', { connection: 'connecting' });
+  socket.ws.emit('frame', Buffer.from('Noise handshake'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(resolved, false, 'une trame binaire du handshake ne suffit pas');
+
+  socket.ws.emit('frame', { tag: 'iq', attrs: {}, content: [] });
+  await ready;
+  assert.equal(resolved, true);
+  assert.equal(socket.ws.listenerCount('frame'), 0);
+  assert.equal(socket.ev.listenerCount('connection.update'), 0);
+});
+
+test('waitForPairingReady rejette une fermeture avant que le socket soit prêt', async () => {
   const socket = fakeSocket(false);
   const ready = waitForPairingReady(socket, { timeoutMs: 1000 });
   socket.ev.emit('connection.update', {
@@ -196,4 +214,5 @@ test('waitForPairingReady rejette une fermeture avant le stanza pair-device', as
     return true;
   });
   assert.equal(socket.ev.listenerCount('connection.update'), 0);
+  assert.equal(socket.ws.listenerCount('frame'), 0);
 });

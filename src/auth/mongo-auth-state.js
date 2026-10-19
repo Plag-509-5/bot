@@ -11,6 +11,7 @@
 const { proto } = require('@whiskeysockets/baileys');
 const { sanitizeNumber, credsLooksValid } = require('./auth-utils');
 const { cloneAuthValue } = require('./mongo-auth-backend');
+const { createAuthWriteCoordinator } = require('./auth-write-coordinator');
 
 class MongoAuthCorruptedError extends Error {
   constructor(message, details = {}) {
@@ -116,24 +117,22 @@ async function createMongoAuthState(number, options = {}) {
     keyCache.set(keyRef(key.type, key.id), cloneAuthValue(key.value));
   }
 
-  let writeTail = Promise.resolve();
-  let pending = 0;
   let closed = false;
   let discarded = false;
-
-  function enqueue(operation) {
-    if (closed || discarded) {
-      return Promise.reject(new Error(`État d'authentification ${sanitized} déjà fermé`));
-    }
-    pending += 1;
-    const result = writeTail.then(operation);
-    // Une écriture ratée est renvoyée à son appelant, sans condamner toutes les
-    // écritures suivantes de la file.
-    writeTail = result.catch(() => {});
-    return result.finally(() => {
-      pending = Math.max(0, pending - 1);
-    });
-  }
+  const writes = createAuthWriteCoordinator({
+    writeKeys: async changes => {
+      await backend.saveKeys(
+        sanitized,
+        changes.map(({ ref, value }) => ({ ref, value }))
+      );
+      // Le cache n'est validé qu'après l'acquittement MongoDB.
+      for (const { ref, value } of changes) {
+        if (value === null) keyCache.delete(ref);
+        else keyCache.set(ref, value);
+      }
+    },
+    writeCreds: snapshot => backend.saveCreds(sanitized, snapshot)
+  });
 
   const signalKeys = {
     async get(type, ids) {
@@ -163,33 +162,29 @@ async function createMongoAuthState(number, options = {}) {
       }
       if (!changes.length) return;
 
-      await enqueue(async () => {
-        await backend.saveKeys(
-          sanitized,
-          changes.map(({ ref, value }) => ({ ref, value }))
-        );
-        // Le cache n'est validé qu'après l'acquittement MongoDB.
-        for (const { ref, value } of changes) {
-          if (value === null) keyCache.delete(ref);
-          else keyCache.set(ref, value);
-        }
-      });
+      if (closed || discarded) {
+        throw new Error(`État d'authentification ${sanitized} déjà fermé`);
+      }
+      await writes.enqueueKeys(changes);
     }
   };
 
   async function saveCreds() {
+    if (closed || discarded) {
+      throw new Error(`État d'authentification ${sanitized} déjà fermé`);
+    }
     const snapshot = cloneAuthValue(creds);
-    await enqueue(() => backend.saveCreds(sanitized, snapshot));
+    await writes.enqueueCreds(snapshot);
   }
 
   async function flush() {
-    await writeTail;
+    await writes.flush();
   }
 
   async function close() {
     if (discarded) return;
     if (closed) {
-      await writeTail;
+      await writes.flush();
       return;
     }
 
@@ -201,7 +196,7 @@ async function createMongoAuthState(number, options = {}) {
     } catch (error) {
       saveError = error;
     }
-    await writeTail;
+    await writes.flush();
     if (saveError) throw saveError;
     closed = true;
   }
@@ -215,7 +210,7 @@ async function createMongoAuthState(number, options = {}) {
     if (discarded) return;
     discarded = true;
     closed = true;
-    await writeTail;
+    await writes.flush();
     keyCache.clear();
   }
 
@@ -238,7 +233,7 @@ async function createMongoAuthState(number, options = {}) {
     discard,
     number: sanitized,
     source,
-    pendingWrites: () => pending,
+    pendingWrites: writes.pendingWrites,
     keyCount: () => keyCache.size,
     persistNow: flush
   };

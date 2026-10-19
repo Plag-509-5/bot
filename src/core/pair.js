@@ -9,6 +9,7 @@ const moment = require('moment-timezone');
 const yts = require('yt-search');
 const Jimp = require('jimp');
 const crypto = require('crypto');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
@@ -16,6 +17,7 @@ const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPlug
 const {
   resolveSessionPrefix,
   parseCommandInput,
+  shouldRouteToChatbot,
   extractMainCommandNames
 } = require('../services/command-routing');
 const {
@@ -24,6 +26,8 @@ const {
   wakeForCommand,
   applyAlwaysOnlineSetting
 } = require('../services/presence-mode');
+const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
+const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
   collectMessageIdentifiers,
@@ -31,16 +35,21 @@ const {
   ownerNumbers,
   resolveAccess
 } = require('../services/access-control');
+const { resolveAntiStatusMode, formatKaidoStatusMention } = require('../services/status-mention-guard');
 const {
   DEFAULT_NEWSLETTER_EMOJIS,
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  parseNewsletterMessageReference,
+  extractNewsletterServerId,
+  reactToNewsletterMessage,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
   modeAllowsChat,
   normaliseAntideleteMode,
+  shouldCacheIncomingMessage,
   unwrapMessage: unwrapAntideleteMessage,
   resolveOriginalAuthor,
   resolveRevoker,
@@ -57,7 +66,11 @@ const {
 } = require('../services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd');
-const { findReactionCommand, initReactionDb } = require('../features/reaction_cmd');
+const {
+  findReactionCommand,
+  hasReactionCommands: sessionHasReactionCommands,
+  initReactionDb
+} = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
 const {
@@ -65,17 +78,43 @@ const {
   setupTranslationWrapper,
   saveSessionLanguage
 } = require('../features/translation');
+const githubUpdater = require('../services/github-updater');
+const githubUpdateSettings = require('../services/github-update-settings');
+const { createGitHubAutoUpdater } = require('../services/github-auto-updater');
+const { configureGitHubUpdateSettings } = githubUpdateSettings;
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
-const { getGroupAdminsInfo, jidToNumber } = require('../lib/normalize');
+const { getGroupAdminsInfo } = require('../lib/normalize');
+const {
+  areSameIdentity,
+  findGroupParticipant,
+  getBotJid,
+  getGroupAdminJids,
+  getGroupAdminNumbers,
+  getParticipantId,
+  getParticipantMentionJid,
+  getPhoneNumberJid,
+  isAdminParticipant,
+  isBotAdmin: isBotGroupAdmin,
+  isBotIdentity,
+  isGroupAdmin,
+  isGroupSuperAdmin,
+  isSuperAdminParticipant
+} = require('../services/group-admins');
 const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
 const {
   resolveGroupSelection,
-  actorIdFromMessage
+  actorIdFromMessage,
+  isPublicGroupStatusCommand
 } = require('../services/group-status-selector');
+const {
+  completeStatusAudienceGroupSelection,
+  STATUS_AUDIENCE_SELECTION_PURPOSE
+} = require('../plugins/owner/tostatus');
 const { handleAntiLink } = require('../handlers/antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('../handlers/antilink');
+const statusLog = require('../services/status-log');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
 const {
@@ -110,12 +149,59 @@ const {
   createPairingLifecycle,
   waitForPairingReady
 } = require('../auth/pairing-lifecycle');
+const { issuePairingCode } = require('../auth/pairing-code');
+const {
+  createPairingCodeUrlCandidates,
+  isPairingNetworkError,
+  fetchPairingCodeWithFallback
+} = require('../services/pairing-code-url');
+const { resolvePairingNumber } = require('../services/pairing-code-input');
+const { resolveReactionTargetMessage } = require('../services/reaction-target-message');
+const { createBoundedCache, isBoundedCache } = require('../services/bounded-cache');
+const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
   createBaileysVersionResolver,
   formatWaVersion
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
+const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
+const {
+  createMessageDispatcher,
+  DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_MESSAGE_QUEUE_LIMIT
+} = require('../services/message-batch');
+const { createMediaAlbumStore, snapshotMessageEnvelope } = require('../services/media-album-store');
+const {
+  SESSION_KEEPALIVE_INTERVAL_MS,
+  SESSION_HEALTH_CHECK_INTERVAL_MS,
+  SESSION_STALE_AFTER_MS,
+  getSocketOpenState,
+  forceCloseSessionSocket,
+  createSessionHealthWatcher
+} = require('../services/session-health-watcher');
+
+function resolveGroupActionTargets(metadata, identities) {
+  const candidates = Array.isArray(identities) ? identities : [identities];
+  const seen = new Set();
+  const targets = [];
+
+  for (const identity of candidates) {
+    const participant = findGroupParticipant(metadata, identity);
+    if (!participant) continue;
+    const jid = getParticipantId(participant);
+    if (!jid || seen.has(jid)) continue;
+    seen.add(jid);
+    targets.push({
+      participant,
+      jid,
+      mentionJid: getParticipantMentionJid(participant) || jid
+    });
+  }
+
+  return targets;
+}
+
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -142,11 +228,16 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_RECORDING: false,
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
   PREFIX: '.',
-  AUTO_ONLINE: false,
-  ANTI_TAG_MODE: true,
+  AUTO_ONLINE: true,
+  ANTI_TAG_MODE: 'off',
+  antistatusmention: false,
+  antistatusmention_threshold: 2,
   MODE: 'public',
   THEME: 'onigashima',
-  SUDO_USERS: []
+  SUDO_USERS: [],
+  CHATBOT_ENABLED: false,
+  STATUS_REPLY_FORWARD_ENABLED: false,
+  STATUS_REPLY_KEYWORDS: []
 };
 
 // En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
@@ -172,10 +263,17 @@ function isKnownCommandName(command) {
   return getPlugins().has(name) || LEGACY_COMMANDS.has(name);
 }
 
-const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
+const SESSION_CONFIG_CACHE_TTL_MS = 60_000;
+const SESSION_CONFIG_REFRESH_RETRY_MS = 5_000;
 const sessionConfigCache = new Map();
-const ADMIN_CACHE_TTL_MS = 5_000;
-let adminCache = { value: [], expiresAt: 0 };
+const sessionConfigLoads = new Map();
+const sessionConfigRefreshAfter = new Map();
+const sessionConfigRevision = new Map();
+const ADMIN_CACHE_TTL_MS = 60_000;
+let adminCache = { value: [], expiresAt: 0, loaded: false };
+let adminLoad = null;
+let adminRevision = 0;
+let adminRefreshAfter = 0;
 
 const config = {
   MAX_RETRIES: 3,
@@ -249,6 +347,18 @@ configureTranslationStorage({
   initMongo,
   getDb: () => mongoDB
 });
+configureGitHubUpdateSettings({
+  initMongo,
+  getDb: () => mongoDB
+});
+const githubAutoUpdater = createGitHubAutoUpdater({
+  env: process.env,
+  updater: githubUpdater,
+  settings: githubUpdateSettings,
+  // Le handler SIGTERM vide les creds Baileys/MongoDB avant que le superviseur
+  // de l’hébergeur ne relance le processus avec les nouveaux fichiers.
+  restart: () => process.kill(process.pid, 'SIGTERM')
+});
 
 // État d'authentification actif par numéro (cache mémoire d'exécution seulement).
 const authStates = new Map();
@@ -300,26 +410,45 @@ async function getAllNumbersFromMongo() {
   return Array.from(numbers);
 }
 
-async function loadAdminsFromMongo(forceRefresh = false) {
-  try {
-    if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
-    await initMongo();
-    const docs = await adminsCol.find({}).toArray();
-    const admins = [];
-    const seen = new Set();
-    for (const doc of docs) {
-      const identity = canonicalAdmin(doc);
-      const value = identity.jid || identity.raw;
-      if (!value || seen.has(value)) continue;
-      seen.add(value);
-      admins.push(value);
-    }
-    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS };
-    return [...admins];
-  } catch (e) {
-    console.error('loadAdminsFromMongo', e);
-    return adminCache.value.length ? [...adminCache.value] : [];
+async function queryAdminsFromMongo() {
+  const revision = adminRevision;
+  await initMongo();
+  const docs = await adminsCol.find({}).toArray();
+  const admins = [];
+  const seen = new Set();
+  for (const doc of docs) {
+    const identity = canonicalAdmin(doc);
+    const value = identity.jid || identity.raw;
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    admins.push(value);
   }
+  if (revision === adminRevision) {
+    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS, loaded: true };
+    adminRefreshAfter = 0;
+  }
+  return admins;
+}
+
+function startAdminRefresh() {
+  if (adminLoad) return adminLoad;
+  adminLoad = queryAdminsFromMongo()
+    .catch(error => {
+      adminRefreshAfter = Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS;
+      console.error('loadAdminsFromMongo', error);
+      return adminCache.value;
+    })
+    .finally(() => { adminLoad = null; });
+  return adminLoad;
+}
+
+async function loadAdminsFromMongo(forceRefresh = false) {
+  if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
+  if (!forceRefresh && adminCache.loaded) {
+    if (!adminLoad && adminRefreshAfter <= Date.now()) void startAdminRefresh();
+    return [...adminCache.value];
+  }
+  return [...await startAdminRefresh()];
 }
 
 // Récupérer le statut d'un groupe (welcome ou goodbye)
@@ -363,7 +492,9 @@ async function addAdminToMongo(jidOrNumber) {
       { $set: { jid, number: identity.number || null, updatedAt: new Date() } },
       { upsert: true }
     );
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Added admin ${jid}`);
     return jid;
   } catch (e) {
@@ -387,7 +518,9 @@ async function removeAdminFromMongo(jidOrNumber) {
       .map(doc => doc._id)
       .filter(Boolean);
     if (matchingIds.length) await adminsCol.deleteMany({ _id: { $in: matchingIds } });
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Removed admin ${identity.jid || identity.raw}`);
     return true;
   } catch (e) {
@@ -463,6 +596,8 @@ async function setUserConfigInMongo(number, conf) {
       { $set: { number: sanitized, config: conf, updatedAt: new Date() } },
       { upsert: true }
     );
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
+    sessionConfigRefreshAfter.delete(sanitized);
     sessionConfigCache.set(sanitized, {
       value: { ...DEFAULT_SESSION_CONFIG, ...(conf || {}) },
       expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
@@ -483,6 +618,35 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
+function refreshSessionConfig(sanitized) {
+  const current = sessionConfigLoads.get(sanitized);
+  if (current) return current;
+
+  const revision = sessionConfigRevision.get(sanitized) || 0;
+  const load = (async () => {
+    try {
+      await initMongo();
+      const doc = await configsCol.findOne({ number: sanitized });
+      const merged = { ...DEFAULT_SESSION_CONFIG, ...(doc?.config || {}) };
+      if ((sessionConfigRevision.get(sanitized) || 0) === revision) {
+        sessionConfigCache.set(sanitized, {
+          value: merged,
+          expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+        });
+      }
+      sessionConfigRefreshAfter.delete(sanitized);
+      return merged;
+    } catch (error) {
+      sessionConfigRefreshAfter.set(sanitized, Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS);
+      throw error;
+    }
+  })().finally(() => {
+    if (sessionConfigLoads.get(sanitized) === load) sessionConfigLoads.delete(sanitized);
+  });
+  sessionConfigLoads.set(sanitized, load);
+  return load;
+}
+
 async function loadSessionConfigMerged(number, forceRefresh = false) {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   if (!sanitized) return { ...DEFAULT_SESSION_CONFIG };
@@ -490,13 +654,25 @@ async function loadSessionConfigMerged(number, forceRefresh = false) {
   const cached = sessionConfigCache.get(sanitized);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.value };
 
-  const dbCfg = await loadUserConfigFromMongo(sanitized) || {};
-  const merged = { ...DEFAULT_SESSION_CONFIG, ...dbCfg };
-  sessionConfigCache.set(sanitized, {
-    value: merged,
-    expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
-  });
-  return { ...merged };
+  // Cache périmé disponible : ne jamais suspendre le traitement d'un message
+  // sur Mongo. Le rafraîchissement unique se fait en arrière-plan; une panne DB
+  // conserve la dernière configuration connue et temporise les nouvelles
+  // tentatives pour éviter une rafale de requêtes lors d'une déconnexion.
+  if (!forceRefresh && cached) {
+    if ((sessionConfigRefreshAfter.get(sanitized) || 0) <= Date.now()) {
+      void refreshSessionConfig(sanitized).catch(error => {
+        console.warn(`[CONFIG ${sanitized}] rafraîchissement en arrière-plan impossible :`, error?.message || error);
+      });
+    }
+    return { ...cached.value };
+  }
+
+  try {
+    return { ...await refreshSessionConfig(sanitized) };
+  } catch (error) {
+    if (cached) return { ...cached.value };
+    throw error;
+  }
 }
 
 // Helpers Mongo pour persister le schedule
@@ -711,6 +887,51 @@ const pairingGuard = createPairingGuard({
   lockTtlMs: Math.max(30000, Number(process.env.PAIRING_LOCK_TTL_MS) || 3 * 60 * 1000)
 });
 const lastConnectionActivity = new Map();
+const messageProcessingStats = new Map();
+const messageDispatchers = new Map();
+const eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelayMonitor.enable();
+
+function readEventLoopDelayStats() {
+  const milliseconds = value => Number.isFinite(value) ? Number((value / 1e6).toFixed(2)) : null;
+  const snapshot = {
+    p50Ms: milliseconds(eventLoopDelayMonitor.percentile(50)),
+    p95Ms: milliseconds(eventLoopDelayMonitor.percentile(95)),
+    p99Ms: milliseconds(eventLoopDelayMonitor.percentile(99)),
+    maxMs: milliseconds(eventLoopDelayMonitor.max)
+  };
+  eventLoopDelayMonitor.reset();
+  return snapshot;
+}
+
+function getMessageProcessingStats(number) {
+  const key = String(number || '').replace(/[^0-9]/g, '');
+  if (!key) return null;
+  let stats = messageProcessingStats.get(key);
+  if (!stats) {
+    stats = {
+      received: 0,
+      receivedByType: { notify: 0, append: 0, other: 0 },
+      lastReceivedType: null,
+      historyIgnored: 0,
+      processed: 0,
+      errors: 0,
+      lastReceivedAt: null,
+      lastProcessedAt: null,
+      // Âge approximatif de l’horodatage WhatsApp au moment du `messages.upsert`;
+      // à comparer entre sessions, en tenant compte d’un éventuel décalage d’horloge.
+      lastNotifyTimestampAgeMs: null,
+      maxNotifyTimestampAgeMs: 0,
+      lastError: null,
+      lastErrorAt: null,
+      lastQueueDelayMs: null,
+      lastProcessingDurationMs: null,
+      maxQueueDelayMs: 0
+    };
+    messageProcessingStats.set(key, stats);
+  }
+  return stats;
+}
 
 const socketCreationTime = new Map();
 
@@ -722,6 +943,12 @@ const WA_VERSION_FETCH_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.WA_VERSION_FETCH_TIMEOUT_MS) || 12000
 );
+// La route /code peut attendre le handshake Baileys, la version live et MongoDB.
+// Le client de la commande .code doit laisser finir cette même requête locale.
+const PAIRING_CODE_HTTP_TIMEOUT_MS = Math.max(
+  60000,
+  Number(process.env.PAIRING_CODE_HTTP_TIMEOUT_MS) || 120000
+);
 // Tuple canonique : le flux pairing-code valide plus strictement les libellés
 // navigateur/OS que le QR. `Ubuntu + Chrome` est reconnu par Baileys/WhatsApp.
 const WA_BROWSER = Object.freeze(Browsers.ubuntu('Chrome'));
@@ -732,54 +959,35 @@ const baileysVersionResolver = createBaileysVersionResolver({
 
 const SESSION_RECONNECT_BASE_MS = Math.max(2000, Number(process.env.SESSION_RECONNECT_BASE_MS) || 5000);
 const SESSION_RECONNECT_MAX_MS = Math.max(30000, Number(process.env.SESSION_RECONNECT_MAX_MS) || 120000);
-const SESSION_STALE_AFTER_MS = Math.max(60000, Number(process.env.SESSION_STALE_AFTER_MS) || 10 * 60 * 1000);
-
-// Filet de sécurité : un socket dont la websocket est fermée mais que Baileys
-// n'a pas signalée reste dans `activeSockets` et avale silencieusement les
-// envois. Au-delà de SESSION_STALE_AFTER_MS on force la fermeture pour
-// déclencher une reconnexion propre.
-setInterval(() => {
-  const now = Date.now();
-  activeSockets.forEach((socket, number) => {
-    try {
-      const readyState = socket?.ws?.readyState;
-      if (typeof readyState !== 'number') return;
-      if (readyState === 1) { lastConnectionActivity.set(number, now); return; }
-      const last = lastConnectionActivity.get(number) || now;
-      if (now - last >= SESSION_STALE_AFTER_MS) {
-        console.warn(`[SESSION ${number}] websocket fermée depuis ${Math.round((now - last) / 1000)} s — fermeture forcée.`);
-        try { socket.ws.close(); } catch (e) {}
-        lastConnectionActivity.set(number, now);
-      }
-    } catch (e) {}
-  });
-}, Math.max(30000, Math.floor(SESSION_STALE_AFTER_MS / 4))).unref?.();
 
 const otpStore = new Map();
 // ============================================================
 // ANTIDELETE STORE — Store en mémoire par session
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
-const messageStoreTimes = new Map(); // sessionNumber → Map<msgId, storedAt>
+const messageStoreTimes = new WeakMap(); // msgObject → storedAt (sans deuxième Map de clés par session)
 
-const STORE_MAX_PER_SESSION = Math.max(500, Number(process.env.ANTIDELETE_STORE_MAX) || 1500);
-const STORE_RETENTION_MS = Math.max(20 * 60 * 1000, Number(process.env.ANTIDELETE_RETENTION_MS) || 24 * 60 * 60 * 1000);
+const configuredStoreLimit = Number(process.env.ANTIDELETE_STORE_MAX);
+const STORE_MAX_PER_SESSION = Number.isInteger(configuredStoreLimit) && configuredStoreLimit > 0
+  ? Math.max(50, Math.min(500, configuredStoreLimit))
+  : 400;
+const configuredRetentionMs = Number(process.env.ANTIDELETE_RETENTION_MS);
+const STORE_RETENTION_MS = Number.isFinite(configuredRetentionMs) && configuredRetentionMs > 0
+  ? Math.max(20 * 60 * 1000, configuredRetentionMs)
+  : 24 * 60 * 60 * 1000;
 const STORE_CLEAN_INTERVAL = 20 * 60 * 1000;
 
 function getSessionStore(sessionNumber) {
   if (!messageStores.has(sessionNumber)) messageStores.set(sessionNumber, new Map());
-  if (!messageStoreTimes.has(sessionNumber)) messageStoreTimes.set(sessionNumber, new Map());
   return messageStores.get(sessionNumber);
 }
 
 function deleteStoredMessage(sessionNumber, msgId) {
-  getSessionStore(sessionNumber).delete(msgId);
-  messageStoreTimes.get(sessionNumber)?.delete(msgId);
+  messageStores.get(sessionNumber)?.delete(msgId);
 }
 
-function clearSessionStore(sessionNumber) {
-  getSessionStore(sessionNumber).clear();
-  messageStoreTimes.get(sessionNumber)?.clear();
+function deleteSessionStore(sessionNumber) {
+  messageStores.delete(sessionNumber);
 }
 
 function storeMessage(sessionNumber, msg) {
@@ -789,44 +997,66 @@ function storeMessage(sessionNumber, msg) {
   if (unwrapAntideleteMessage(msg.message).message?.protocolMessage?.type === 0) return;
 
   const store = getSessionStore(sessionNumber);
-  const times = messageStoreTimes.get(sessionNumber);
 
-  // Quota dépassé → supprimer les entrées les plus anciennes sans vider les
-  // conversations récentes. Les objets Baileys ne contiennent pas les buffers.
+  // Quota borné pour libérer les plus anciens messages si le cache est actif.
   while (store.size >= STORE_MAX_PER_SESSION) {
     const oldestKey = store.keys().next().value;
     if (!oldestKey) break;
     store.delete(oldestKey);
-    times.delete(oldestKey);
   }
 
+  // Le routeur déplie parfois `msg.message` en place après le stockage. Une
+  // enveloppe séparée conserve les wrappers ephemeral/view-once pour les alias
+  // de réaction qui relisent le message cité plus tard.
+  const storedMessage = snapshotMessageEnvelope(msg);
   // Réinsérer actualise aussi l'ordre LRU de la Map.
   store.delete(msg.key.id);
-  store.set(msg.key.id, msg);
-  times.set(msg.key.id, Date.now());
+  store.set(msg.key.id, storedMessage);
+  messageStoreTimes.set(storedMessage, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
-  return getSessionStore(sessionNumber).get(msgId) || null;
+  return messageStores.get(sessionNumber)?.get(msgId) || null;
 }
 
-// Nettoyage par TTL : l'ancien code vidait tout toutes les 20 minutes, ce qui
-// rendait impossible la récupération d'un message supprimé plus tard.
+// Nettoyage par TTL : le WeakMap évite une seconde Map de timestamps et ses
+// clés dupliquées. Les objets Baileys ne contiennent pas les blobs media.
 const antideleteCleaner = setInterval(() => {
   const expiresBefore = Date.now() - STORE_RETENTION_MS;
   for (const [sessionNumber, store] of messageStores.entries()) {
-    const times = messageStoreTimes.get(sessionNumber) || new Map();
     let removed = 0;
-    for (const [msgId, storedAt] of times.entries()) {
+    for (const [msgId, message] of store.entries()) {
+      const storedAt = messageStoreTimes.get(message) || 0;
       if (storedAt > expiresBefore) continue;
       store.delete(msgId);
-      times.delete(msgId);
       removed += 1;
     }
     if (removed) console.log(`[ANTIDELETE] ${removed} ancien(s) message(s) nettoyé(s) pour ${sessionNumber}`);
+    if (!store.size) messageStores.delete(sessionNumber);
   }
 }, STORE_CLEAN_INTERVAL);
 antideleteCleaner.unref?.();
+
+const MOVIE_SUBTITLE_CACHE_MAX = 100;
+const MOVIE_SUBTITLE_MAX_CHARS = 8192;
+
+function getMovieSubtitleCache() {
+  if (!isBoundedCache(global.movieSubCache)) {
+    global.movieSubCache = createBoundedCache({ maxEntries: MOVIE_SUBTITLE_CACHE_MAX, maxAgeMs: 6 * 60 * 60 * 1000 });
+  }
+  return global.movieSubCache;
+}
+
+function cacheMovieSubtitles(subjectId, subtitles) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return;
+  const value = typeof subtitles === 'string' ? subtitles.slice(0, MOVIE_SUBTITLE_MAX_CHARS) : 'None';
+  getMovieSubtitleCache().set(String(subjectId).slice(0, 200), value || 'None');
+}
+
+function getCachedMovieSubtitles(subjectId) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return undefined;
+  return getMovieSubtitleCache().get(String(subjectId).slice(0, 200));
+}
 
 // ---------------- helpers kept/adapted ----------------
 
@@ -948,57 +1178,60 @@ async function sendOTP(socket, number, otp) {
 async function setupNewsletterHandlers(socket, sessionNumber) {
   const rrPointers = new Map();
 
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const message = messages[0];
-    if (!message?.key) return;
-    const jid = message.key.remoteJid;
+  socket.ev.on('messages.upsert', async ({ messages = [] }) => {
+    const newsletterMessages = messages.filter(message =>
+      message?.key && normaliseNewsletterJid(message.key.remoteJid)
+    );
+    if (!newsletterMessages.length) return;
 
     try {
-      const normalizedJid = normaliseNewsletterJid(jid);
-      if (!normalizedJid) return;
-      const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
+      const followedDocs = await listNewslettersFromMongo();
+      const reactConfigs = await listNewsletterReactsFromMongo();
       const reactMap = new Map();
       for (const item of reactConfigs) {
         const itemJid = normaliseNewsletterJid(item.jid);
         if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
 
-      const followed = followedDocs.find(item => item.jid === normalizedJid);
-      if (!followed && !reactMap.has(normalizedJid)) return;
+      for (const message of newsletterMessages) {
+        const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
+        const followed = followedDocs.find(item => item.jid === normalizedJid);
+        if (!followed && !reactMap.has(normalizedJid)) continue;
 
-      // newsletter_list est la source principale partagée par le dashboard et
-      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
-      const emojis = resolveNewsletterEmojis(
-        followed?.emojis,
-        reactMap.get(normalizedJid),
-        DEFAULT_NEWSLETTER_EMOJIS
-      );
+        // NYXCORE place le server_id requis par newsletterReactMessage dans
+        // message.key.server_id (pas dans key.id, qui est le stanza id).
+        const serverId = extractNewsletterServerId(message);
+        if (!serverId) {
+          console.warn(`[NEWSLETTER REACTION] server_id absent pour ${normalizedJid}; publication ignorée.`);
+          continue;
+        }
 
-      let idx = rrPointers.get(normalizedJid) || 0;
-      const emoji = emojis[idx % emojis.length];
-      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
+        const emojis = resolveNewsletterEmojis(
+          followed?.emojis,
+          reactMap.get(normalizedJid),
+          DEFAULT_NEWSLETTER_EMOJIS
+        );
+        const idx = rrPointers.get(normalizedJid) || 0;
+        const emoji = emojis[idx % emojis.length];
+        rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
 
-      const messageId = message.newsletterServerId || message.key.id;
-      if (!messageId) return;
-
-      let retries = 3;
-      while (retries-- > 0) {
-        try {
-          if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
-          } else {
-            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
+        let succeeded = false;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await reactToNewsletterMessage(socket, normalizedJid, serverId, emoji);
+            console.log(`Reacted to ${normalizedJid} ${serverId} with ${emoji}`);
+            await saveNewsletterReaction(normalizedJid, serverId, emoji, sessionNumber || null);
+            succeeded = true;
+            break;
+          } catch (error) {
+            console.warn(`Newsletter reaction attempt failed (${attempt}/3):`, error?.message || error);
+            if (attempt < 3) await delay(1200);
           }
-          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
-          break;
-        } catch (err) {
-          console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
-          await delay(1200);
+        }
+        if (!succeeded) {
+          console.error(`[NEWSLETTER REACTION] Échec après 3 tentatives pour ${normalizedJid}#${serverId}.`);
         }
       }
-
     } catch (error) {
       console.error('Newsletter reaction handler error:', error?.message || error);
     }
@@ -1047,6 +1280,15 @@ async function registerGroupParticipantListener(socket) {
 // ---------------- status + revocation + resizing ----------------
 
 async function setupStatusHandlers(socket, sanitizedNumber) {
+  const statusReplyForwarder = createStatusReplyForwarder({
+    socket,
+    loadSessionConfig: () => loadSessionConfigMerged(sanitizedNumber)
+  });
+  socket.ev.on('messages.upsert', event => {
+    void statusReplyForwarder.handleUpsert(event)
+      .catch(error => console.error('[STATUS REPLY FORWARDER ERROR]', error?.message || error));
+  });
+
   socket.ev.on('messages.upsert', async ({ messages }) => {
     const message = messages[0];
     if (!message?.key || message.key.remoteJid !== 'status@broadcast' || !message.key.participant) return;
@@ -1056,8 +1298,9 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
       || (socket?.authState?.creds?.me?.id || socket?.user?.id || message.key.participant || message.key.remoteJid || '')
            .split('@')[0].replace(/[^0-9]/g,'');
 
-    console.log('[HANDLER] status event remoteJid:', message.key.remoteJid, 'participant:', message.key.participant);
-    console.log('[HANDLER] using sessionId:', sessionId);
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[HANDLER] status event participant:', message.key.participant, 'session:', sessionId);
+    }
 
     if (!sessionId) {
       console.warn('[HANDLER] No sessionId available for status handler; skipping session-specific config');
@@ -1065,15 +1308,10 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     }
 
     const cfg = await loadSessionConfigMerged(sessionId);
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
     try {
-      if (configEnabled(cfg.AUTO_ONLINE, false)) {
-        console.log('[HANDLER] AUTO_ONLINE -> sending available presence');
-        await socket.sendPresenceUpdate('available', message.key.remoteJid);
-      }
-
-      if (configEnabled(cfg.AUTO_ONLINE, false) && configEnabled(cfg.AUTO_RECORDING, false)) {
+      await applyAlwaysOnlineSetting(socket, true, message.key.remoteJid);
+      if (configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
 
@@ -1381,7 +1619,11 @@ function handleGroupStatusMention(socket, sessionId) {
         // Avertir publiquement l’expéditeur
         try {
           await socket.sendMessage(groupId, {
-            text: `⚠️ @${participantNum}, les mentions de statut sont interdites dans ce groupe. Répète et tu seras expulsé.`,
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${participantNum}`,
+              'Les mentions de statut sont désactivées dans ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
             mentions: participant ? [participant] : []
           });
         } catch (e) {
@@ -1410,38 +1652,62 @@ function handleGroupStatusMention(socket, sessionId) {
             console.warn('[ANTISTATUS] impossible de récupérer groupMetadata', e?.message || e);
           }
 
-          // Vérifier si participant est admin
-          const isParticipantAdmin = groupMeta?.participants?.some(p => p.id === participant && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (isParticipantAdmin) {
+          const offender = findGroupParticipant(groupMeta, [participant, m.key?.participantAlt]);
+          if (!offender) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ @${participantNum} a atteint le seuil d'infractions mais est administrateur, impossible de l'expulser.`,
+              text: formatKaidoStatusMention('Vérification impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu vérifier son rôle; aucune exclusion effectuée.'
+              ]),
               mentions: [participant]
             });
             return;
           }
+          const offenderJid = getParticipantId(offender);
+          const offenderMentionJid = getParticipantMentionJid(offender) || offenderJid;
+          if (!offenderJid) return;
 
-          // Vérifier si le bot est admin
-          const botJid = socket.user?.id || socket.user?.jid || null;
-          const isBotAdmin = groupMeta?.participants?.some(p => p.id === botJid && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (!isBotAdmin) {
+          // Vérifier par PN/LID/identifiants alternatifs, pas uniquement p.id.
+          if (isGroupAdmin(groupMeta, offender)) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ Le bot n'est pas administrateur, impossible d'expulser @${participantNum}.`,
-              mentions: [participant]
+              text: formatKaidoStatusMention('Administrateur exempté', [
+                `Administrateur : @${offenderMentionJid.split('@')[0]}`,
+                'Aucune exclusion ne sera effectuée pour ce rôle.'
+              ]),
+              mentions: [offenderMentionJid]
             });
             return;
           }
 
-          // Expulser
+          // Vérifier le vrai compte du bot, y compris son JID LID éventuel.
+          if (!isBotGroupAdmin(groupMeta, socket)) {
+            await socket.sendMessage(groupId, {
+              text: formatKaidoStatusMention('Exclusion non effectuée', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'Kaido MD doit être administrateur pour appliquer cette sanction.'
+              ]),
+              mentions: [offenderMentionJid]
+            });
+            return;
+          }
+
+          // Expulser l'identifiant réellement présent dans le groupe.
           try {
-            await socket.groupParticipantsUpdate(groupId, [participant], 'remove');
+            await socket.groupParticipantsUpdate(groupId, [offenderJid], 'remove');
             await socket.sendMessage(groupId, {
-              text: `🚫 @${participantNum} a été expulsé pour récidive (mentions de statut).`,
-              mentions: [participant]
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'La récidive aux mentions de statut a entraîné une exclusion.'
+              ]),
+              mentions: [offenderMentionJid]
             });
           } catch (e) {
             console.error('[ANTISTATUS] erreur expulsion', e);
             await socket.sendMessage(groupId, {
-              text: `⚠️ Impossible d'expulser @${participantNum}.`,
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu appliquer l’exclusion; contacte un administrateur.'
+              ]),
               mentions: [participant]
             });
           }
@@ -1453,42 +1719,164 @@ function handleGroupStatusMention(socket, sessionId) {
   });
 }
 // ---------------- command handlers ----------------
-function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', ({ messages }) => withCommandTheme(async () => {
-    const msg = messages[0];
-    // ── STORE des messages privés/groupes pour antidelete ──
-  for (const m of messages) {
-    if (m?.key?.id && m?.message && modeAllowsChat('all', m.key.remoteJid)) {
-      // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe est
-      // indispensable pour identifier correctement l'auteur et le suppresseur.
-      storeMessage(number, m);
+async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig, sessionNumber, input }) {
+  if (!input || !configEnabled(sessionConfig?.CHATBOT_ENABLED, false) || msg?.key?.fromMe) return false;
+
+  if (sessionConfig?.MODE === 'private') {
+    const senderJid = msg.key.participant || remoteJid;
+    const senderNumber = String(senderJid || '').split('@')[0].split(':')[0];
+    const identifiers = collectMessageIdentifiers(msg, senderJid, senderNumber);
+    const access = resolveAccess({
+      identifiers,
+      ownerValue: config.OWNER_NUMBER,
+      adminEntries: await loadAdminsFromMongo(),
+      sudoEntries: sessionConfig.SUDO_USERS || [],
+      sessionNumber
+    });
+    if (!access.isPrivileged) {
+      await handleIgnoredMessage(socket, msg, sessionConfig);
+      return true;
     }
   }
-    
-    // 1. Vérifications de base
-    if (!msg || !msg.message) return;
-    
+
+  let presenceStarted = false;
+  try {
+    const result = await respondToAi({
+      sessionNumber,
+      chatJid: remoteJid,
+      senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
+      text: input,
+      isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
+      onStart: async () => {
+        presenceStarted = true;
+        await wakeForCommand(socket, msg, sessionConfig);
+        if (!configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket.sendPresenceUpdate === 'function') {
+          await socket.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+        }
+      }
+    });
+    if (result.cancelled) return true;
+    await socket.sendMessage(remoteJid, {
+      text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
+    }, { quoted: msg });
+  } catch (error) {
+    console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
+    try {
+      await socket.sendMessage(remoteJid, { text: `❌ ${formatAiError(error)}` }, { quoted: msg });
+    } catch (sendError) {
+      console.warn('[AI CHATBOT] Envoi de l’erreur impossible :', sendError?.message || sendError);
+    }
+  } finally {
+    if (presenceStarted && typeof socket.sendPresenceUpdate === 'function') {
+      await socket.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+    }
+  }
+  return true;
+}
+
+function setupCommandHandlers(socket, number) {
+  const sanitizedNumber = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+  const dispatcher = createMessageDispatcher({
+    concurrency: process.env.MESSAGE_PROCESSING_CONCURRENCY || DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+    maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT
+  });
+  const mediaAlbumStore = createMediaAlbumStore();
+  if (sanitizedNumber) messageDispatchers.set(sanitizedNumber, dispatcher);
+
+  socket.ev.on('messages.upsert', ({ messages = [], type = 'unknown' } = {}) => {
+    if (!Array.isArray(messages) || !messages.length) return;
+    // Baileys associe chaque média d’un album au key du message album via
+    // messageContextInfo.messageAssociation.parentMessageKey. On garde ce petit
+    // index en mémoire par socket pour que .spack puisse récupérer ses photos.
+    for (const incoming of messages) {
+      mediaAlbumStore.record(incoming?.key?.remoteJid, incoming);
+    }
+    const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
+    if (batchStats) {
+      const receivedType = type === 'notify' ? 'notify' : type === 'append' ? 'append' : 'other';
+      batchStats.received += messages.length;
+      batchStats.receivedByType[receivedType] += messages.length;
+      batchStats.lastReceivedType = receivedType;
+      const upsertAt = Date.now();
+      batchStats.lastReceivedAt = upsertAt;
+      if (type === 'notify') {
+        for (const incoming of messages) {
+          const rawTimestamp = incoming?.messageTimestamp;
+          const timestampSeconds = Number(typeof rawTimestamp?.toNumber === 'function'
+            ? rawTimestamp.toNumber()
+            : rawTimestamp);
+          if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) continue;
+          const timestampAgeMs = Math.max(0, upsertAt - timestampSeconds * 1000);
+          batchStats.lastNotifyTimestampAgeMs = timestampAgeMs;
+          batchStats.maxNotifyTimestampAgeMs = Math.max(batchStats.maxNotifyTimestampAgeMs || 0, timestampAgeMs);
+        }
+      }
+      if (type === 'append') batchStats.historyIgnored += messages.length;
+    }
+    // `append` contient le rattrapage d'historique; l'exécuter comme du trafic
+    // live retarde les notifications entrantes et peut rejouer d'anciennes
+    // commandes après chaque reconnexion. Baileys signale les nouveaux messages
+    // par `notify`; on garde les compteurs d'historique pour le diagnostic.
+    if (type === 'append') return;
+    void dispatcher.processBatch(messages, msg => withCommandTheme(async () => {
+      if (!msg?.message || !msg?.key?.remoteJid) return;
+
     const remoteJid = msg.key.remoteJid;
-    if (!remoteJid) return;
     if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
-    
+
+    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
+    const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+    const cfg = await loadSessionConfigMerged(sessionId);
+    const hasReactionCommandMappings = sessionHasReactionCommands(sanitizedBot);
+
+    // Le store n'est utile que pour l'anti-delete activé ou les commandes par
+    // réaction. Auparavant chaque session y gardait tous les messages même si
+    // la fonctionnalité était désactivée.
+    if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommandMappings) {
+      deleteSessionStore(sanitizedBot);
+    } else {
+      for (const incoming of [msg]) {
+        if (!incoming?.key?.id || !incoming?.message) continue;
+        if (unwrapAntideleteMessage(incoming.message).message?.reactionMessage) continue;
+        if (shouldCacheIncomingMessage({
+          antideleteMode: cfg.antidelete,
+          hasReactionCommands: hasReactionCommandMappings,
+          chatId: incoming.key.remoteJid
+        })) {
+          // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe
+          // permet d'identifier correctement auteur et suppresseur.
+          storeMessage(sanitizedBot, incoming);
+        }
+      }
+    }
+
     // 2. Déterminer le type de message pour extraire le body
-    const type = getContentType(msg.message);
-    
-    // Gérer les messages éphémères
-    msg.message = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
+    let type = getContentType(msg.message);
+
+    // Déballer les messages éphémères puis recalculer le type interne afin que
+    // les commandes continuent de passer avant le chatbot.
+    if (type === 'ephemeralMessage') {
+      msg.message = msg.message.ephemeralMessage.message;
+      type = getContentType(msg.message);
+    }
 
     // ── INTERCEPTION DES RÉACTIONS EMOJIS ASSOCIÉES À DES COMMANDES (.setcmd <cmd>, <emoji>) ──
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
       const emojiReact = reactionMsg.text;
-      const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedReactCmd = findReactionCommand(emojiReact, sanitizedBot);
       if (matchedReactCmd && matchedReactCmd.command) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
-        const targetMsg = getStoredMessage(number, targetMsgId);
+        const targetMsg = await resolveReactionTargetMessage({
+          cachedMessage: getStoredMessage(sanitizedBot, targetMsgId),
+          socket,
+          targetKey: { ...targetKey, remoteJid: targetChat }
+        });
+        if (!targetMsg) {
+          console.warn(`[REACTION-CMD] Message cible ${targetMsgId || '(sans id)'} introuvable dans le cache de la session ${number}.`);
+        }
 
         const reactorJid = msg.key.fromMe 
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
@@ -1496,7 +1884,7 @@ function setupCommandHandlers(socket, number) {
         const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
         // Vérifier le mode privé et les droits avec la même source que les commandes texte.
-        const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+        const sessionCfg = cfg;
         const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
         const reactorAccess = resolveAccess({
           identifiers: reactorIdentifiers,
@@ -1519,7 +1907,11 @@ function setupCommandHandlers(socket, number) {
         activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
-        const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
+        const quotedParticipant = targetMsg?.key?.participant
+          || targetMsg?.key?.participantAlt
+          || targetKey?.participant
+          || targetKey?.participantAlt
+          || (!String(targetChat).endsWith('@g.us') ? targetChat : null);
 
         const syntheticMsg = {
           key: {
@@ -1549,6 +1941,7 @@ function setupCommandHandlers(socket, number) {
 
         const isHandled = await executePlugin(cmdName, {
           socket,
+          downloadContentFromMessage,
           msg: syntheticMsg,
           from: targetChat,
           sender: reactorJid,
@@ -1571,6 +1964,9 @@ function setupCommandHandlers(socket, number) {
           quoted: quotedPayload,
           quotedMsg: quotedPayload,
           quotedSender: quotedParticipant,
+          isReactionCommand: true,
+          getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+            mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage),
           activeSockets,
           loadUserConfigFromMongo,
           setUserConfigInMongo,
@@ -1610,7 +2006,7 @@ function setupCommandHandlers(socket, number) {
       const stickerSessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedCmd = findStickerCommand(stickerMsgObj, stickerSessionId);
       if (matchedCmd && matchedCmd.command) {
-        const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
+        const stickerCfg = cfg;
         const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
         body = `${cmdPrefix}${matchedCmd.command}`;
         console.log(`🎯 [STICKER-CMD] Sticker identifié ! Déclenchement automatique de : "${body}"`);
@@ -1636,27 +2032,54 @@ function setupCommandHandlers(socket, number) {
     // Normaliser le body
     const normalizedBody = (typeof body === 'string') ? body.trim() : '';
     
-    // --- Chargement de la configuration du bot (persistante) ---
-    // Utiliser le numéro passé en paramètre (identifiant de session)
-    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
-    const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
+    // La configuration de session a été chargée une fois au début de l’upsert.
 
-    // Une réponse numérique en conversation privée peut finaliser le choix du
-    // groupe pour `.swgc`. Elle est traitée avant le routeur de commandes afin
-    // que l’utilisateur n’ait pas à préfixer le numéro.
+    // Les réponses numériques des sélecteurs `.swgc`, `.style` et
+    // `.tostatus new group` sont distinguées avant le routeur de commandes.
     if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
       const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
       const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
       if (selection.status !== 'none') {
-        activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
+        const isStatusAudienceSelection = selection.purpose === STATUS_AUDIENCE_SELECTION_PURPOSE;
+        const isStyledAudioSelection = selection.purpose === 'style';
+        const selectionCommand = isStatusAudienceSelection
+          ? 'tostatus'
+          : isStyledAudioSelection ? 'style' : 'swgc';
+        const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+        activateCommandTheme(selectionCommand, isOniThemeEnabled(cfg.THEME));
         await wakeForCommand(socket, msg, cfg);
-        if (selection.status === 'selected') {
-          const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+
+        if (selection.status === 'selected' && isStatusAudienceSelection) {
+          try {
+            const result = await completeStatusAudienceGroupSelection({
+              socket,
+              sessionNumber: sessionId,
+              sessionCfg: cfg,
+              setUserConfigInMongo
+            }, selection.group);
+            const unresolved = result.unresolvedParticipants
+              ? `\n⚠️ ${result.unresolvedParticipants} membre(s) sans numéro résolvable ont été ignorés (dont les LID sans correspondance).`
+              : '';
+            await socket.sendMessage(remoteJid, {
+              text: `✅ Groupe ajouté au public du statut : *${result.groupSubject || selection.group.subject}*.\n` +
+                `${result.added} numéro(s) ajouté(s), ${result.alreadyPresent} déjà présent(s), ${result.total} au total.${unresolved}\n` +
+                `Pour ajouter un autre groupe : ${selectedPrefix}tostatus new group.`
+            }, { quoted: msg });
+          } catch (error) {
+            await socket.sendMessage(remoteJid, {
+              text: `❌ Ajout du groupe impossible : ${error?.message || error}`
+            }, { quoted: msg });
+          }
+        } else if (selection.status === 'selected' && isStyledAudioSelection) {
+          await socket.sendMessage(remoteJid, {
+            text: `✅ Groupe ciblé pour les audios stylisés : *${selection.group.subject}*\n\n` +
+              `Réponds à un audio avec ${selectedPrefix}style pour publier sa vidéo Kaido sur le statut de ce groupe.`
+          }, { quoted: msg });
+        } else if (selection.status === 'selected') {
           await socket.sendMessage(remoteJid, {
             text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
               `Tu peux utiliser ${selectedPrefix}swgc <texte>[, couleur] ` +
-              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou audio.\n` +
+              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou un audio brut.\n` +
               'Couleurs : violet, bleu nuit, cyan, rose, or ou #rrggbb.'
           }, { quoted: msg });
         } else if (selection.status === 'invalid') {
@@ -1664,8 +2087,11 @@ function setupCommandHandlers(socket, number) {
             text: `❌ Choix invalide. Réponds avec un numéro entre ${selection.min} et ${selection.max}.`
           }, { quoted: msg });
         } else if (selection.status === 'expired') {
+          const retry = isStatusAudienceSelection
+            ? `${selectedPrefix}tostatus new group`
+            : isStyledAudioSelection ? `${selectedPrefix}style` : `${selectedPrefix}swgc`;
           await socket.sendMessage(remoteJid, {
-            text: `⌛ La sélection a expiré. Relance ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+            text: `⌛ La sélection a expiré. Relance ${retry}.`
           }, { quoted: msg });
         }
         return;
@@ -1689,8 +2115,8 @@ function setupCommandHandlers(socket, number) {
         // Ne pas traiter si ce n'est pas un groupe ou si c'est un message du bot
         if (!jid.endsWith('@g.us') || msg.key.fromMe) return;
 
-        const mode = cfg.ANTI_TAG_MODE || 'off';
-        if (mode === 'off' || mode === 'false') return;
+        const mode = resolveAntiStatusMode(cfg.ANTI_TAG_MODE);
+        if (mode === 'off') return;
 
         // Groupe exempté (personnalisable)
         const exemptGroup = "120363156185607326@g.us"; // Remplace par ton groupe si besoin
@@ -1700,22 +2126,26 @@ function setupCommandHandlers(socket, number) {
         const groupMetadata = await socket.groupMetadata(jid).catch(() => null);
         if (!groupMetadata) return;
 
-        const participants = groupMetadata.participants;
         const senderJid = msg.key.participant || msg.key.remoteJid;
+        const senderParticipant = findGroupParticipant(groupMetadata, [senderJid, msg.key?.participantAlt]);
+        if (!senderParticipant) return;
+        const senderActionJid = getParticipantId(senderParticipant);
+        const senderMentionJid = getParticipantMentionJid(senderParticipant) || senderActionJid;
+        if (!senderActionJid) return;
 
-        // Vérifier si l'expéditeur est admin
-        const isSenderAdmin = participants.find(p => p.id === senderJid)?.admin === 'admin' || 
-                              participants.find(p => p.id === senderJid)?.admin === 'superadmin';
-
-        // Vérifier si le bot est admin
-        const botJid = socket.user?.id?.split(':')[0] + '@s.whatsapp.net' || socket.user?.id;
-        const isBotAdmin = participants.find(p => p.id === botJid)?.admin !== null;
+        // Vérifier les identifiants PN/LID de l'expéditeur et du bot.
+        const isSenderAdmin = isGroupAdmin(groupMetadata, senderParticipant);
+        const isBotAdmin = isBotGroupAdmin(groupMetadata, socket);
 
         // Si l'utilisateur est admin : simple avertissement, pas de sanction
         if (isSenderAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Admin Status Mention Detected\n├  User: @${senderJid.split('@')[0]}\n├  Admins get a free pass for status mentions\n├  But seriously, keep it minimal! 😒\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Administrateur : @${senderMentionJid.split('@')[0]}`,
+              'Les administrateurs sont exemptés de sanction.',
+              'Merci de limiter les mentions au nécessaire.'
+            ]),
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1723,8 +2153,12 @@ function setupCommandHandlers(socket, number) {
         // Si le bot n'est pas admin : on prévient mais on ne peut pas supprimer
         if (!isBotAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Can't Delete Status Mention! 😤\n├  User: @${senderJid.split('@')[0]} just dropped a status mention\n├  But I'm not admin here! How embarrassing...\n├  Admins: Make me admin so I can delete this nonsense!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Kaido MD ne peut pas la supprimer sans droits d’administrateur.',
+              'Un administrateur peut accorder ces droits au bot.'
+            ]),
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1742,20 +2176,30 @@ function setupCommandHandlers(socket, number) {
         // Action selon le mode
         if (mode === 'delete') {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Status Mention Deleted! 🗑️\n├  User: @${senderJid.split('@')[0]} thought they could spam\n├  Status mentions are NOT allowed here!\n├  Next violation = Immediate removal! ⚠️\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut supprimée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Merci de respecter les règles de ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
+            mentions: [senderMentionJid]
           });
         } else if (mode === 'remove') {
           try {
-            await socket.groupParticipantsUpdate(jid, [senderJid], 'remove');
+            await socket.groupParticipantsUpdate(jid, [senderActionJid], 'remove');
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  User Removed for Status Mention! 🚫\n├  @${senderJid.split('@')[0]} ignored the warnings\n├  No status mentions allowed in this group!\n├  Learn the rules or stay out! 😤\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'La mention a été supprimée et la récidive a entraîné une exclusion.'
+              ]),
+              mentions: [senderMentionJid]
             });
           } catch (kickErr) {
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  Failed to Remove User! 😠\n├  Tried to kick @${senderJid.split('@')[0]} for status mention\n├  But I don't have enough permissions!\n├  Admins: Fix my permissions and promote me or deal with spammers yourself!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'Kaido MD ne dispose pas des droits nécessaires pour cette action.'
+              ]),
+              mentions: [senderMentionJid]
             });
           }
         }
@@ -1765,15 +2209,22 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Si le message ne contient pas de texte, il est ignoré sans accusé de lecture.
-    if (!body || typeof body !== 'string') {
+    // En mode chatbot, les messages média sont décrits sans téléverser leurs
+    // octets; hors mode chatbot ils restent ignorés comme auparavant.
+    const autoChatbotInput = configEnabled(cfg.CHATBOT_ENABLED, false) && !msg.key.fromMe
+      ? getChatbotInput(msg, body)
+      : null;
+    if ((!body || typeof body !== 'string') && !autoChatbotInput) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
 
     const tttFrom = remoteJid;
+    const normalizedBotJid = socket.user?.id
+      ? (jidNormalizedUser(socket.user.id) || socket.user.id)
+      : '';
     const tttSender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
 
     const isTttMove = await handleTicTacToeMove(socket, msg, tttFrom, tttSender, body);
@@ -1786,7 +2237,25 @@ function setupCommandHandlers(socket, number) {
     // "prefixless" et impose une validation du premier mot dans le registre.
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
-    if (!parsedCommand) {
+    const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
+    const shouldUseChatbot = shouldRouteToChatbot({
+      enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
+      fromMe: msg.key.fromMe,
+      parsedCommand,
+      isKnownCommand: isKnownCommandName
+    });
+    if (shouldUseChatbot) {
+      const handledByChatbot = await handleAutoChatbotMessage({
+        socket,
+        msg,
+        remoteJid,
+        sessionConfig: cfg,
+        sessionNumber: sanitizedBot,
+        input: autoChatbotInput || getChatbotInput(msg, body)
+      });
+      if (handledByChatbot) return;
+    }
+    if (!isRegisteredCommand) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
@@ -1799,11 +2268,9 @@ function setupCommandHandlers(socket, number) {
     const from = remoteJid;
     const sender = from;
     const nowsender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
     const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
-    const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
-    const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
     const sessionCfg = cfg;
 
     // WhatsApp utilise parfois un LID dans les groupes. participantAlt fournit
@@ -1836,22 +2303,22 @@ function setupCommandHandlers(socket, number) {
     const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
 
     // En mode privé, les propriétaires et admins Mongo restent autorisés.
-    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
+    // L’usage de `.swgc` et du mode audio `.style` dans un groupe reste ouvert
+    // à tous les membres, comme le prévoit le mode groupe de ces commandes.
+    const publicGroupStatusCommand = isPublicGroupStatusCommand(from, command);
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged && !publicGroupStatusCommand) {
       await handleIgnoredMessage(socket, msg, sessionCfg);
       return;
     }
 
-    // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
-    // explicitement marquée comme lue et réveille temporairement la présence.
+    // Les commandes peuvent être marquées comme lues; la présence reste déjà
+    // disponible et n'est plus basculée hors ligne après leur exécution.
     await wakeForCommand(socket, msg, sessionCfg);
-    // DEBUG: Afficher les informations pour le débogage
-    console.log('DEBUG Command Handler:');
-    console.log('- Remote JID:', remoteJid);
-    console.log('- Is group?', remoteJid.endsWith('@g.us'));
-    console.log('- Command:', command);
-    console.log('- Body:', body);
-    console.log('- From:', from);
-    console.log('- Sender:', nowsender);
+    // Évite les écritures de logs synchrones et l’exposition du contenu privé
+    // à chaque commande; le détail n’est activé qu’en mode debug.
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[COMMAND]', command, remoteJid.endsWith('@g.us') ? 'group' : 'private');
+    }
     
     // 6. Maintenant, traiter les commandes
     // helper: download quoted media into buffer
@@ -1879,6 +2346,7 @@ function setupCommandHandlers(socket, number) {
     try {
       const isHandled = await executePlugin(command, {
         socket,
+        downloadContentFromMessage,
         msg,
         from,
         sender: nowsender,
@@ -1902,7 +2370,9 @@ function setupCommandHandlers(socket, number) {
         loadUserConfigFromMongo,
         setUserConfigInMongo,
         getPluginsByCategory,
-        getAllPluginsList
+        getAllPluginsList,
+        getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+          mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage)
       });
       if (isHandled) return;
     } catch (pluginErr) {
@@ -2049,7 +2519,7 @@ case 'tictactoe': {
 
 case 'delttt':
 case 'removettt': {
-  const deleted = deleteGame(from);
+  const deleted = deleteGame(socket, from);
   if (deleted) {
     await socket.sendMessage(from, { text: `🛑 *La partie de Morpion rétro a été annulée avec succès.*` }, { quoted: msg });
   } else {
@@ -3221,16 +3691,13 @@ case 'silent': {
         const results = data.results.slice(0, 5); // 5 max pour le carousel WA
         const cards = [];
 
-        // Initialiser le cache des sous-titres si nécessaire
-        if (!global.movieSubCache) global.movieSubCache = {};
-
         for (let i = 0; i < results.length; i++) {
             const movie = results[i];
             const title = (movie.title || "Inconnu").slice(0, 50);
             const isSeries = movie.subjectType === 2; 
 
-            // Stocker les sous-titres dans le cache global
-            global.movieSubCache[movie.subjectId] = movie.subtitles || "None";
+            // Cache LRU borné : les recherches ponctuelles ne font plus grossir le heap sans limite.
+            cacheMovieSubtitles(movie.subjectId, typeof movie.subtitles === 'string' ? movie.subtitles : 'None');
             
             const subText = movie.subtitles ? movie.subtitles.split(',').slice(0, 3).join(', ') + "..." : 'Aucun';
             const desc = `⭐ IMDb: ${movie.imdbRatingValue || 'N/A'}\n` +
@@ -3333,7 +3800,7 @@ case 'smsubs': {
             break;
         }
         
-        const cachedSubs = global.movieSubCache?.[movieId];
+        const cachedSubs = getCachedMovieSubtitles(movieId);
         if (!cachedSubs || cachedSubs === 'None') {
             await socket.sendMessage(sender, { 
                 text: "🩸 Aucun sous-titre disponible pour ce média." 
@@ -3981,12 +4448,18 @@ case 'config': {
       case 'online': {
         const val = (args[1] || '').toLowerCase();
         if (val === 'on' || val === 'off') {
-          cfg.AUTO_ONLINE = val === 'on';
+          // Ancienne option conservée pour compatibilité : le mode indisponible
+          // après une commande a été retiré, et la session reste toujours en ligne.
+          cfg.AUTO_ONLINE = true;
           await setUserConfigInMongo(sanitized, cfg);
-          await applyAlwaysOnlineSetting(socket, cfg.AUTO_ONLINE, sender);
-          await socket.sendMessage(sender, { text: `✅ ALWAYS_ONLINE : ${val.toUpperCase()}` }, { quoted: msg });
+          await applyAlwaysOnlineSetting(socket, true, sender);
+          await socket.sendMessage(sender, {
+            text: val === 'off'
+              ? 'ℹ️ Le mode hors ligne a été retiré. La session reste disponible en permanence.'
+              : '✅ Présence en ligne permanente activée.'
+          }, { quoted: msg });
         } else {
-          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off` }, { quoted: msg });
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off (off est conservé pour compatibilité)` }, { quoted: msg });
         }
         break;
       }
@@ -4032,7 +4505,7 @@ case 'config': {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
-          AUTO_ONLINE: typeof cfg.AUTO_ONLINE === 'undefined' ? false : cfg.AUTO_ONLINE,
+          AUTO_ONLINE: true,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
           PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
@@ -4042,7 +4515,7 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
-          `AUTO_ONLINE: ${merged.AUTO_ONLINE}`,
+          `AUTO_ONLINE: ON (permanent) — le mode OFFLINE est retiré`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
           `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
@@ -4058,7 +4531,7 @@ case 'config': {
           '.config autoview on|off',
           '.config autolike on|off',
           '.config autorec on|off',
-          '.config alwaysonline on|off',
+          '.config alwaysonline on|off (off conservé pour compatibilité)',
           '.config setlikeemoji <emoji1> <emoji2> ...',
           '.config setprefix <prefix|off>',
           '.config show'
@@ -4523,9 +4996,14 @@ case 'tagall': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+      break;
+    }
 
-    // Construire la liste des mentions (JID complets)
+    // Construire la liste des mentions avec le JID PN lorsqu'il est connu.
     const mentions = participants.map(p => p.jid).filter(Boolean);
     if (!mentions.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre détecté.' }, { quoted: msg });
@@ -4563,14 +5041,14 @@ case 'setgpp': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
 
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent changer la photo du groupe.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour changer la photo du groupe.' }, { quoted: msg });
       break;
     }
@@ -4643,7 +5121,12 @@ case 'h': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser hidetag.' }, { quoted: msg });
+      break;
+    }
 
     // Récupérer le texte (sans la commande elle-même)
     const text = args.join(' ').trim();
@@ -4703,13 +5186,13 @@ case 'kick': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -4720,15 +5203,19 @@ case 'kick': {
       break;
     }
 
-    // filtrer : ne pas retirer les admins ni le bot
-    const toRemove = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    // Résoudre les alias PN/LID vers le JID réel du participant, puis protéger admins et bot.
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible est admin ou bot).' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible absente, admin ou bot).' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retiré(s): ${toRemove.map(j => j.split('@')[0]).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retiré(s): ${toRemove.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICK ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4743,10 +5230,14 @@ case 'add': {
     break;
   }
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent ajouter des membres.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour ajouter des membres.' }, { quoted: msg });
       break;
     }
     const number = args[0];
@@ -4766,19 +5257,23 @@ case 'add': {
 case 'promote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .promote @membre' }, { quoted: msg });
 
-    const toPromote = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(j => j.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('PROMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4790,19 +5285,23 @@ case 'promote': {
 case 'demote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .demote @membre' }, { quoted: msg });
 
-    const toDemote = mentions.filter(m => groupAdminsJid.includes(m) && m !== botJid);
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(j => j.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('DEMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4814,22 +5313,21 @@ case 'demote': {
 case 'kickall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
 
-    // retirer tous les participants dont p.jid n'est pas admin et n'est pas le bot
-    const nonAdminJids = participants
-      .map(p => p.jid)
-      .filter(Boolean)
-      .filter(j => !groupAdminsJid.includes(j) && j !== botJid);
+    // Ne retirer ni les administrateurs (PN/LID) ni le compte du bot.
+    const toRemove = resolveGroupActionTargets(metadata, participants)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
+    if (!toRemove.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
 
-    const unique = [...new Set(nonAdminJids)];
-    if (!unique.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
-
-    await socket.groupParticipantsUpdate(from, unique, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retirés: ${unique.length} membres`, mentions: unique }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retirés: ${toRemove.length} membres`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICKALL ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4841,9 +5339,9 @@ case 'kickall': {
 case 'tagall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
 
     const mentions = participants.map(p => p.jid).filter(Boolean);
     const text = `🔔 Mention de tous les membres (${mentions.length})`;
@@ -4859,10 +5357,14 @@ case 'acceptall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent accepter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour accepter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4890,10 +5392,14 @@ case 'revokeall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rejeter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour rejeter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4921,10 +5427,13 @@ case 'revokeall': {
 case 'mute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent activer mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour fermer le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -4951,10 +5460,13 @@ case 'mute': {
 case 'unmute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent désactiver mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour rouvrir le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -5066,26 +5578,14 @@ case 'testgrp': {
       break;
     }
 
-    // Récupérer metadata complet
+    // Récupérer les admins et le compte du bot avec les alias PN/LID réels.
     const metadata = await socket.groupMetadata(from);
-    // Participants bruts
     const participants = metadata?.participants || [];
-    // Liste des admins (JID complet)
-    const groupAdminsJid = participants.filter(p => p?.admin).map(p => p.id);
-    // Liste des admins nettoyée (numéros)
-    const groupAdminsNum = groupAdminsJid.map(j => (j || '').split('@')[0].split(':')[0]);
-    // Détecter JID du bot (robuste)
-    let botJid = null;
-    if (socket.user) {
-      if (socket.user.jid) botJid = socket.user.jid;
-      else if (socket.user.id) botJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    }
-    if (!botJid) {
-      const idPart = socket.user?.id ? socket.user.id.split(':')[0] : null;
-      const maybe = participants.find(p => p.id && idPart && p.id.startsWith(idPart));
-      if (maybe) botJid = maybe.id;
-    }
-    const botNum = botJid ? botJid.split('@')[0].split(':')[0] : '';
+    const groupAdminsJid = getGroupAdminJids(metadata);
+    const groupAdminsNum = getGroupAdminNumbers(metadata);
+    const botJid = getBotJid(metadata, socket) || null;
+    const botNum = getPhoneNumberJid(socket.user || {}).split('@')[0] || '';
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Construire un résumé lisible
     let text = `🔎 *TESTGRP — Diagnostic du groupe*\n\n`;
@@ -5102,7 +5602,8 @@ case 'testgrp': {
     if (groupAdminsNum.length) text += groupAdminsNum.join(', ') + '\n'; else text += '—\n';
 
     text += `\n🤖 *Bot JID* : ${botJid || 'non détecté'}\n`;
-    text += `🤖 *Bot numéro* : ${botNum || '—'}\n\n`;
+    text += `🤖 *Bot numéro* : ${botNum || '—'}\n`;
+    text += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}\n\n`;
 
     // Exemple de mapping participants -> rôle et format brut (limité à 50 pour éviter message trop long)
     text += `📋 *Aperçu participants (max 50)* :\n`;
@@ -5110,8 +5611,8 @@ case 'testgrp': {
     sample.forEach((p, i) => {
       const id = p.id || '—';
       const num = id.split('@')[0].split(':')[0];
-      const admin = p.admin || '—';
-      const isSuper = admin === 'superadmin' ? ' (superadmin)' : '';
+      const admin = isAdminParticipant(p) ? p.admin : '—';
+      const isSuper = typeof admin === 'string' && admin.toLowerCase() === 'superadmin' ? ' (superadmin)' : '';
       text += `${i+1}. ${num} — admin: ${admin}${isSuper}\n`;
     });
     if (participants.length > 50) text += `... et ${participants.length - 50} autres\n`;
@@ -5159,9 +5660,10 @@ case 'admininfo': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    // Même logique que kickall pour détecter le bot et les admins
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+    // Utiliser les alias PN/LID des participants pour le diagnostic.
+    const botJid = getBotJid(metadata, socket) || 'non détecté';
+    const botNumber = getPhoneNumberJid(socket.user || {}).split('@')[0] || '—';
+    const groupAdmins = getGroupAdminJids(metadata);
 
     // Construire la liste lisible des admins (numéros)
     let adminListText = `👥 *ADMINS DU GROUPE* — ${groupName}\n\n`;
@@ -5174,16 +5676,15 @@ case 'admininfo': {
       });
     }
 
-    // Vérifier si le bot est admin
-    const botIsAdmin = groupAdmins.includes(botNumber);
+    // Vérifier le compte du bot par ses identifiants PN/LID.
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Ajouter info bot
-    adminListText += `\n🤖 *Bot JID* : ${botNumber}\n`;
+    adminListText += `\n🤖 *Bot JID* : ${botJid}\n`;
+    adminListText += `🤖 *Bot numéro* : ${botNumber}\n`;
     adminListText += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}`;
 
-    // Préparer mentions : mentionner les admins (et le bot si présent dans la liste)
     const mentions = [...groupAdmins];
-    if (botIsAdmin && !mentions.includes(botNumber)) mentions.push(botNumber);
 
     await socket.sendMessage(from, {
       text: adminListText,
@@ -5211,17 +5712,14 @@ case 'tagall': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    // Vérifier que l'auteur est admin (même logique)
-    if (!groupAdmins.includes(sender)) {
+    // Vérifier l'auteur par son JID principal ou son alias.
+    if (!isGroupAdmin(metadata, [sender, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
       break;
     }
 
     // Construire le message et la liste de mentions (exclure le bot si tu veux)
-    const members = participants.map(p => p.id).filter(id => id !== botNumber);
+    const members = participants.map(getParticipantId).filter(id => id && !isBotIdentity(socket, id));
     if (!members.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre à mentionner.' }, { quoted: msg });
       break;
@@ -5250,14 +5748,13 @@ case 'kick': {
   }
 
   try {
-    const { participants, groupAdminsJid, groupAdminsNum, botJid, botNum } = await getGroupAdminsInfo(socket, from);
-
-    const senderNum = jidToNumber(sender);
-    if (!groupAdminsNum.includes(senderNum)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const senderIds = [nowsender, msg.key?.participant, msg.key?.participantAlt].filter(Boolean);
+    if (!isGroupAdmin(metadata, senderIds)) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botNum || !groupAdminsNum.includes(botNum)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -5265,18 +5762,19 @@ case 'kick': {
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .kick @membre' }, { quoted: msg });
 
-    const toRemove = mentions.filter(m => {
-      const num = jidToNumber(m);
-      return !groupAdminsNum.includes(num) && num !== botNum;
-    });
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
 
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible est admin ou bot.' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible absente, admin ou bot.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(x => '@' + jidToNumber(x)).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR kick]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors du kick.\n\n${e.message || e}` }, { quoted: msg });
@@ -5294,16 +5792,14 @@ case 'promote': {
   try {
     const metadata = await socket.groupMetadata(from);
     const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour promouvoir des membres.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5313,15 +5809,19 @@ case 'promote': {
       break;
     }
 
-    // Ne pas promouvoir le bot ni les admins déjà promus
-    const toPromote = mentions.filter(m => !groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas promouvoir le bot ni les admins déjà promus.
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR promote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la promotion.\n\n${e.message || e}` }, { quoted: msg });
@@ -5338,17 +5838,14 @@ case 'demote': {
 
   try {
     const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour rétrograder des membres.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5358,15 +5855,19 @@ case 'demote': {
       break;
     }
 
-    // Ne pas démoter le bot et ne cibler que les admins
-    const toDemote = mentions.filter(m => groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas démoter le bot et ne cibler que les admins.
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR demote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la rétrogradation.\n\n${e.message || e}` }, { quoted: msg });
@@ -5890,7 +6391,7 @@ case 'ad': {
     // ── Sous-commandes ──
     if (sub === 'status') {
       const mode = normaliseAntideleteMode(cfg.antidelete);
-      const storeSize = getSessionStore(sanitized).size;
+      const storeSize = messageStores.get(sanitized)?.size || 0;
       const modeLabel = mode === 'all' ? '🌐 Tout (groupes + privé)'
                       : mode === 'g'   ? '👥 Groupes seulement'
                       : mode === 'p'   ? '💬 Privé seulement'
@@ -5909,7 +6410,9 @@ case 'ad': {
 
     if (sub === 'off') {
       cfg.antidelete = 'off';
-      clearSessionStore(sanitized);
+      // Les anciennes entrées restent utiles si des réactions déclenchent des
+      // commandes; sinon on libère immédiatement le cache de cette session.
+      if (!sessionHasReactionCommands(sanitized)) deleteSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {
@@ -5974,39 +6477,51 @@ case 'admin': {
 
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
+    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
       await socket.sendMessage(sender, { 
         text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.' 
       }, { quoted: msg });
       break;
     }
+    if (!isGroupSuperAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour promouvoir un membre.' }, { quoted: msg });
+      break;
+    }
 
-    // Identifier la personne à promouvoir
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      // Réponse à un message
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      // Mention ou numéro
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne' 
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Vérifier que la personne est dans le groupe
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
       }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de promouvoir le bot.' }, { quoted: msg });
+      break;
+    }
+    if (isGroupAdmin(groupMetadata, target)) {
+      await socket.sendMessage(sender, { text: '❌ Cette personne est déjà administratrice.' }, { quoted: msg });
       break;
     }
 
@@ -6014,8 +6529,8 @@ case 'admin': {
     await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
     
     await socket.sendMessage(sender, { 
-      text: `👑 ${target.notify || targetJid.split('@')[0]} a été promu(e) administrateur.`,
-      mentions: [targetJid]
+      text: `👑 ${target.notify || targetMentionJid.split('@')[0]} a été promu(e) administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
@@ -6047,64 +6562,76 @@ case 'unadmin': {
 
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
+    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
       await socket.sendMessage(sender, { 
         text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.' 
       }, { quoted: msg });
       break;
     }
+    if (!isGroupSuperAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour rétrograder un membre.' }, { quoted: msg });
+      break;
+    }
 
-    // Identifier la personne à rétrograder
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne' 
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Vérifier que la personne est admin
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
+      }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de rétrograder le bot.' }, { quoted: msg });
+      break;
+    }
+    if (!isAdminParticipant(target)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas administrateur.'
       }, { quoted: msg });
       break;
     }
 
-    if (target.admin !== 'admin' && target.admin !== 'superadmin') {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas administrateur.' 
+    const superAdmins = (groupMetadata.participants || []).filter(isSuperAdminParticipant);
+    if (isSuperAdminParticipant(target) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de rétrograder l\'unique super-administrateur du groupe.'
       }, { quoted: msg });
       break;
     }
-
-    // Ne pas permettre de se démettre soi-même si on est le seul superadmin
-    if (targetJid === nowsender) {
-      const superAdmins = groupMetadata.participants.filter(p => p.admin === 'superadmin');
-      if (superAdmins.length === 1) {
-        await socket.sendMessage(sender, { 
-          text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.' 
-        }, { quoted: msg });
-        break;
-      }
+    if (areSameIdentity(target, [nowsender, msg.key?.participantAlt]) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.'
+      }, { quoted: msg });
+      break;
     }
 
     // Rétrograder
     await socket.groupParticipantsUpdate(from, [targetJid], 'demote');
     
     await socket.sendMessage(sender, { 
-      text: `📉 ${target.notify || targetJid.split('@')[0]} n\'est plus administrateur.`,
-      mentions: [targetJid]
+      text: `📉 ${target.notify || targetMentionJid.split('@')[0]} n\'est plus administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
@@ -6437,39 +6964,17 @@ case 'vv': {
       break;
     }
 
-    // Helper : extraire le contenu view-once quel que soit le nesting (iOS/Android/ephemeral)
-    function extractViewOnceContent(q) {
-      // cas 1: q.viewOnceMessage?.message.{imageMessage|videoMessage|...}
-      if (q.viewOnceMessage && q.viewOnceMessage.message) {
-        const inner = q.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 2: q.ephemeralMessage?.message?.viewOnceMessage?.message.{...} (iPhone parfois)
-      if (q.ephemeralMessage && q.ephemeralMessage.message && q.ephemeralMessage.message.viewOnceMessage && q.ephemeralMessage.message.viewOnceMessage.message) {
-        const inner = q.ephemeralMessage.message.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 3: q.{imageMessage|videoMessage|stickerMessage|documentMessage|audioMessage} direct
-      const directTypes = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-      const directFound = directTypes.find(t => q[t]);
-      if (directFound) return { qType: directFound, content: q[directFound] };
-      // aucun trouvé
-      return null;
-    }
-
-    const extracted = extractViewOnceContent(quoted);
-    if (!extracted) {
+    // Les aliases de réaction et les différents clients WhatsApp peuvent ajouter
+    // plusieurs enveloppes autour du média (ephemeral, V2/V2Extension, document).
+    const extracted = extractViewOnceMedia(quoted);
+    if (!extracted || !extracted.isViewOnce) {
       await socket.sendMessage(sender, {
         text: '❌ Le message cité ne contient pas de média view-once supporté.'
       }, { quoted: msg });
       break;
     }
 
-    const { qType, content } = extracted;
+    const { field: qType, content } = extracted;
     const messageType = qType.replace(/Message$/i, '').toLowerCase(); // 'image', 'video', 'sticker', 'document', 'audio'
 
     // Télécharger le flux via downloadContentFromMessage
@@ -6556,16 +7061,13 @@ case 'add': {
     break;
   }
   try {
-    const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour ajouter des membres.' }, { quoted: msg });
       break;
     }
@@ -6705,32 +7207,13 @@ case 'breact': {
     let channelRef = parts[0].trim();
     const reactEmoji = parts[1].trim();
 
-    // Extraction du channelJid et messageId
-    let channelJid = null;
-    let messageId = null;
-
-    // Format URL
-    const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-    if (urlMatch) {
-      channelJid = `${urlMatch[1]}@newsletter`;
-      messageId = urlMatch[2];
-    } 
-    // Format court
-    else {
-      const maybeParts = channelRef.split('/');
-      if (maybeParts.length >= 2) {
-        messageId = maybeParts[maybeParts.length - 1];
-        channelJid = maybeParts[maybeParts.length - 2];
-        if (!channelJid.endsWith('@newsletter')) {
-          if (/^\d+$/.test(channelJid)) {
-            channelJid = `${channelJid}@newsletter`;
-          }
-        }
-      }
-    }
+    // Les réactions de chaîne exigent le server_id de la publication.
+    const reference = parseNewsletterMessageReference(channelRef);
+    const channelJid = reference?.jid || '';
+    const messageId = reference?.serverId || '';
 
     // Validation du format
-    if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
+    if (!channelJid || !messageId || !reactEmoji) {
       await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
       await socket.sendMessage(sender, { 
         text: "❌ Format invalide. Utilisez :\n1. `!breact 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n2. `!breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`" 
@@ -6783,16 +7266,11 @@ L'opération est en cours...`
         try {
           const botSocket = activeSockets.get(botNumber);
           
-          // Essayer de faire suivre le canal au bot
-          try {
-            await botSocket.newsletterFollow(channelJid);
-            await delay(1500); // Attente après le follow
-          } catch (followError) {
-            // Le bot suit peut-être déjà le canal, continuer
-          }
-          
-          // Envoyer la réaction
-          await botSocket.newsletterReactMessage(channelJid, messageId, reactEmoji);
+          // NYXCORE expose newsletterReactMessage(jid, serverId, reaction).
+          await reactToNewsletterMessage(botSocket, channelJid, messageId, reactEmoji, {
+            ensureFollow: true,
+            followDelayMs: 1500
+          });
           
           // Sauvegarder dans MongoDB
           await saveNewsletterReaction(channelJid, messageId, reactEmoji, botNumber);
@@ -6906,6 +7384,9 @@ case 'getpp': {
 
                 
 case 'code': {
+  // `from` is the remote chat JID (group or private), so the API result is
+  // returned to the exact conversation in which `.code` was issued.
+  const codeChat = from || msg.key?.remoteJid;
   const q = msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
@@ -6913,46 +7394,72 @@ case 'code': {
   
   const args = q.trim().split(/\s+/);
   args.shift(); // enlever la commande
-  const number = args.join(' ').trim();
+  const requestedNumber = args.join(' ').trim();
+  const pairingTarget = await resolvePairingNumber({
+    explicitNumber: requestedNumber,
+    msg,
+    from,
+    senderJid: nowsender,
+    socket
+  });
+  const cleanNumber = pairingTarget.number;
 
-  if (!number) {
-    return await socket.sendMessage(sender, {
+  if (!cleanNumber) {
+    const details = pairingTarget.error || 'Indique un numéro de téléphone valide.';
+    return await socket.sendMessage(codeChat, {
       text: `*📌 𝗖𝗢𝗗𝗘 𝗗𝗘 𝗖𝗢𝗡𝗡𝗘𝗫𝗜𝗢𝗡 𝗞𝗔𝗜𝗗𝗢*\n\n` +
+            `${details}\n\n` +
             `*Usage:* .code [numéro]\n` +
-            `*Exemple:* .code 5094744XXXX\n\n` +
-            `*Note:* Le numéro doit être au format international sans le +`
+            `Réponds à un message de la personne, ou utilise .code sans numéro pour ton propre compte.\n` +
+            `*Exemple:* .code 50947441234 (sans +)`
     }, { quoted: msg });
   }
 
-  const cleanNumber = number.replace(/[^\d]/g, '');
   if (cleanNumber.length < 9 || cleanNumber.length > 15) {
-    return await socket.sendMessage(sender, {
+    return await socket.sendMessage(codeChat, {
       text: `*❌ 𝙵𝚘𝚛𝚖𝚊𝚝 𝚒𝚗𝚌𝚘𝚛𝚛𝚎𝚌𝚝  *\n\n` +
             `ʟᴇ Nᴜᴍᴇʀᴏ ᴅᴏɪᴛ ᴄᴏɴᴛᴇɴɪʀ ᴇɴᴛʀᴇ 9 ᴇᴛ 15 ᴄʜɪғғʀᴇs.\n` +
             `ᗴ᙭ᗴᗰᑭᒪᗴ: 50947441234`
     }, { quoted: msg });
   }
 
+  let localFallbackAttempted = false;
+  let pairingApiNetworkFailure = false;
   try {
-    await socket.sendMessage(sender, { react: { text: "⏳", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "⏳", key: msg.key } });
 
-    let fetch;
+    // Chaque invocation demande un code frais. On tente d'abord l'hôte public
+    // configuré, puis localhost:PORT si l'adresse publique ne répond pas depuis
+    // le processus lui-même (cas fréquent avec une IP sans hairpin NAT).
+    const pairingUrls = createPairingCodeUrlCandidates(
+      cleanNumber,
+      process.env,
+      undefined,
+      { forceFresh: true }
+    );
+    let pairingResponse;
     try {
-      fetch = (await import('node-fetch')).default;
-    } catch {
-      fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+      pairingResponse = await fetchPairingCodeWithFallback(
+        pairingUrls,
+        fetch,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
+            'Accept': 'application/json'
+          },
+          timeout: PAIRING_CODE_HTTP_TIMEOUT_MS
+        },
+        () => {
+          localFallbackAttempted = true;
+          console.warn('[CODE] Hôte pairing inaccessible; nouvel essai sur localhost et le PORT courant.');
+        }
+      );
+    } catch (error) {
+      pairingApiNetworkFailure = isPairingNetworkError(error);
+      throw error;
     }
-
-    const url = `https://kaidomd-byplag.mooo.com/code?number=${encodeURIComponent(cleanNumber)}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
-        'Accept': 'application/json'
-      },
-      timeout: 30000
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    localFallbackAttempted = localFallbackAttempted || pairingResponse.usedFallback;
+    const response = pairingResponse.response;
 
     const bodyText = await response.text();
     let result;
@@ -6961,15 +7468,21 @@ case 'code': {
     } catch {
       const codeMatch = bodyText.match(/"code"\s*:\s*"([^"]+)"/) || bodyText.match(/'code'\s*:\s*'([^']+)'/);
       if (codeMatch) result = { code: codeMatch[1] };
+      else if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       else throw new Error("Réponse invalide du serveur");
     }
 
-    if (!result || !result.code) throw new Error("Aucun code reçu du serveur");
+    if (!response.ok) {
+      throw new Error(result?.message || result?.error || `HTTP ${response.status}: ${response.statusText}`);
+    }
+    if (!result || !result.code) {
+      throw new Error(result?.message || result?.error || "Aucun code reçu du serveur");
+    }
 
     const code = result.code.trim();
 
     // Message interactif avec bouton copy
-    await socket.relayMessage(sender, {
+    await socket.relayMessage(codeChat, {
       viewOnceMessage: {
         message: {
           interactiveMessage: {
@@ -7002,12 +7515,25 @@ case 'code': {
       }
     }, { quoted: msg });
 
-    await socket.sendMessage(sender, { react: { text: "✅", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "✅", key: msg.key } });
 
   } catch (err) {
-    console.error("❌ Erreur commande code:", err);
-    await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(sender, { text: `❌ Erreur: ${err.message || err}` }, { quoted: msg });
+    const errorText = String(err?.message || err);
+    const isTimeout = pairingApiNetworkFailure && (
+      err?.type === 'request-timeout'
+      || err?.code === 'ETIMEDOUT'
+      || err?.code === 'ESOCKETTIMEDOUT'
+      || /network timeout|timed? ?out|timeout/i.test(errorText)
+    );
+    const isNetworkFailure = pairingApiNetworkFailure;
+    console.error("❌ Erreur commande code:", errorText);
+    await socket.sendMessage(codeChat, { react: { text: "❌", key: msg.key } });
+    const userMessage = isNetworkFailure
+      ? isTimeout
+        ? `❌ Délai dépassé en attendant le serveur de pairing. Une demande de code frais (force=1) a été tentée${localFallbackAttempted ? ' via l’hôte configuré puis localhost' : ''}. Vérifie l’hôte et le PORT, puis réessaie si aucun code n’est arrivé.`
+        : `❌ Le serveur de pairing est inaccessible${localFallbackAttempted ? ' via l’hôte configuré et localhost' : ''}. Vérifie l’hôte et le PORT.${errorText ? ` (${errorText})` : ''}`
+      : `❌ Erreur: ${errorText}`;
+    await socket.sendMessage(codeChat, { text: userMessage }, { quoted: msg });
   }
   break;
 }
@@ -7111,7 +7637,7 @@ case 'cfn': {
   const full = args.join(" ").trim();
   if (!full) {
     await socket.sendMessage(sender, { 
-      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 120363402094635383@newsletter | 🔥,❤️` 
+      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 0029Vb761O39mrGTZvQ8UQ02@newsletter | 🔥,❤️`
     }, { quoted: msg });
     break;
   }
@@ -7204,34 +7730,12 @@ case 'chr': {
   let channelRef = parts[0].trim();
   const reactEmoji = parts[1].trim();
 
-  let channelJid = null;
-  let messageId = null;
-
-  // 🔹 OPTION 1 : URL complète (https://whatsapp.com/channel/...)
-  const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-  if (urlMatch) {
-    channelJid = `${urlMatch[1]}@newsletter`;
-    messageId = urlMatch[2];
-  }
-  // 🔹 OPTION 2 : Format channelJid/messageId
-  else {
-    const maybeParts = channelRef.split('/');
-    if (maybeParts.length >= 2) {
-      messageId = maybeParts[maybeParts.length - 1];
-      channelJid = maybeParts[maybeParts.length - 2];
-      
-      // Vérifier si le JID contient déjà @newsletter
-      if (!channelJid.endsWith('@newsletter')) {
-        // Si c'est juste des chiffres, ajouter @newsletter
-        if (/^\d+$/.test(channelJid)) {
-          channelJid = `${channelJid}@newsletter`;
-        }
-      }
-    }
-  }
+  const reference = parseNewsletterMessageReference(channelRef);
+  const channelJid = reference?.jid || '';
+  const messageId = reference?.serverId || '';
 
   // Validation finale
-  if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
+  if (!channelJid || !messageId || !reactEmoji) {
     return await socket.sendMessage(sender, { 
       text: '❌ Format invalide. Utilisez :\n' +
             '1. `chr 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n' +
@@ -7240,7 +7744,10 @@ case 'chr': {
   }
 
   try {
-    await socket.newsletterReactMessage(channelJid, messageId.toString(), reactEmoji);
+    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, {
+      ensureFollow: true,
+      followDelayMs: 1500
+    });
     await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
 
     // BotName meta mention
@@ -7581,17 +8088,27 @@ ${statusEmoji} *Statut :* ${status}
                 }
 
                 try {
-                    const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-                    const groupName = metadata.subject || "Sans nom";
+                    const { metadata, participants } = await getGroupAdminsInfo(socket, from);
+                    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+                    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
+                        await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    if (!isBotGroupAdmin(metadata, socket)) {
+                        await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    const groupName = metadata?.subject || "Sans nom";
 
-                    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-                    // Membres à expulser (non-admins, pas le bot)
-                    const toKick = participants.filter(p => 
-                        !groupAdmins.includes(p.id) && p.id !== botNumber
-                    );
+                    // Membres à expulser (non-admins et pas le bot), résolus par leur JID réel.
+                    const toKick = participants
+                        .filter(participant => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant))
+                        .map(participant => ({
+                            ...participant,
+                            id: getParticipantId(participant),
+                            mentionJid: getParticipantMentionJid(participant)
+                        }))
+                        .filter(participant => participant.id);
 
                     if (!toKick.length) {
                         await socket.sendMessage(from, { 
@@ -7603,7 +8120,7 @@ ${statusEmoji} *Statut :* ${status}
                     // Liste numérotée
                     let kickLines = "";
                     toKick.forEach((mem, i) => {
-                        const num = mem.id.split('@')[0];
+                        const num = (mem.mentionJid || mem.id).split('@')[0];
                         kickLines += `☠️ ${(i + 1).toString().padStart(2, '0')}. @${num}\n`;
                     });
 
@@ -7613,7 +8130,7 @@ ${statusEmoji} *Statut :* ${status}
 ✦━━━━━━━━━━━━━━━━━━━━✦
 
 📌 GROUPE : ${groupName}
-⚓ Ordre donné par : @${sender.split('@')[0]}
+⚓ Ordre donné par : @${actor.split('@')[0]}
 
 💬 Vous tous avez étés jugés indigne de persister dans ce groupe🚶. Le roi des bêtes à scellé votre destin 🐉!
 👥 Membres expulsés : ${toKick.length}
@@ -7625,7 +8142,7 @@ ${kickLines}
                     // Annonce avant expulsion
                     await socket.sendMessage(from, {
                         text: caption,
-                        mentions: [sender, ...toKick.map(p => p.id)]
+                        mentions: [actor, ...toKick.map(p => p.mentionJid || p.id)]
                     }, { quoted: msg });
 
                     // Expulsion en un seul coup
@@ -7655,10 +8172,7 @@ ${kickLines}
 
                 try {
                     const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-
-                    // Liste des admins
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+                    const groupAdmins = getGroupAdminJids(metadata);
 
                     if (!groupAdmins.length) {
                         await socket.sendMessage(from, { 
@@ -8632,6 +9146,7 @@ case 'menu': {
 > ・ .mute
 > ・ .unmute
 > ・ .swgc / .gcstatus
+> ・ .style (audio stylisé / Fancy Text)
 > ・ .setgpp
 > ・ .listadmin
 > ・ .creategroup
@@ -8730,7 +9245,7 @@ ${footer}
           `.add, .kick, .creategroup\n` +
           `.save, .tovn, .vv\n` +
           `.play, .bible, .code\n` +
-          `.upch, .swgc / .gcstatus, .img\n` +
+          `.upch, .swgc / .gcstatus, .style, .img\n` +
           `\nUtilise .help [commande] pour plus d'info`
       }, { quoted: msg });
     } catch (e) {}
@@ -8739,8 +9254,8 @@ ${footer}
 }
 
 
-// `.swgc` / `.gcstatus` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
-// avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
+// `.swgc` / `.gcstatus` et le mode audio de `.style` sont implémentés dans les
+// plugins de groupe. Ils s’exécutent avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
 // le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
 // ==================== DOWNLOAD MENU ====================
@@ -8793,7 +9308,8 @@ case 'help': {
 ・ .tagall               → Mentionne tous les membres du groupe.
 ・ .mute                 → Restreint l'envoi aux admins (admins).
 ・ .unmute               → Réactive l'envoi pour tous.
-・ .swgc / .gcstatus     → Publie en privé un statut de groupe (texte, média ou audio stylisé).
+・ .swgc / .gcstatus     → Publie un statut de groupe (audio brut, texte, image ou vidéo).
+・ .style                → Répond à un audio pour publier la vidéo Kaido stylisée; avec du texte, Fancy Text.
 ・ .listadmin            → Liste les admins du groupe.
 ・ .creategroup          → Crée un nouveau groupe via le bot.
 ・ .listactive           → Liste les membres actifs.
@@ -9563,14 +10079,16 @@ END:VCARD`
         text: '⚠️ Format de lien invalide.\nAssurez‑vous qu’il ressemble à :\nhttps://whatsapp.com/channel/xxxxxxxxx'
       }, { quoted: shonux });
     }
-    const inviteId = match[1];
+    const inviteId = match[1].slice(0, 128);
 
-    // --- Cache mémoire simple pour éviter appels répétés (TTL 10 minutes)
-    if (!global.__whatsapp_channel_cache) global.__whatsapp_channel_cache = new Map();
+    // Cache LRU borné, avec expiration : le TTL seul laissait les vieilles clés
+    // oubliées en mémoire quand les liens n’étaient consultés qu’une fois.
+    if (!isBoundedCache(global.__whatsapp_channel_cache)) {
+      global.__whatsapp_channel_cache = createBoundedCache({ maxEntries: 128, maxAgeMs: 10 * 60 * 1000 });
+    }
     const cacheKey = `channel_${inviteId}`;
     const cached = global.__whatsapp_channel_cache.get(cacheKey);
-    const now = Date.now();
-    if (cached && (now - cached._ts) < (10 * 60 * 1000)) {
+    if (cached) {
       const metadata = cached.metadata;
       if (process.env.LOG_LEVEL === 'debug') console.debug('[CID] renvoi depuis le cache pour', inviteId);
       const infoTextCached = buildChannelInfoText(metadata, botName);
@@ -9635,15 +10153,26 @@ END:VCARD`
       }, { quoted: shonux });
     }
 
+    const safeMetadataText = (value, maxLength = 256) => {
+      if (value instanceof Date && Number.isFinite(value.getTime())) value = value.toISOString();
+      if (typeof value !== 'string' && typeof value !== 'number') return null;
+      const text = String(value).trim().slice(0, maxLength);
+      return text || null;
+    };
+    const rawPreview = metadata.preview || metadata.thumbnail || metadata.image || null;
+    const preview = typeof rawPreview === 'string'
+      ? rawPreview.slice(0, 2048)
+      : (typeof rawPreview?.url === 'string' ? rawPreview.url.slice(0, 2048) : null);
+    const subscriberCount = Number(metadata.subscribers ?? metadata.subscriberCount ?? metadata.followers);
     const normalized = {
-      id: metadata.id || inviteId,
-      name: metadata.name || metadata.title || null,
-      subscribers: (typeof metadata.subscribers === 'number') ? metadata.subscribers : (metadata.subscriberCount || metadata.followers || null),
-      creation_time: metadata.creation_time || metadata.createdAt || metadata.created_at || null,
-      preview: metadata.preview || metadata.thumbnail || metadata.image || null,
-      description: metadata.description || metadata.about || null,
-      category: metadata.category || null,
-      owner: metadata.owner || metadata.creator || null
+      id: safeMetadataText(metadata.id || inviteId, 256),
+      name: safeMetadataText(metadata.name || metadata.title, 256),
+      subscribers: Number.isFinite(subscriberCount) ? subscriberCount : null,
+      creation_time: safeMetadataText(metadata.creation_time || metadata.createdAt || metadata.created_at, 64),
+      preview,
+      description: safeMetadataText(metadata.description || metadata.about, 1200),
+      category: safeMetadataText(metadata.category, 100),
+      owner: safeMetadataText(metadata.owner || metadata.creator, 256)
     };
 
     // --- Persister dans le cache mémoire
@@ -9674,9 +10203,10 @@ END:VCARD`
     }
 
     function normalizePreviewUrl(preview) {
-      if (!preview) return null;
-      if (preview.startsWith('http')) return preview;
-      return `https://pps.whatsapp.net${preview}`;
+      if (typeof preview !== 'string' || !preview) return null;
+      const value = preview.slice(0, 2048);
+      if (/^https?:\/\//i.test(value)) return value;
+      return `https://pps.whatsapp.net${value.startsWith('/') ? '' : '/'}${value}`;
     }
 
     const infoText = buildChannelInfoText(normalized, botName);
@@ -9811,10 +10341,14 @@ case 'tagall': {
       }, { quoted: msg });
     }
 
-    const participants = gm.participants || [];
+    const participants = Array.isArray(gm.participants) ? gm.participants : [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(gm, [actor, msg.key?.participantAlt])) {
+      return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+    }
     if (!participants.length) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Aucun membre trouvé dans le groupe.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Aucun membre trouvé dans le groupe.'
       }, { quoted: msg });
     }
 
@@ -9825,7 +10359,7 @@ case 'tagall': {
       groupPP = await socket.profilePictureUrl(from, 'image'); 
     } catch(e){}
 
-    const mentions = participants.map(p => p.id || p.jid);
+    const mentions = participants.map(getParticipantMentionJid).filter(Boolean);
     const groupName = gm.subject || 'Groupe';
     const totalMembers = participants.length;
 
@@ -10386,16 +10920,39 @@ case 'resetconfig': {
       console.error('Command handler error:', err);
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
-
-  }));
+    }), (error, { index, message, queueDelayMs, processingDurationMs } = {}) => {
+      if (batchStats) {
+        if (Number.isFinite(queueDelayMs)) {
+          batchStats.lastQueueDelayMs = queueDelayMs;
+          batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+        }
+        if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
+        batchStats.errors += 1;
+        batchStats.lastErrorAt = Date.now();
+        batchStats.lastError = String(error?.message || error).slice(0, 300);
+      }
+      console.error(
+        `[SESSION ${number || 'inconnue'}] traitement messages.upsert #${index} (${message?.key?.id || 'sans id'}) :`,
+        error?.stack || error
+      );
+    }, (_result, { queueDelayMs, processingDurationMs } = {}) => {
+      if (!batchStats) return;
+      batchStats.processed += 1;
+      batchStats.lastProcessedAt = Date.now();
+      if (Number.isFinite(queueDelayMs)) {
+        batchStats.lastQueueDelayMs = queueDelayMs;
+        batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+      }
+      if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
+    });
+  });
 }
 
 // ---------------- message handlers ----------------
 
 function setupMessageHandlers() {
-  // La présence et les accusés de lecture sont gérés après reconnaissance de la
-  // commande dans setupCommandHandlers. Ne rien envoyer ici évite de réveiller
-  // le compte pour un message ordinaire lorsque AUTO_ONLINE est désactivé.
+  // La disponibilité est maintenue à l'ouverture du socket Baileys. Ce handler
+  // ne doit ni envoyer unavailable ni modifier la présence des messages ignorés.
 }
 
 // ---------------- cleanup helper ----------------
@@ -10419,8 +10976,15 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     pairingSockets.delete(sanitized);
     socketCreationTime.delete(sanitized);
     lastConnectionActivity.delete(sanitized);
+    messageProcessingStats.delete(sanitized);
+    messageDispatchers.delete(sanitized);
+    sessionConfigCache.delete(sanitized);
+    sessionConfigRefreshAfter.delete(sanitized);
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
     connectionLifecycles.delete(sanitized);
     socketRuntimeMetadata.delete(sanitized);
+    deleteSessionStore(sanitized);
+    statusLog.clear(sanitized);
 
     // 2) Socket : logout côté WhatsApp puis fermeture de la websocket. Le
     // marqueur est posé AVANT logout(), car celui-ci peut émettre close aussitôt.
@@ -10476,8 +11040,15 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   activeSockets.delete(sanitized);
   socketCreationTime.delete(sanitized);
   lastConnectionActivity.delete(sanitized);
+  messageProcessingStats.delete(sanitized);
+  messageDispatchers.delete(sanitized);
+  sessionConfigCache.delete(sanitized);
+  sessionConfigRefreshAfter.delete(sanitized);
+  sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
   connectionLifecycles.delete(sanitized);
   socketRuntimeMetadata.delete(sanitized);
+  deleteSessionStore(sanitized);
+  statusLog.clear(sanitized);
 
   if (socket) {
     intentionalSocketClosures.add(socket);
@@ -10531,6 +11102,41 @@ const reconnectScheduler = createReconnectScheduler({
     );
   }
 });
+
+// Baileys envoie déjà une IQ ping-pong sur CHAQUE socket au rythme configuré
+// dans makeWASocket. Ce watchdog vérifie le vrai getter `socket.ws.isOpen` de
+// WebSocketClient (pas `readyState`, qui n’existe pas sur son wrapper) et ne
+// recycle que les sockets durablement bloqués. Il réutilise le scheduler unique.
+const sessionHealthWatcher = createSessionHealthWatcher({
+  getSessions: () => activeSockets,
+  intervalMs: SESSION_HEALTH_CHECK_INTERVAL_MS,
+  staleAfterMs: SESSION_STALE_AFTER_MS,
+  onStale: async (number, socket, health) => {
+    if (shuttingDown || activeSockets.get(number) !== socket || getSocketOpenState(socket) !== false) return;
+    console.error(
+      `[SESSION ${number}] WebSocket toujours fermé après ${Math.round(health.unhealthyForMs / 1000)} s; reconnexion ciblée.`
+    );
+    activeSockets.delete(number);
+    socketCreationTime.delete(number);
+    try {
+      forceCloseSessionSocket(socket, error => {
+        console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+      });
+    } catch (error) {
+      console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+    }
+    const scheduled = reconnectScheduler.schedule(number, {
+      reason: 'watchdog keepalive : socket non ouvert'
+    });
+    if (!scheduled.scheduled && scheduled.reason === 'tentatives-epuisees') {
+      console.error(`[SESSION ${number}] le watchdog ne peut plus programmer de reconnexion.`);
+    }
+  },
+  onError: (error, number) => {
+    console.error(`[SESSION ${number || 'watchdog'}] contrôle keepalive :`, error?.message || error);
+  }
+});
+sessionHealthWatcher.start();
 
 function setupAutoRestart(socket, number, auth) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
@@ -10783,7 +11389,8 @@ async function EmpirePair(number, res, options = {}) {
       version: waVersion,
       printQRInTerminal: false,
       logger,
-      markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
+      keepAliveIntervalMs: SESSION_KEEPALIVE_INTERVAL_MS,
+      markOnlineOnConnect: true,
       browser: WA_BROWSER
     });
 
@@ -10802,20 +11409,20 @@ socket.ev.on('creds.update', () => {
 // Branché avant tout await : il doit voir pair-success puis le close 515, même
 // si l'initialisation d'un handler métier prend du temps.
 const pairingLifecycle = setupAutoRestart(socket, sanitizedNumber, auth);
-// Le stanza pair-device peut arriver pendant l'initialisation des wrappers :
-// on s'abonne donc tout de suite, puis on attend le résultat juste avant la
-// demande de code. La promesse convertit son rejet pour éviter tout unhandled.
+// Le handshake Baileys peut terminer pendant l'initialisation des handlers :
+// on s'abonne tout de suite, puis la demande de code attend le premier stanza
+// déchiffré (ou update.qr) sans imposer le parcours QR.
 const pairingReadyResult = socket.authState.creds.registered
   ? null
   : waitForPairingReady(socket, { timeoutMs: PAIRING_READY_TIMEOUT_MS }).then(
       () => ({ ok: true }),
       (error) => ({ ok: false, error })
     );
-// Garde-fou d'envoi : installé avant les handlers métier pour que tous les
-// `socket.sendMessage` du bot vérifient la connexion réelle.
-installSafeSend(socket);
+// Les wrappers fonctionnels sont installés avant le garde-fou afin que
+// safe-send vérifie l'état Baileys avant toute traduction ou autre travail.
 await setupTranslationWrapper(socket, sanitizedNumber);
 setupCommandThemeWrapper(socket);
+installSafeSend(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
@@ -10846,20 +11453,18 @@ handleMessageRevocation(socket, sanitizedNumber);
       let code = null;
       let lastError = null;
       try {
-        const ready = await pairingReadyResult;
-        if (!ready?.ok) throw ready?.error || new Error('WhatsApp non prêt pour l’appairage');
-        pairingLifecycle.markPairingReady();
-        pairingLifecycle.markCodeRequested();
-
         // Une seule demande par socket. Réessayer automatiquement ici peut
         // écraser creds.pairingCode alors que le téléphone traite encore la
         // première réponse (voir le cycle delayed primary_hello de Baileys).
-        code = await socket.requestPairingCode(sanitizedNumber);
-        // Ne jamais remettre le code au navigateur avant que les creds qui lui
-        // correspondent soient acquittées par MongoDB.
-        await auth.saveCreds();
-        await auth.flush();
-        pairingLifecycle.markCodeIssued();
+        code = await issuePairingCode({
+          socket,
+          number: sanitizedNumber,
+          auth,
+          readiness: pairingReadyResult,
+          onReady: () => pairingLifecycle.markPairingReady(),
+          onRequest: () => pairingLifecycle.markCodeRequested(),
+          onIssued: () => pairingLifecycle.markCodeIssued()
+        });
       } catch (error) {
         lastError = error;
         console.warn(
@@ -10923,8 +11528,7 @@ handleMessageRevocation(socket, sanitizedNumber);
           await auth.saveCreds();
           await addNumberToMongo(sanitizedNumber);
 
-          const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, true);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -11010,7 +11614,7 @@ Le bot est maintenant connecté et fonctionnel.`,
             console.error('Failed during connect-message edit sequence:', e);
           }
 
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, true);
 
         } catch (e) {
           // Ne JAMAIS redémarrer tout le processus ici : ça tuerait toutes les
@@ -11197,17 +11801,38 @@ router.get('/ping', (req, res) => {
 });
 
 
+async function launchSessionsWithConcurrency(numbers, reconnectReason, { skipLocked = false } = {}) {
+  const { mapWithConcurrency } = require('../services/session-startup');
+  const concurrency = getSessionStartupConcurrency();
+  const uniqueNumbers = [...new Set((numbers || [])
+    .map(number => String(number).replace(/[^0-9]/g, ''))
+    .filter(Boolean))];
+  const outcomes = await mapWithConcurrency(uniqueNumbers, concurrency, async number => {
+    if (activeSockets.has(number)) return { number, status: 'already_connected' };
+    if (skipLocked && pairingGuard.isLocked(number)) return { number, status: 'already_starting' };
+    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+    await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason });
+    return { number, status: 'connection_initiated' };
+  });
+  return outcomes.map((outcome, index) => outcome.status === 'fulfilled'
+    ? outcome.value
+    : {
+        number: uniqueNumbers[index],
+        status: 'failed',
+        error: outcome.reason?.message || String(outcome.reason || 'Erreur inconnue')
+      });
+}
+
+function getSessionStartupConcurrency() {
+  const { resolveSessionStartupConcurrency } = require('../services/session-startup');
+  return resolveSessionStartupConcurrency(process.env.SESSION_STARTUP_CONCURRENCY);
+}
+
 router.get('/connect-all', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No numbers found to connect' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'connect-all' });
-      results.push({ number, status: 'connection_initiated' });
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'connect-all');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
 });
@@ -11217,16 +11842,7 @@ router.get('/reconnect', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No session numbers found in MongoDB' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      try {
-        await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'api-reconnect' });
-        results.push({ number, status: 'connection_initiated' });
-      } catch (err) { results.push({ number, status: 'failed', error: err.message }); }
-      await delay(1000);
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'api-reconnect');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
 });
@@ -11315,9 +11931,9 @@ router.get('/api/active', async (req, res) => {
 });
 
 /**
- * Diagnostic des sessions : source de l'état d'authentification, nombre de clés
- * Signal, écritures en attente, état de la websocket et statistiques d'envoi.
- * C'est l'endroit où regarder quand une réponse ne part pas.
+ * Diagnostic des sessions : source auth, clés Signal, websocket, messages reçus
+ * et traités, erreurs du handler et statistiques d'envoi. C'est l'endroit où
+ * localiser un cas où le téléphone affiche le compte connecté sans réponse du bot.
  */
 router.get('/api/session/health', async (req, res) => {
   try {
@@ -11326,12 +11942,14 @@ router.get('/api/session/health', async (req, res) => {
       const auth = authStates.get(number);
       sessions.push({
         number,
-        websocketOuverte: socket?.ws?.readyState === 1,
+        websocketOuverte: getSocketOpenState(socket) === true,
         enregistre: Boolean(socket?.authState?.creds?.registered),
         sourceAuth: auth ? auth.source : null,
         clesSignal: auth ? auth.keyCount() : null,
         ecrituresEnAttente: auth ? auth.pendingWrites() : null,
         envois: typeof getSendStats === 'function' ? getSendStats(socket) : null,
+        traitementMessages: { ...getMessageProcessingStats(number) },
+        fileTraitement: messageDispatchers.get(number)?.getStats() || null,
         derniereActivite: lastConnectionActivity.get(number) || null,
         runtimeBaileys: socketRuntimeMetadata.get(number) || null,
         cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null
@@ -11346,6 +11964,7 @@ router.get('/api/session/health', async (req, res) => {
       ok: true,
       stockageSessions: 'mongodb',
       mongodbConnecte: mongoConnection.isConnected(),
+      boucleEvenement: readEventLoopDelayStats(),
       versionWhatsAppWeb: baileysVersionResolver.snapshot(),
       appairages,
       sessions
@@ -11409,6 +12028,8 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  sessionHealthWatcher.stop();
+  githubAutoUpdater.stop();
   console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
   const socketsToClose = new Set([...activeSockets.values(), ...pairingSockets.values()]);
   socketsToClose.forEach((socket) => {
@@ -11444,22 +12065,29 @@ async function restoreSessionsOnBoot() {
       .filter(Boolean)
   );
 
-  console.log(`[BOOT] ${numbers.size} session(s) MongoDB à restaurer.`);
-  for (const n of numbers) {
-    if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
-    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-    try {
-      await EmpirePair(n, mockRes, { internalReconnect: true, reconnectReason: 'boot' });
-    } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
-    await delay(500);
+  console.log(
+    `[BOOT] ${numbers.size} session(s) MongoDB à restaurer avec ${getSessionStartupConcurrency()} démarrage(s) parallèle(s).`
+  );
+  const results = await launchSessionsWithConcurrency([...numbers], 'boot', { skipLocked: true });
+  const started = results.filter(result => result.status === 'connection_initiated').length;
+  const failed = results.filter(result => result.status === 'failed');
+  console.log(`[BOOT] ${started} démarrage(s) lancé(s), ${results.length - started - failed.length} déjà actif(s/en attente), ${failed.length} échec(s).`);
+  for (const result of failed) {
+    console.error(`[BOOT] ${result.number}:`, result.error);
   }
 }
 
 async function bootstrapMongoSessions() {
   try {
     await initMongo();
+    // Réchauffe les contrôles consultés à chaque commande avant l'ouverture des
+    // sockets, afin qu'une première réponse ne dépende pas d'une lecture Mongo.
+    await loadAdminsFromMongo().catch(error => {
+      console.warn('[BOOT] cache des administrateurs indisponible :', error?.message || error);
+    });
     await restoreRestartSchedule();
     await restoreSessionsOnBoot();
+    githubAutoUpdater.start();
   } catch (error) {
     // Le serveur HTTP reste joignable pour afficher le diagnostic, mais aucun
     // socket WhatsApp ne démarre sans la source de vérité MongoDB.

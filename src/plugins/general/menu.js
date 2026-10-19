@@ -41,7 +41,7 @@ const LEGACY_GROUPS = {
   ]),
   group: new Set([
     'admin', 'unadmin', 'admins', 'promote', 'demote', 'kick', 'kickall',
-    'mute', 'unmute', 'tagall', 'hidetag', 'cgroup', 'creategroup', 'grouplist',
+    'mute', 'unmute', 'tagall', 'hidetag', 'cgroup', 'creategroup', 'grouplist', 'style',
     'groupjid', 'gjid', 'welcome', 'goodbye', 'leave', 'fullpp', 'setgpp'
   ]),
   download: new Set([
@@ -51,7 +51,7 @@ const LEGACY_GROUPS = {
   ]),
   tools: new Set([
     'tourl', 'tolink', 'upload', 'tovn', 'sticker', 's', 'take', 'save', 'vv',
-    'rvo', 'readviewonce', 'img', 'fancy', 'fancytext', 'style', 'translate',
+    'rvo', 'readviewonce', 'img', 'fancy', 'fancytext', 'translate',
     'tr', 'trt', 'ssweb', 'upscale', 'lyrics', 'shazam', 'whatmusic',
     'findmusic', 'quemusica', 'detect', 'getpp', 'setpp', 'setppfull', 'setlang',
     'jid', 'cid', 'chr', 'bible', 'verset', 'bibleai', 'bratvid', 'bratvideo'
@@ -223,7 +223,8 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}hidetag / ${p}h
 > ・ ${p}mute
 > ・ ${p}unmute
-> ・ ${p}swgc / ${p}gcstatus (statut de groupe privé)
+> ・ ${p}swgc / ${p}gcstatus (audio brut et statut de groupe)
+> ・ ${p}style (répondre à un audio pour créer la vidéo Kaido)
 > ・ ${p}setgpp
 > ・ ${p}listadmin
 > ・ ${p}creategroup
@@ -268,6 +269,13 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}listcmd
 > ・ ${p}delcmd
 
+> 〢 𝐒𝐓𝐀𝐓𝐔𝐓 𝐏𝐄𝐑𝐒𝐎𝐍𝐍𝐄𝐋 📲
+
+> ・ ${p}tostatus <texte> / ${p}tostatus new group
+> ・ ${p}tostatus add / ${p}tostatus export
+> ・ ${p}setstatusviewers / ${p}statusviewers
+> ・ ${p}delstatus
+
 > 〢 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 ✿︎
 
 > ・ ${p}play Ⓛ︎
@@ -287,6 +295,10 @@ function buildMenuText({ prefix, userTag, uptime, version, footer, activeCount, 
 > ・ ${p}config autorec
 > ・ ${p}config setemoji
 > ・ ${p}config setprefix
+
+> 〢 𝐌𝐀𝐈𝐍𝐓𝐄𝐍𝐀𝐍𝐂𝐄 🔄
+
+> ・ ${p}update [check]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
                 🐉-𝑲𝒊𝒏𝒈 𝒐𝒇 𝒕𝒉𝒆 𝒃𝒆𝒂𝒔𝒕 -🐉
