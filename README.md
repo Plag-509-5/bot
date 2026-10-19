@@ -128,8 +128,10 @@ Signal, les écritures en attente et l'état de chaque websocket. `traitementMes
 compte les upserts reçus/traités, les erreurs et la latence d'attente; `fileTraitement`
 expose la file, le parallélisme, les refus en surcharge et les temps de traitement.
 Les messages de chats différents avancent en parallèle, ceux du même chat restent
-FIFO. `boucleEvenement` expose la latence du thread Node, `envois` les envois réussis
-ou échoués, et `ecrituresEnAttente` la file de persistance auth MongoDB. `receivedByType`
+FIFO. Les clés Signal sont persistées par MongoDB avec ordre garanti pour chaque clé,
+mais les clés distinctes et les creds ne se bloquent plus mutuellement. `boucleEvenement`
+expose la latence du thread Node, `envois` les envois réussis ou échoués, et
+`ecrituresEnAttente` la file de persistance auth MongoDB. `receivedByType`
 distingue les notifications live (`notify`) des messages d'historique (`append`); l'historique est
 compté mais n'exécute pas d'anciennes commandes après une reconnexion (`historyIgnored`). Si
 `received` n'augmente pas après un message WhatsApp, le défaut est avant le routeur de commandes;
