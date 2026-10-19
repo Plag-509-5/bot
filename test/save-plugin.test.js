@@ -145,6 +145,58 @@ test('.save sur réaction récupère un imageMessage direct du chat @lid et le t
   assert.equal(sent.some(event => event.content?.text?.includes('Réponds à un média')), false);
 });
 
+test('.save via une réaction déballée envoie une vue unique éphémère vers « Vous »', async () => {
+  const { socket, sent } = fakeSocket();
+  const targetChat = '120363000000000000@g.us';
+  const image = { mimetype: 'image/jpeg', viewOnce: true, caption: 'Photo éphémère', fileLength: 123 };
+  const targetMessage = {
+    key: { remoteJid: targetChat, fromMe: false, id: 'ephemeral-view-once', participant: requesterJid },
+    message: {
+      ephemeralMessage: {
+        message: {
+          viewOnceMessageV2: {
+            message: { imageMessage: image }
+          }
+        }
+      }
+    }
+  };
+  const syntheticMsg = {
+    key: { remoteJid: targetChat, fromMe: false, id: 'reaction-save-ephemeral', participant: requesterJid },
+    message: {
+      extendedTextMessage: {
+        text: '.save',
+        contextInfo: {
+          remoteJid: targetChat,
+          stanzaId: targetMessage.key.id,
+          participant: requesterJid,
+          quotedMessage: targetMessage.message
+        }
+      }
+    }
+  };
+  const bytes = Buffer.from('decrypted ephemeral view-once image');
+  await savePlugin.execute({
+    socket,
+    msg: syntheticMsg,
+    from: targetChat,
+    command: 'save',
+    quotedMsg: targetMessage.message,
+    downloadContentFromMessage: async (content, mediaType) => {
+      assert.equal(content, image);
+      assert.equal(mediaType, 'image');
+      return Readable.from([bytes]);
+    }
+  });
+
+  const saved = sent.find(event => event.jid === selfJid && event.content?.image);
+  assert.ok(saved, 'la vue unique décodée doit être réenvoyée dans « Vous »');
+  assert.equal(saved.content.image.toString(), bytes.toString());
+  assert.equal(saved.content.caption, 'Photo éphémère');
+  assert.equal(saved.content.mimetype, 'image/jpeg');
+  assert.equal(sent.some(event => event.content?.forward), false, 'une vue unique doit être téléchargée puis réenvoyée, pas forwardée comme proto chiffré');
+});
+
 test('.vv extrait une vue unique via le quote d’un alias de réaction et renvoie le média dans le même groupe', async () => {
   const { socket, sent } = fakeSocket();
   const image = { mimetype: 'image/png', viewOnce: true, caption: 'Photo privée' };

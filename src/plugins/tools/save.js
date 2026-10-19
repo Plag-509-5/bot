@@ -105,6 +105,32 @@ function getCommandName(context) {
   return String(context?.body || '').trim().split(/\s+/)[0].replace(/^[./!#]+/, '').toLowerCase();
 }
 
+function buildViewOncePayload(extracted, buffer, { includeUnwrappedNotice = false } = {}) {
+  const defaults = VIEW_ONCE_DEFAULTS[extracted.type];
+  const mimetype = extracted.content.mimetype || defaults.mimetype;
+  const fileName = extracted.content.fileName || defaults.fileName;
+  const originalCaption = extracted.content.caption || '';
+  const caption = includeUnwrappedNotice
+    ? (originalCaption ? `${originalCaption}\n\n${defaults.caption}` : defaults.caption)
+    : originalCaption;
+  const captionField = caption ? { caption } : {};
+
+  switch (extracted.type) {
+    case 'image':
+      return { image: buffer, ...captionField, mimetype };
+    case 'video':
+      return { video: buffer, ...captionField, mimetype, fileName };
+    case 'audio':
+      return { audio: buffer, mimetype, ptt: Boolean(extracted.content.ptt) };
+    case 'document':
+      return { document: buffer, mimetype, fileName, ...captionField };
+    case 'sticker':
+      return { sticker: buffer, mimetype };
+    default:
+      throw new Error('Type de média non pris en charge pour une vue unique.');
+  }
+}
+
 async function executeViewOnce(context, quoted) {
   const { socket, msg, downloadContentFromMessage } = context;
   const chatId = context?.from || msg?.key?.remoteJid;
@@ -134,32 +160,7 @@ async function executeViewOnce(context, quoted) {
   const buffer = await collectMediaStream(stream);
   if (!buffer.length) throw new Error('Le flux view-once téléchargé est vide.');
 
-  const defaults = VIEW_ONCE_DEFAULTS[extracted.type];
-  const mimetype = extracted.content.mimetype || defaults.mimetype;
-  const fileName = extracted.content.fileName || defaults.fileName;
-  const originalCaption = extracted.content.caption || '';
-  const caption = originalCaption ? `${originalCaption}\n\n${defaults.caption}` : defaults.caption;
-  let payload;
-
-  switch (extracted.type) {
-    case 'image':
-      payload = { image: buffer, caption, mimetype };
-      break;
-    case 'video':
-      payload = { video: buffer, caption, mimetype, fileName };
-      break;
-    case 'audio':
-      payload = { audio: buffer, mimetype, ptt: Boolean(extracted.content.ptt) };
-      break;
-    case 'document':
-      payload = { document: buffer, mimetype, fileName, caption };
-      break;
-    case 'sticker':
-      payload = { sticker: buffer, mimetype };
-      break;
-    default:
-      throw new Error('Type de média non pris en charge pour une vue unique.');
-  }
+  const payload = buildViewOncePayload(extracted, buffer, { includeUnwrappedNotice: true });
 
   const sent = await socket.sendMessage(chatId, payload, { quoted: msg });
   if (!sent) throw new Error('WhatsApp n’a pas confirmé l’envoi du média.');
@@ -214,6 +215,20 @@ module.exports = {
 
       const quotedContext = getQuotedMessageFromContext(msg);
       const source = statusQuote?.message || quoted;
+      const viewOnceMedia = extractViewOnceMedia(source);
+      if (viewOnceMedia?.isViewOnce && typeof context.downloadContentFromMessage === 'function') {
+        const stream = await context.downloadContentFromMessage(viewOnceMedia.content, viewOnceMedia.type);
+        const buffer = await collectMediaStream(stream);
+        if (!buffer.length) throw new Error('Le flux view-once téléchargé est vide.');
+        const payload = buildViewOncePayload(viewOnceMedia, buffer);
+        const saved = await socket.sendMessage(selfJid, payload);
+        if (!saved) throw new Error('WhatsApp n’a pas confirmé la sauvegarde du média.');
+        if (msg?.key && from) {
+          await socket.sendMessage(from, { react: { text: '💾', key: msg.key } }).catch(() => {});
+        }
+        return saved;
+      }
+
       const { content } = unwrapForSave(source);
       if (!content || typeof content !== 'object' || !Object.keys(content).length) {
         throw new Error('Le contenu cité est vide ou indisponible.');
