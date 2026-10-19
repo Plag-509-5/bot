@@ -1,5 +1,8 @@
 'use strict';
 
+const DEFAULT_MESSAGE_PROCESSING_CONCURRENCY = 4;
+const DEFAULT_MESSAGE_QUEUE_LIMIT = 500;
+
 /**
  * Traite chaque message d'un `messages.upsert` Baileys. Une mise à jour peut
  * regrouper plusieurs messages; une erreur sur l'un ne doit ni en perdre les
@@ -31,4 +34,171 @@ async function processMessageBatch(messages, processMessage, onError = () => {},
   return results;
 }
 
-module.exports = { processMessageBatch };
+function boundedInteger(value, fallback, min, max) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
+}
+
+/**
+ * Files FIFO indépendantes par chat : un traitement lent dans un groupe ou une
+ * commande média ne bloque plus les messages privés/autres groupes de la même
+ * session. Le parallélisme global et la file sont bornés pour protéger le
+ * processus quand plusieurs sessions reçoivent une rafale.
+ */
+function createMessageDispatcher({
+  concurrency = DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+  maxPending = DEFAULT_MESSAGE_QUEUE_LIMIT,
+  keyFor = message => message?.key?.remoteJid || '__unknown__',
+  now = Date.now
+} = {}) {
+  const workerLimit = boundedInteger(concurrency, DEFAULT_MESSAGE_PROCESSING_CONCURRENCY, 1, 64);
+  const queueLimit = boundedInteger(maxPending, DEFAULT_MESSAGE_QUEUE_LIMIT, 1, 100_000);
+  const queues = new Map();
+  const readyChats = [];
+  const activeChats = new Set();
+  let queued = 0;
+  let inFlight = 0;
+  let completed = 0;
+  let failed = 0;
+  let rejected = 0;
+  let totalQueueDelayMs = 0;
+  let maxQueueDelayMs = 0;
+  let lastQueueDelayMs = null;
+  let totalProcessingMs = 0;
+  let maxProcessingMs = 0;
+  let lastProcessingMs = null;
+
+  function safeCallback(callback, ...args) {
+    if (typeof callback !== 'function') return;
+    try {
+      const result = callback(...args);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch (_) {}
+  }
+
+  function runTask(chat, task) {
+    const startedAt = now();
+    const queueDelayMs = Math.max(0, startedAt - task.receivedAt);
+    queued = Math.max(0, queued - 1);
+    inFlight += 1;
+    totalQueueDelayMs += queueDelayMs;
+    maxQueueDelayMs = Math.max(maxQueueDelayMs, queueDelayMs);
+    lastQueueDelayMs = queueDelayMs;
+
+    Promise.resolve()
+      .then(() => task.processMessage(task.message))
+      .then(result => {
+        completed += 1;
+        safeCallback(task.onProcessed, result, {
+          message: task.message,
+          index: task.index,
+          chat,
+          queueDelayMs,
+          processingDurationMs: Math.max(0, now() - startedAt)
+        });
+        task.resolve(result);
+      }, error => {
+        failed += 1;
+        safeCallback(task.onError, error, {
+          message: task.message,
+          index: task.index,
+          chat,
+          queueDelayMs,
+          processingDurationMs: Math.max(0, now() - startedAt)
+        });
+        task.resolve(undefined);
+      })
+      .finally(() => {
+        const processingDurationMs = Math.max(0, now() - startedAt);
+        totalProcessingMs += processingDurationMs;
+        maxProcessingMs = Math.max(maxProcessingMs, processingDurationMs);
+        lastProcessingMs = processingDurationMs;
+        inFlight = Math.max(0, inFlight - 1);
+        activeChats.delete(chat);
+        const next = queues.get(chat);
+        if (next?.length) readyChats.push(chat);
+        else queues.delete(chat);
+        drain();
+      });
+  }
+
+  function drain() {
+    while (inFlight < workerLimit && readyChats.length) {
+      const chat = readyChats.shift();
+      if (activeChats.has(chat)) continue;
+      const queue = queues.get(chat);
+      if (!queue?.length) {
+        queues.delete(chat);
+        continue;
+      }
+      activeChats.add(chat);
+      runTask(chat, queue.shift());
+    }
+  }
+
+  function processBatch(messages, processMessage, onError = () => {}, onProcessed = () => {}) {
+    if (!Array.isArray(messages) || typeof processMessage !== 'function') return Promise.resolve([]);
+    const results = messages.map((message, index) => new Promise(resolve => {
+      if (queued >= queueLimit) {
+        rejected += 1;
+        let rejectedChat = '__unknown__';
+        try { rejectedChat = String(keyFor(message) || rejectedChat); } catch (_) {}
+        safeCallback(onError, new Error(`File de messages pleine (${queueLimit}); message refusé pour protéger la session.`), {
+          message,
+          chat: rejectedChat,
+          queueDelayMs: 0,
+          processingDurationMs: 0,
+          index,
+          rejected: true
+        });
+        resolve(undefined);
+        return;
+      }
+
+      let chat;
+      try { chat = String(keyFor(message) || '__unknown__'); }
+      catch (_) { chat = '__unknown__'; }
+      let queue = queues.get(chat);
+      if (!queue) {
+        queue = [];
+        queues.set(chat, queue);
+      }
+      const wasIdle = queue.length === 0 && !activeChats.has(chat);
+      queue.push({ message, index, processMessage, onError, onProcessed, resolve, receivedAt: now() });
+      queued += 1;
+      if (wasIdle) readyChats.push(chat);
+      drain();
+    }));
+    drain();
+    return Promise.all(results);
+  }
+
+  function getStats() {
+    const processed = completed + failed;
+    return {
+      queued,
+      inFlight,
+      chatsEnAttente: queues.size,
+      concurrency: workerLimit,
+      maxPending: queueLimit,
+      completed,
+      failed,
+      rejected,
+      lastQueueDelayMs,
+      averageQueueDelayMs: processed ? Math.round(totalQueueDelayMs / processed) : 0,
+      maxQueueDelayMs,
+      lastProcessingMs,
+      averageProcessingMs: processed ? Math.round(totalProcessingMs / processed) : 0,
+      maxProcessingMs
+    };
+  }
+
+  return { processBatch, getStats };
+}
+
+module.exports = {
+  DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_MESSAGE_QUEUE_LIMIT,
+  processMessageBatch,
+  createMessageDispatcher
+};

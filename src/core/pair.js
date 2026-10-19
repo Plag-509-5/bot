@@ -9,6 +9,7 @@ const moment = require('moment-timezone');
 const yts = require('yt-search');
 const Jimp = require('jimp');
 const crypto = require('crypto');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
@@ -165,7 +166,11 @@ const {
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
 const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
-const { processMessageBatch } = require('../services/message-batch');
+const {
+  createMessageDispatcher,
+  DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_MESSAGE_QUEUE_LIMIT
+} = require('../services/message-batch');
 const {
   SESSION_KEEPALIVE_INTERVAL_MS,
   SESSION_HEALTH_CHECK_INTERVAL_MS,
@@ -257,10 +262,17 @@ function isKnownCommandName(command) {
   return getPlugins().has(name) || LEGACY_COMMANDS.has(name);
 }
 
-const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
+const SESSION_CONFIG_CACHE_TTL_MS = 60_000;
+const SESSION_CONFIG_REFRESH_RETRY_MS = 5_000;
 const sessionConfigCache = new Map();
-const ADMIN_CACHE_TTL_MS = 5_000;
-let adminCache = { value: [], expiresAt: 0 };
+const sessionConfigLoads = new Map();
+const sessionConfigRefreshAfter = new Map();
+const sessionConfigRevision = new Map();
+const ADMIN_CACHE_TTL_MS = 60_000;
+let adminCache = { value: [], expiresAt: 0, loaded: false };
+let adminLoad = null;
+let adminRevision = 0;
+let adminRefreshAfter = 0;
 
 const config = {
   MAX_RETRIES: 3,
@@ -397,26 +409,45 @@ async function getAllNumbersFromMongo() {
   return Array.from(numbers);
 }
 
-async function loadAdminsFromMongo(forceRefresh = false) {
-  try {
-    if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
-    await initMongo();
-    const docs = await adminsCol.find({}).toArray();
-    const admins = [];
-    const seen = new Set();
-    for (const doc of docs) {
-      const identity = canonicalAdmin(doc);
-      const value = identity.jid || identity.raw;
-      if (!value || seen.has(value)) continue;
-      seen.add(value);
-      admins.push(value);
-    }
-    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS };
-    return [...admins];
-  } catch (e) {
-    console.error('loadAdminsFromMongo', e);
-    return adminCache.value.length ? [...adminCache.value] : [];
+async function queryAdminsFromMongo() {
+  const revision = adminRevision;
+  await initMongo();
+  const docs = await adminsCol.find({}).toArray();
+  const admins = [];
+  const seen = new Set();
+  for (const doc of docs) {
+    const identity = canonicalAdmin(doc);
+    const value = identity.jid || identity.raw;
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    admins.push(value);
   }
+  if (revision === adminRevision) {
+    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS, loaded: true };
+    adminRefreshAfter = 0;
+  }
+  return admins;
+}
+
+function startAdminRefresh() {
+  if (adminLoad) return adminLoad;
+  adminLoad = queryAdminsFromMongo()
+    .catch(error => {
+      adminRefreshAfter = Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS;
+      console.error('loadAdminsFromMongo', error);
+      return adminCache.value;
+    })
+    .finally(() => { adminLoad = null; });
+  return adminLoad;
+}
+
+async function loadAdminsFromMongo(forceRefresh = false) {
+  if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
+  if (!forceRefresh && adminCache.loaded) {
+    if (!adminLoad && adminRefreshAfter <= Date.now()) void startAdminRefresh();
+    return [...adminCache.value];
+  }
+  return [...await startAdminRefresh()];
 }
 
 // Récupérer le statut d'un groupe (welcome ou goodbye)
@@ -460,7 +491,9 @@ async function addAdminToMongo(jidOrNumber) {
       { $set: { jid, number: identity.number || null, updatedAt: new Date() } },
       { upsert: true }
     );
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Added admin ${jid}`);
     return jid;
   } catch (e) {
@@ -484,7 +517,9 @@ async function removeAdminFromMongo(jidOrNumber) {
       .map(doc => doc._id)
       .filter(Boolean);
     if (matchingIds.length) await adminsCol.deleteMany({ _id: { $in: matchingIds } });
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Removed admin ${identity.jid || identity.raw}`);
     return true;
   } catch (e) {
@@ -560,6 +595,8 @@ async function setUserConfigInMongo(number, conf) {
       { $set: { number: sanitized, config: conf, updatedAt: new Date() } },
       { upsert: true }
     );
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
+    sessionConfigRefreshAfter.delete(sanitized);
     sessionConfigCache.set(sanitized, {
       value: { ...DEFAULT_SESSION_CONFIG, ...(conf || {}) },
       expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
@@ -580,6 +617,35 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
+function refreshSessionConfig(sanitized) {
+  const current = sessionConfigLoads.get(sanitized);
+  if (current) return current;
+
+  const revision = sessionConfigRevision.get(sanitized) || 0;
+  const load = (async () => {
+    try {
+      await initMongo();
+      const doc = await configsCol.findOne({ number: sanitized });
+      const merged = { ...DEFAULT_SESSION_CONFIG, ...(doc?.config || {}) };
+      if ((sessionConfigRevision.get(sanitized) || 0) === revision) {
+        sessionConfigCache.set(sanitized, {
+          value: merged,
+          expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+        });
+      }
+      sessionConfigRefreshAfter.delete(sanitized);
+      return merged;
+    } catch (error) {
+      sessionConfigRefreshAfter.set(sanitized, Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS);
+      throw error;
+    }
+  })().finally(() => {
+    if (sessionConfigLoads.get(sanitized) === load) sessionConfigLoads.delete(sanitized);
+  });
+  sessionConfigLoads.set(sanitized, load);
+  return load;
+}
+
 async function loadSessionConfigMerged(number, forceRefresh = false) {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   if (!sanitized) return { ...DEFAULT_SESSION_CONFIG };
@@ -587,13 +653,25 @@ async function loadSessionConfigMerged(number, forceRefresh = false) {
   const cached = sessionConfigCache.get(sanitized);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.value };
 
-  const dbCfg = await loadUserConfigFromMongo(sanitized) || {};
-  const merged = { ...DEFAULT_SESSION_CONFIG, ...dbCfg };
-  sessionConfigCache.set(sanitized, {
-    value: merged,
-    expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
-  });
-  return { ...merged };
+  // Cache périmé disponible : ne jamais suspendre le traitement d'un message
+  // sur Mongo. Le rafraîchissement unique se fait en arrière-plan; une panne DB
+  // conserve la dernière configuration connue et temporise les nouvelles
+  // tentatives pour éviter une rafale de requêtes lors d'une déconnexion.
+  if (!forceRefresh && cached) {
+    if ((sessionConfigRefreshAfter.get(sanitized) || 0) <= Date.now()) {
+      void refreshSessionConfig(sanitized).catch(error => {
+        console.warn(`[CONFIG ${sanitized}] rafraîchissement en arrière-plan impossible :`, error?.message || error);
+      });
+    }
+    return { ...cached.value };
+  }
+
+  try {
+    return { ...await refreshSessionConfig(sanitized) };
+  } catch (error) {
+    if (cached) return { ...cached.value };
+    throw error;
+  }
 }
 
 // Helpers Mongo pour persister le schedule
@@ -809,6 +887,21 @@ const pairingGuard = createPairingGuard({
 });
 const lastConnectionActivity = new Map();
 const messageProcessingStats = new Map();
+const messageDispatchers = new Map();
+const eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelayMonitor.enable();
+
+function readEventLoopDelayStats() {
+  const milliseconds = value => Number.isFinite(value) ? Number((value / 1e6).toFixed(2)) : null;
+  const snapshot = {
+    p50Ms: milliseconds(eventLoopDelayMonitor.percentile(50)),
+    p95Ms: milliseconds(eventLoopDelayMonitor.percentile(95)),
+    p99Ms: milliseconds(eventLoopDelayMonitor.percentile(99)),
+    maxMs: milliseconds(eventLoopDelayMonitor.max)
+  };
+  eventLoopDelayMonitor.reset();
+  return snapshot;
+}
 
 function getMessageProcessingStats(number) {
   const key = String(number || '').replace(/[^0-9]/g, '');
@@ -817,12 +910,18 @@ function getMessageProcessingStats(number) {
   if (!stats) {
     stats = {
       received: 0,
+      receivedByType: { notify: 0, append: 0, other: 0 },
+      lastReceivedType: null,
+      historyIgnored: 0,
       processed: 0,
       errors: 0,
       lastReceivedAt: null,
       lastProcessedAt: null,
       lastError: null,
-      lastErrorAt: null
+      lastErrorAt: null,
+      lastQueueDelayMs: null,
+      lastProcessingDurationMs: null,
+      maxQueueDelayMs: 0
     };
     messageProcessingStats.set(key, stats);
   }
@@ -1667,14 +1766,30 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
 }
 
 function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', ({ messages = [] } = {}) => {
+  const sanitizedNumber = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+  const dispatcher = createMessageDispatcher({
+    concurrency: process.env.MESSAGE_PROCESSING_CONCURRENCY || DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+    maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT
+  });
+  if (sanitizedNumber) messageDispatchers.set(sanitizedNumber, dispatcher);
+
+  socket.ev.on('messages.upsert', ({ messages = [], type = 'unknown' } = {}) => {
     if (!Array.isArray(messages) || !messages.length) return;
     const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
     if (batchStats) {
+      const receivedType = type === 'notify' ? 'notify' : type === 'append' ? 'append' : 'other';
       batchStats.received += messages.length;
+      batchStats.receivedByType[receivedType] += messages.length;
+      batchStats.lastReceivedType = receivedType;
       batchStats.lastReceivedAt = Date.now();
+      if (type === 'append') batchStats.historyIgnored += messages.length;
     }
-    void processMessageBatch(messages, msg => withCommandTheme(async () => {
+    // `append` contient le rattrapage d'historique; l'exécuter comme du trafic
+    // live retarde les notifications entrantes et peut rejouer d'anciennes
+    // commandes après chaque reconnexion. Baileys signale les nouveaux messages
+    // par `notify`; on garde les compteurs d'historique pour le diagnostic.
+    if (type === 'append') return;
+    void dispatcher.processBatch(messages, msg => withCommandTheme(async () => {
       if (!msg?.message || !msg?.key?.remoteJid) return;
 
     const remoteJid = msg.key.remoteJid;
@@ -10771,8 +10886,13 @@ case 'resetconfig': {
       console.error('Command handler error:', err);
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
-    }), (error, { index, message }) => {
+    }), (error, { index, message, queueDelayMs, processingDurationMs } = {}) => {
       if (batchStats) {
+        if (Number.isFinite(queueDelayMs)) {
+          batchStats.lastQueueDelayMs = queueDelayMs;
+          batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+        }
+        if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
         batchStats.errors += 1;
         batchStats.lastErrorAt = Date.now();
         batchStats.lastError = String(error?.message || error).slice(0, 300);
@@ -10781,10 +10901,15 @@ case 'resetconfig': {
         `[SESSION ${number || 'inconnue'}] traitement messages.upsert #${index} (${message?.key?.id || 'sans id'}) :`,
         error?.stack || error
       );
-    }, () => {
+    }, (_result, { queueDelayMs, processingDurationMs } = {}) => {
       if (!batchStats) return;
       batchStats.processed += 1;
       batchStats.lastProcessedAt = Date.now();
+      if (Number.isFinite(queueDelayMs)) {
+        batchStats.lastQueueDelayMs = queueDelayMs;
+        batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+      }
+      if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
     });
   });
 }
@@ -10818,6 +10943,10 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     socketCreationTime.delete(sanitized);
     lastConnectionActivity.delete(sanitized);
     messageProcessingStats.delete(sanitized);
+    messageDispatchers.delete(sanitized);
+    sessionConfigCache.delete(sanitized);
+    sessionConfigRefreshAfter.delete(sanitized);
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
     connectionLifecycles.delete(sanitized);
     socketRuntimeMetadata.delete(sanitized);
     deleteSessionStore(sanitized);
@@ -10878,6 +11007,10 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   socketCreationTime.delete(sanitized);
   lastConnectionActivity.delete(sanitized);
   messageProcessingStats.delete(sanitized);
+  messageDispatchers.delete(sanitized);
+  sessionConfigCache.delete(sanitized);
+  sessionConfigRefreshAfter.delete(sanitized);
+  sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
   connectionLifecycles.delete(sanitized);
   socketRuntimeMetadata.delete(sanitized);
   deleteSessionStore(sanitized);
@@ -11770,6 +11903,7 @@ router.get('/api/session/health', async (req, res) => {
         ecrituresEnAttente: auth ? auth.pendingWrites() : null,
         envois: typeof getSendStats === 'function' ? getSendStats(socket) : null,
         traitementMessages: { ...getMessageProcessingStats(number) },
+        fileTraitement: messageDispatchers.get(number)?.getStats() || null,
         derniereActivite: lastConnectionActivity.get(number) || null,
         runtimeBaileys: socketRuntimeMetadata.get(number) || null,
         cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null
@@ -11784,6 +11918,7 @@ router.get('/api/session/health', async (req, res) => {
       ok: true,
       stockageSessions: 'mongodb',
       mongodbConnecte: mongoConnection.isConnected(),
+      boucleEvenement: readEventLoopDelayStats(),
       versionWhatsAppWeb: baileysVersionResolver.snapshot(),
       appairages,
       sessions
@@ -11898,6 +12033,11 @@ async function restoreSessionsOnBoot() {
 async function bootstrapMongoSessions() {
   try {
     await initMongo();
+    // Réchauffe les contrôles consultés à chaque commande avant l'ouverture des
+    // sockets, afin qu'une première réponse ne dépende pas d'une lecture Mongo.
+    await loadAdminsFromMongo().catch(error => {
+      console.warn('[BOOT] cache des administrateurs indisponible :', error?.message || error);
+    });
     await restoreRestartSchedule();
     await restoreSessionsOnBoot();
     githubAutoUpdater.start();
