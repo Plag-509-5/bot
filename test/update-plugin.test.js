@@ -101,6 +101,7 @@ test('liste, sélectionne et persiste un dépôt/branche puis les affiche lors d
   assert.equal(checked.repository, 'Plag-509-5/private-bot');
   assert.equal(checked.branch, 'release/v2');
   assert.equal(checked.token, token);
+  assert.equal(checked.bootstrapIfMissing, false);
 
   const status = context(['status']);
   await updatePlugin._test.executeUpdate(status.value, dependencies);
@@ -110,6 +111,32 @@ test('liste, sélectionne et persiste un dépôt/branche puis les affiche lors d
   const reset = context(['reset']);
   await updatePlugin._test.executeUpdate(reset.value, dependencies);
   assert.deepEqual(saved, {});
+});
+
+test('la première mise à jour sans .git crée le fichier Git et explique la synchronisation initiale', async () => {
+  const calls = [];
+  const dependencies = {
+    getSettings: async () => ({}),
+    getToken: () => '',
+    listBranches: async () => ['main'],
+    checkForUpdates: async options => {
+      calls.push(options);
+      return {
+        bootstrapped: true,
+        repository: 'Plag-509-5/bot',
+        branch: 'main',
+        shortSha: 'abc1234',
+        hasUpdate: false,
+        ahead: 0
+      };
+    }
+  };
+  const update = context([]);
+  await updatePlugin._test.executeUpdate(update.value, dependencies);
+  assert.equal(calls[0].bootstrapIfMissing, true);
+  assert.match(update.sent.at(-1).content.text, /fichier \.git a été créé/);
+  assert.match(update.sent.at(-1).content.text, /fichiers suivis ont été synchronisés/);
+  assert.match(update.sent.at(-1).content.text, /\.env/);
 });
 
 test('valide que la branche choisie existe et n’écrase pas une sélection avec un nom invalide', async () => {

@@ -1,11 +1,14 @@
 'use strict';
 
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_UPDATE_BRANCH = 'main';
+const DEFAULT_UPDATE_REPOSITORY = 'Plag-509-5/bot';
+const DEPLOYMENT_GIT_DIRECTORY = '.kaido-update-git';
 const GIT_COMMAND_TIMEOUT_MS = 90_000;
 const GITHUB_API_TIMEOUT_MS = 15_000;
 const GITHUB_API_PAGE_SIZE = 100;
@@ -268,29 +271,120 @@ async function gitRawOutput(run, args, cwd, options) {
   return String(result?.stdout || '');
 }
 
+async function pathExists(filePath) {
+  try {
+    await fs.lstat(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/**
+ * Hébergeurs qui téléversent une archive du code omettent souvent le dossier
+ * .git. À la première mise à jour explicite, installe un gitdir bare adjacent
+ * et crée le .git-file standard d'un worktree. Le checkout initial synchronise
+ * les fichiers suivis vers la branche choisie; .env et autres fichiers non
+ * suivis ne sont pas supprimés.
+ */
+async function bootstrapDeploymentGit({
+  cwd = getDefaultRepositoryPath(),
+  repository = process.env.BOT_UPDATE_REPO || DEFAULT_UPDATE_REPOSITORY,
+  branch = process.env.BOT_UPDATE_BRANCH || DEFAULT_UPDATE_BRANCH,
+  token = getGitHubToken(),
+  run = runGit,
+  remoteUrl
+} = {}) {
+  const root = path.resolve(cwd);
+  const targetRepository = validateGitHubRepository(repository);
+  const updateBranch = validateBranchName(branch);
+  const dotGitPath = path.join(root, '.git');
+  if (await pathExists(dotGitPath)) {
+    throw new Error(`Le chemin ${dotGitPath} existe déjà mais Git ne peut pas l’utiliser; aucun fichier n’a été remplacé.`);
+  }
+
+  const metadataPath = path.join(root, DEPLOYMENT_GIT_DIRECTORY);
+  if (await pathExists(metadataPath)) {
+    throw new Error(
+      `Les métadonnées ${metadataPath} existent déjà sans fichier .git valide. ` +
+      'Vérifie ce dossier ou configure BOT_REPO_PATH vers un clone Git complet.'
+    );
+  }
+
+  const sourceUrl = remoteUrl || `https://github.com/${targetRepository}.git`;
+  const cloneArgs = [
+    'clone', '--bare', '--depth=1', '--single-branch', '--branch', updateBranch,
+    sourceUrl, metadataPath
+  ];
+  await run(cloneArgs, root, { timeout: 5 * 60_000, token });
+
+  await run(['--git-dir', metadataPath, 'config', 'core.bare', 'false'], root);
+  await run(['--git-dir', metadataPath, 'config', 'core.worktree', root], root);
+  await run(['--git-dir', metadataPath, 'symbolic-ref', 'HEAD', `refs/heads/${updateBranch}`], root);
+  await run([
+    '--git-dir', metadataPath,
+    '--work-tree', root,
+    'checkout', '--force', '-B', updateBranch, `refs/heads/${updateBranch}`
+  ], root, { timeout: GIT_COMMAND_TIMEOUT_MS });
+
+  // Le .git-file suit le format natif Git: sa cible est relative à la racine
+  // du déploiement, ce qui le rend portable si le dossier est déplacé ensuite.
+  const pointer = `gitdir: ${DEPLOYMENT_GIT_DIRECTORY}\n`;
+  const handle = await fs.open(dotGitPath, 'wx');
+  try {
+    await handle.writeFile(pointer, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+
+  const gitRoot = await gitOutput(run, ['rev-parse', '--show-toplevel'], root);
+  if (path.resolve(gitRoot) !== root) {
+    throw new Error('Le fichier .git a été créé, mais Git ne reconnaît pas la racine du déploiement.');
+  }
+  const currentSha = await gitOutput(run, ['rev-parse', 'HEAD'], root);
+  return {
+    root,
+    repository: targetRepository,
+    remoteUrl: sourceUrl,
+    currentSha,
+    bootstrapped: true,
+    dotGitFile: dotGitPath,
+    metadataPath
+  };
+}
+
 async function getOriginRepository({
   cwd = getDefaultRepositoryPath(),
-  run = runGit
+  run = runGit,
+  repository,
+  branch = process.env.BOT_UPDATE_BRANCH || DEFAULT_UPDATE_BRANCH,
+  token = getGitHubToken(),
+  bootstrapIfMissing = false
 } = {}) {
   let root;
   try {
     root = await gitOutput(run, ['rev-parse', '--show-toplevel'], cwd);
   } catch (error) {
     if (/not a git repository|pas un dépôt git/i.test(String(error?.message || error))) {
+      if (bootstrapIfMissing && run === runGit) {
+        return bootstrapDeploymentGit({ cwd, repository, branch, token, run });
+      }
       throw new Error(
-        `Dépôt Git introuvable depuis ${cwd}. Vérifie que le dossier déployé contient .git, ` +
-        'ou configure BOT_REPO_PATH vers la racine du clone Git.'
+        `Dépôt Git introuvable depuis ${cwd}. Pour créer automatiquement le fichier .git et synchroniser ` +
+        'le premier déploiement, lance .update sans « check »; sinon configure BOT_REPO_PATH vers la racine du clone Git.'
       );
     }
     throw error;
   }
   if (!root) throw new Error('Ce dossier ne semble pas être un dépôt Git.');
   const remoteUrl = await gitOutput(run, ['remote', 'get-url', 'origin'], root);
-  const repository = parseGitHubRepository(remoteUrl);
-  if (!repository) {
+  const originRepository = parseGitHubRepository(remoteUrl);
+  if (!originRepository) {
     throw new Error('Le remote `origin` doit pointer vers un dépôt GitHub pour utiliser .update.');
   }
-  return { root, repository, remoteUrl };
+  return { root, repository: originRepository, remoteUrl };
 }
 
 function makeUpdateTargetRef(repository, branch, originRepository) {
@@ -348,10 +442,18 @@ async function checkForUpdates({
   branch = process.env.BOT_UPDATE_BRANCH || DEFAULT_UPDATE_BRANCH,
   repository,
   token = getGitHubToken(),
-  run = runGit
+  run = runGit,
+  bootstrapIfMissing = false
 } = {}) {
   const updateBranch = validateBranchName(branch);
-  const origin = await getOriginRepository({ cwd, run });
+  const origin = await getOriginRepository({
+    cwd,
+    run,
+    repository: repository || process.env.BOT_UPDATE_REPO || DEFAULT_UPDATE_REPOSITORY,
+    branch: updateBranch,
+    token,
+    bootstrapIfMissing
+  });
   const root = origin.root;
   const originRepository = origin.repository;
   const targetRepository = repository
@@ -429,6 +531,7 @@ async function checkForUpdates({
     originRepository,
     targetRef,
     root,
+    bootstrapped: Boolean(origin.bootstrapped),
     branch: updateBranch,
     currentBranch,
     currentSha,
@@ -530,6 +633,8 @@ async function applyUpdate(plan, { run = runGit } = {}) {
 
 module.exports = {
   DEFAULT_UPDATE_BRANCH,
+  DEFAULT_UPDATE_REPOSITORY,
+  DEPLOYMENT_GIT_DIRECTORY,
   GIT_COMMAND_TIMEOUT_MS,
   GITHUB_API_TIMEOUT_MS,
   GITHUB_API_PAGE_SIZE,
@@ -551,6 +656,7 @@ module.exports = {
   parseChangedFiles,
   redactCredentials,
   runGit,
+  bootstrapDeploymentGit,
   checkForUpdates,
   applyUpdate
 };

@@ -119,7 +119,7 @@ function dependencyNames(dependencies = {}) {
 
 async function resolveSelection(saved = {}, dependencies = {}) {
   const services = dependencyNames(dependencies);
-  const repository = String(saved.repository || process.env.BOT_UPDATE_REPO || '').trim();
+  const repository = String(saved.repository || process.env.BOT_UPDATE_REPO || githubUpdater.DEFAULT_UPDATE_REPOSITORY).trim();
   const branch = String(saved.branch || process.env.BOT_UPDATE_BRANCH || githubUpdater.DEFAULT_UPDATE_BRANCH).trim();
   const selectedRepository = repository || (await services.getOriginRepository()).repository;
   return {
@@ -244,9 +244,16 @@ async function checkOrApply(context, mode, dependencies = {}) {
   const plan = await services.checkForUpdates({
     repository: selection.repository,
     branch: selection.branch,
-    token
+    token,
+    bootstrapIfMissing: mode === 'apply'
   });
   const branchInfo = branchListText(branches, selection.branch, branchError);
+
+  if (plan.bootstrapped) {
+    return reply(context,
+      `✅ Déploiement sans métadonnées Git détecté : le fichier .git a été créé et les fichiers suivis ont été synchronisés depuis *${plan.repository}@${plan.branch}* (${plan.shortSha}). ` +
+      'Les fichiers non suivis, dont .env, ont été conservés. Redémarre le bot pour charger cette version.');
+  }
 
   if (!plan.hasUpdate) {
     if (plan.ahead > 0) {

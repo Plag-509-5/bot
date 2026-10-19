@@ -195,6 +195,64 @@ test('peut pointer le détecteur du dépôt vers BOT_REPO_PATH et explique un cl
   }), /BOT_REPO_PATH/);
 });
 
+test('crée un fichier .git standard au premier update d’un déploiement sans clone et conserve .env', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'kaido-git-bootstrap-'));
+  const seed = path.join(parent, 'seed');
+  const remote = path.join(parent, 'remote.git');
+  const deployment = path.join(parent, 'container');
+  fs.mkdirSync(seed);
+  fs.mkdirSync(deployment);
+  execFileSync('git', ['init', '-b', 'main'], { cwd: seed, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.name', 'Updater test'], { cwd: seed });
+  execFileSync('git', ['config', 'user.email', 'updater-test@example.invalid'], { cwd: seed });
+  fs.writeFileSync(path.join(seed, 'index.js'), 'module.exports = "github";\n');
+  fs.writeFileSync(path.join(seed, '.env.example'), 'PORT=3000\n');
+  execFileSync('git', ['add', 'index.js', '.env.example'], { cwd: seed });
+  execFileSync('git', ['commit', '-m', 'initial deployment'], { cwd: seed, stdio: 'ignore' });
+  execFileSync('git', ['clone', '--bare', seed, remote], { stdio: 'ignore' });
+
+  fs.writeFileSync(path.join(deployment, 'index.js'), 'module.exports = "old";\n');
+  fs.writeFileSync(path.join(deployment, '.env'), 'SECRET=keep-me\n');
+  fs.writeFileSync(path.join(deployment, 'panel-data.txt'), 'keep-untracked\n');
+
+  const result = await updater.bootstrapDeploymentGit({
+    cwd: deployment,
+    repository: 'Plag-509-5/bot',
+    branch: 'main',
+    remoteUrl: remote
+  });
+
+  assert.equal(result.bootstrapped, true);
+  assert.equal(fs.statSync(path.join(deployment, '.git')).isFile(), true);
+  assert.equal(fs.readFileSync(path.join(deployment, '.git'), 'utf8'), 'gitdir: .kaido-update-git\n');
+  assert.equal(fs.readFileSync(path.join(deployment, 'index.js'), 'utf8'), 'module.exports = "github";\n');
+  assert.equal(fs.readFileSync(path.join(deployment, '.env'), 'utf8'), 'SECRET=keep-me\n');
+  assert.equal(fs.readFileSync(path.join(deployment, 'panel-data.txt'), 'utf8'), 'keep-untracked\n');
+  assert.equal(execFileSync('git', ['-C', deployment, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim(), deployment);
+  assert.equal(execFileSync('git', ['-C', deployment, 'branch', '--show-current'], { encoding: 'utf8' }).trim(), 'main');
+
+  execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: seed });
+  fs.writeFileSync(path.join(seed, 'index.js'), 'module.exports = "updated";\n');
+  execFileSync('git', ['add', 'index.js'], { cwd: seed });
+  execFileSync('git', ['commit', '-m', 'second deployment'], { cwd: seed, stdio: 'ignore' });
+  execFileSync('git', ['push', 'origin', 'main'], { cwd: seed, stdio: 'ignore' });
+  execFileSync('git', ['-C', deployment, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { stdio: 'ignore' });
+  const targetSha = execFileSync('git', ['-C', deployment, 'rev-parse', 'refs/remotes/origin/main'], { encoding: 'utf8' }).trim();
+  const applied = await updater.applyUpdate({
+    root: deployment,
+    branch: 'main',
+    currentBranch: 'main',
+    currentSha: result.currentSha,
+    targetSha,
+    targetRef: 'refs/remotes/origin/main',
+    canFastForward: true
+  });
+  assert.equal(applied.updatedSha, targetSha);
+  assert.equal(fs.readFileSync(path.join(deployment, 'index.js'), 'utf8'), 'module.exports = "updated";\n');
+  assert.equal(fs.readFileSync(path.join(deployment, '.env'), 'utf8'), 'SECRET=keep-me\n');
+  fs.rmSync(parent, { recursive: true, force: true });
+});
+
 test('masque un token dans les erreurs de l’API GitHub', async () => {
   const token = 'secret-in-error';
   await assert.rejects(updater.listGitHubBranches({
