@@ -11794,17 +11794,38 @@ router.get('/ping', (req, res) => {
 });
 
 
+async function launchSessionsWithConcurrency(numbers, reconnectReason, { skipLocked = false } = {}) {
+  const { mapWithConcurrency } = require('../services/session-startup');
+  const concurrency = getSessionStartupConcurrency();
+  const uniqueNumbers = [...new Set((numbers || [])
+    .map(number => String(number).replace(/[^0-9]/g, ''))
+    .filter(Boolean))];
+  const outcomes = await mapWithConcurrency(uniqueNumbers, concurrency, async number => {
+    if (activeSockets.has(number)) return { number, status: 'already_connected' };
+    if (skipLocked && pairingGuard.isLocked(number)) return { number, status: 'already_starting' };
+    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+    await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason });
+    return { number, status: 'connection_initiated' };
+  });
+  return outcomes.map((outcome, index) => outcome.status === 'fulfilled'
+    ? outcome.value
+    : {
+        number: uniqueNumbers[index],
+        status: 'failed',
+        error: outcome.reason?.message || String(outcome.reason || 'Erreur inconnue')
+      });
+}
+
+function getSessionStartupConcurrency() {
+  const { resolveSessionStartupConcurrency } = require('../services/session-startup');
+  return resolveSessionStartupConcurrency(process.env.SESSION_STARTUP_CONCURRENCY);
+}
+
 router.get('/connect-all', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No numbers found to connect' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'connect-all' });
-      results.push({ number, status: 'connection_initiated' });
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'connect-all');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
 });
@@ -11814,16 +11835,7 @@ router.get('/reconnect', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No session numbers found in MongoDB' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      try {
-        await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'api-reconnect' });
-        results.push({ number, status: 'connection_initiated' });
-      } catch (err) { results.push({ number, status: 'failed', error: err.message }); }
-      await delay(1000);
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'api-reconnect');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
 });
@@ -12046,14 +12058,15 @@ async function restoreSessionsOnBoot() {
       .filter(Boolean)
   );
 
-  console.log(`[BOOT] ${numbers.size} session(s) MongoDB à restaurer.`);
-  for (const n of numbers) {
-    if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
-    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-    try {
-      await EmpirePair(n, mockRes, { internalReconnect: true, reconnectReason: 'boot' });
-    } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
-    await delay(500);
+  console.log(
+    `[BOOT] ${numbers.size} session(s) MongoDB à restaurer avec ${getSessionStartupConcurrency()} démarrage(s) parallèle(s).`
+  );
+  const results = await launchSessionsWithConcurrency([...numbers], 'boot', { skipLocked: true });
+  const started = results.filter(result => result.status === 'connection_initiated').length;
+  const failed = results.filter(result => result.status === 'failed');
+  console.log(`[BOOT] ${started} démarrage(s) lancé(s), ${results.length - started - failed.length} déjà actif(s/en attente), ${failed.length} échec(s).`);
+  for (const result of failed) {
+    console.error(`[BOOT] ${result.number}:`, result.error);
   }
 }
 
