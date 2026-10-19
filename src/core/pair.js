@@ -171,6 +171,7 @@ const {
   DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
   DEFAULT_MESSAGE_QUEUE_LIMIT
 } = require('../services/message-batch');
+const { createMediaAlbumStore } = require('../services/media-album-store');
 const {
   SESSION_KEEPALIVE_INTERVAL_MS,
   SESSION_HEALTH_CHECK_INTERVAL_MS,
@@ -917,6 +918,10 @@ function getMessageProcessingStats(number) {
       errors: 0,
       lastReceivedAt: null,
       lastProcessedAt: null,
+      // Âge approximatif de l’horodatage WhatsApp au moment du `messages.upsert`;
+      // à comparer entre sessions, en tenant compte d’un éventuel décalage d’horloge.
+      lastNotifyTimestampAgeMs: null,
+      maxNotifyTimestampAgeMs: 0,
       lastError: null,
       lastErrorAt: null,
       lastQueueDelayMs: null,
@@ -1771,17 +1776,37 @@ function setupCommandHandlers(socket, number) {
     concurrency: process.env.MESSAGE_PROCESSING_CONCURRENCY || DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
     maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT
   });
+  const mediaAlbumStore = createMediaAlbumStore();
   if (sanitizedNumber) messageDispatchers.set(sanitizedNumber, dispatcher);
 
   socket.ev.on('messages.upsert', ({ messages = [], type = 'unknown' } = {}) => {
     if (!Array.isArray(messages) || !messages.length) return;
+    // Baileys associe chaque média d’un album au key du message album via
+    // messageContextInfo.messageAssociation.parentMessageKey. On garde ce petit
+    // index en mémoire par socket pour que .spack puisse récupérer ses photos.
+    for (const incoming of messages) {
+      mediaAlbumStore.record(incoming?.key?.remoteJid, incoming);
+    }
     const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
     if (batchStats) {
       const receivedType = type === 'notify' ? 'notify' : type === 'append' ? 'append' : 'other';
       batchStats.received += messages.length;
       batchStats.receivedByType[receivedType] += messages.length;
       batchStats.lastReceivedType = receivedType;
-      batchStats.lastReceivedAt = Date.now();
+      const upsertAt = Date.now();
+      batchStats.lastReceivedAt = upsertAt;
+      if (type === 'notify') {
+        for (const incoming of messages) {
+          const rawTimestamp = incoming?.messageTimestamp;
+          const timestampSeconds = Number(typeof rawTimestamp?.toNumber === 'function'
+            ? rawTimestamp.toNumber()
+            : rawTimestamp);
+          if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) continue;
+          const timestampAgeMs = Math.max(0, upsertAt - timestampSeconds * 1000);
+          batchStats.lastNotifyTimestampAgeMs = timestampAgeMs;
+          batchStats.maxNotifyTimestampAgeMs = Math.max(batchStats.maxNotifyTimestampAgeMs || 0, timestampAgeMs);
+        }
+      }
       if (type === 'append') batchStats.historyIgnored += messages.length;
     }
     // `append` contient le rattrapage d'historique; l'exécuter comme du trafic
@@ -2338,7 +2363,9 @@ function setupCommandHandlers(socket, number) {
         loadUserConfigFromMongo,
         setUserConfigInMongo,
         getPluginsByCategory,
-        getAllPluginsList
+        getAllPluginsList,
+        getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+          mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage)
       });
       if (isHandled) return;
     } catch (pluginErr) {
