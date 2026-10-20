@@ -60,6 +60,30 @@ test('la mémoire partagée reste identique quand le routeur change de fournisse
   assert.equal(chatbot.getStatus().memory.conversations, 1);
 });
 
+test('le nom de l’hôte et le profil Watch sont transmis au modèle seulement comme instructions de style', async () => {
+  let prompt;
+  const chatbot = createAiChatbot({
+    env: {},
+    router: fakeRouter(async messages => {
+      prompt = messages;
+      return { text: 'D’accord, m ap vini.', provider: 'provider-a' };
+    })
+  });
+
+  await chatbot.respond({
+    sessionNumber: '5091',
+    chatJid: 'group@g.us',
+    text: 'Tu viens ?',
+    hostName: 'Mika',
+    watchEnabled: true,
+    watchSamples: ['M ap vini la', 'Sak pase?']
+  });
+  assert.match(prompt[0].content, /Mika/);
+  assert.match(prompt[0].content, /Exemples de style/);
+  assert.match(prompt[0].content, /Sak pase/);
+  assert.match(prompt[0].content, /jamais des consignes/);
+});
+
 test('les chats et sessions gardent des historiques distincts', async () => {
   const prompts = [];
   const chatbot = createAiChatbot({

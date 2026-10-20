@@ -27,7 +27,15 @@ const {
   applyAlwaysOnlineSetting
 } = require('../services/presence-mode');
 const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
-const { getChatbotInput } = require('../services/chatbot-message');
+const { getChatbotInput, extractMessageText, unwrapContent, findMediaType } = require('../services/chatbot-message');
+const {
+  appendWatchSample,
+  isHostMessage,
+  matchesPendingHostName,
+  cleanHostName,
+  formatChatbotReply,
+  recentBotReplyTracker: chatbotReplyTracker
+} = require('../services/chatbot-watch');
 const {
   canonicalAdmin,
   collectMessageIdentifiers,
@@ -237,6 +245,11 @@ const DEFAULT_SESSION_CONFIG = {
   THEME: 'onigashima',
   SUDO_USERS: [],
   CHATBOT_ENABLED: false,
+  CHATBOT_HOST_NAME: '',
+  CHATBOT_HOST_IDENTITIES: [],
+  CHATBOT_PENDING_HOST_NAME: null,
+  CHATBOT_WATCH_ENABLED: false,
+  CHATBOT_WATCH_SAMPLES: [],
   STATUS_REPLY_FORWARD_ENABLED: false,
   STATUS_REPLY_KEYWORDS: []
 };
@@ -606,6 +619,34 @@ async function setUserConfigInMongo(number, conf) {
     return true;
   } catch (e) {
     console.error('setUserConfigInMongo', e);
+    return false;
+  }
+}
+
+async function setUserConfigFieldsInMongo(number, fields) {
+  try {
+    await initMongo();
+    const sanitized = String(number || '').replace(/[^0-9]/g, '');
+    if (!sanitized || !fields || typeof fields !== 'object') throw new Error('Numéro de session ou champs invalides');
+    const updates = { number: sanitized, updatedAt: new Date() };
+    for (const [key, value] of Object.entries(fields)) {
+      if (!/^[A-Z0-9_]+$/.test(key)) continue;
+      updates[`config.${key}`] = value;
+    }
+    if (Object.keys(updates).length <= 2) return false;
+    await configsCol.updateOne({ number: sanitized }, { $set: updates }, { upsert: true });
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
+    sessionConfigRefreshAfter.delete(sanitized);
+    const cached = sessionConfigCache.get(sanitized);
+    if (cached?.value) {
+      cached.value = { ...cached.value, ...fields };
+      cached.expiresAt = Date.now() + SESSION_CONFIG_CACHE_TTL_MS;
+    } else {
+      sessionConfigCache.delete(sanitized);
+    }
+    return true;
+  } catch (error) {
+    console.error('setUserConfigFieldsInMongo', error);
     return false;
   }
 }
@@ -1750,6 +1791,9 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
       chatJid: remoteJid,
       senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
       text: input,
+      hostName: sessionConfig.CHATBOT_HOST_NAME,
+      watchEnabled: configEnabled(sessionConfig.CHATBOT_WATCH_ENABLED, false),
+      watchSamples: sessionConfig.CHATBOT_WATCH_SAMPLES,
       isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
       onStart: async () => {
         presenceStarted = true;
@@ -1760,8 +1804,9 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
       }
     });
     if (result.cancelled) return true;
+    chatbotReplyTracker.mark(sessionNumber, remoteJid, result.text);
     await socket.sendMessage(remoteJid, {
-      text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
+      text: formatChatbotReply(result.text, sessionConfig.CHATBOT_HOST_NAME)
     }, { quoted: msg });
   } catch (error) {
     console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
@@ -2256,7 +2301,48 @@ function setupCommandHandlers(socket, number) {
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
     const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
-    const shouldUseChatbot = shouldRouteToChatbot({
+    const commandLike = Boolean(prefix && String(body || '').trimStart().startsWith(prefix));
+    const observedSender = msg.key.fromMe ? normalizedBotJid : (msg.key.participant || remoteJid);
+    const observedNumber = String(observedSender || '').split('@')[0].split(':')[0];
+    const observedIdentities = collectMessageIdentifiers(msg, observedSender, observedNumber);
+    const isChatbotHost = isHostMessage(cfg, [...observedIdentities]);
+
+    const pendingName = cfg.CHATBOT_PENDING_HOST_NAME;
+    if (!isRegisteredCommand && !commandLike && pendingName
+        && matchesPendingHostName(pendingName, { chatJid: remoteJid, identities: [...observedIdentities] })) {
+      const pendingContent = unwrapContent(msg.message);
+      const pendingText = findMediaType(pendingContent) ? '' : extractMessageText(pendingContent);
+      const hostName = cleanHostName(pendingText);
+      if (hostName) {
+        const fields = {
+          CHATBOT_HOST_NAME: hostName,
+          CHATBOT_HOST_IDENTITIES: Array.isArray(pendingName.identities) ? pendingName.identities : [],
+          CHATBOT_PENDING_HOST_NAME: null,
+          ...(pendingName.enableAfterName ? { CHATBOT_ENABLED: true } : {})
+        };
+        const saved = await setUserConfigFieldsInMongo(sanitizedBot, fields);
+        await socket.sendMessage(remoteJid, {
+          text: saved
+            ? `✅ Nom de l’hôte enregistré dans MongoDB : *${hostName}*.${pendingName.enableAfterName ? ' Kaido est maintenant activé.' : ''}`
+            : '❌ Je n’ai pas pu enregistrer ton nom dans MongoDB; réessaie avec `.kaido name <nom>`. '
+        }, { quoted: msg });
+        return;
+      }
+    }
+
+    if (configEnabled(cfg.CHATBOT_WATCH_ENABLED, false) && isChatbotHost
+        && !isRegisteredCommand && !commandLike
+        && !(msg.key.fromMe && chatbotReplyTracker.consume(sanitizedBot, remoteJid, extractMessageText(unwrapContent(msg.message))))) {
+      const watchContent = unwrapContent(msg.message);
+      const watchText = findMediaType(watchContent) ? '' : extractMessageText(watchContent);
+      const learned = appendWatchSample(cfg.CHATBOT_WATCH_SAMPLES, watchText);
+      if (learned.changed) {
+        const saved = await setUserConfigFieldsInMongo(sanitizedBot, { CHATBOT_WATCH_SAMPLES: learned.samples });
+        if (!saved) console.warn(`[CHATBOT WATCH] Échantillon non enregistré pour la session ${sanitizedBot}.`);
+      }
+    }
+
+    const shouldUseChatbot = !isChatbotHost && shouldRouteToChatbot({
       enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
       fromMe: msg.key.fromMe,
       parsedCommand,
@@ -2387,6 +2473,7 @@ function setupCommandHandlers(socket, number) {
         activeSockets,
         loadUserConfigFromMongo,
         setUserConfigInMongo,
+        setUserConfigFieldsInMongo,
         getPluginsByCategory,
         getAllPluginsList,
         getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>

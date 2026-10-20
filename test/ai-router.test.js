@@ -156,6 +156,28 @@ test('Jina DeepSearch utilise son endpoint, son modèle et uniquement les champs
   assert.equal(result.text, 'Voici la réponse Jina.');
 });
 
+test('Jina fait tourner plusieurs clés et passe à la suivante en cas de limite 429', async () => {
+  const usedKeys = [];
+  const router = createAiRouter({
+    env: {
+      JINA_API_KEYS: 'jina-one, jina-two, jina-one',
+      AI_PROVIDER_ORDER: 'jina'
+    },
+    fetchImpl: async (_url, init) => {
+      const key = init.headers.authorization.replace('Bearer ', '');
+      usedKeys.push(key);
+      if (key === 'jina-one') return fakeResponse({ error: 'rate limited' }, 429, '0');
+      return fakeResponse({ choices: [{ message: { content: 'Réponse avec la seconde clé.' } }] });
+    }
+  });
+
+  const first = await router.complete([{ role: 'user', content: 'première question' }]);
+  const second = await router.complete([{ role: 'user', content: 'deuxième question' }]);
+  assert.equal(first.text, 'Réponse avec la seconde clé.');
+  assert.equal(second.text, 'Réponse avec la seconde clé.');
+  assert.deepEqual(usedKeys, ['jina-one', 'jina-two', 'jina-two']);
+});
+
 test('les modèles libres OpenRouter utilisent le routeur gratuit par défaut', async () => {
   let body;
   const router = createAiRouter({

@@ -2,6 +2,7 @@
 
 const { createAiMemory } = require('./ai-memory');
 const { createAiRouter, AiRouterError } = require('./ai-router');
+const { buildChatbotStyleInstruction } = require('./chatbot-watch');
 
 const KAIDO_SYSTEM_PROMPT = [
   'Tu es Kaido, le Roi des Bêtes, la personnalité conversationnelle intégrée à Kaido-MD.',
@@ -132,7 +133,7 @@ function createAiChatbot(options = {}) {
     return `${session}::${chat}`;
   }
 
-  async function respond({ sessionNumber, chatJid, senderName, text, onStart, isActive } = {}) {
+  async function respond({ sessionNumber, chatJid, senderName, text, hostName, watchEnabled, watchSamples, onStart, isActive } = {}) {
     const session = cleanSessionNumber(sessionNumber);
     const key = conversationKey(session, chatJid);
     const messageText = String(text || '').replace(/\u0000/g, '').trim().slice(0, maxInputChars);
@@ -156,8 +157,12 @@ function createAiChatbot(options = {}) {
       }
       if (!(await stillCurrent())) return { cancelled: true, text: '', provider: '', model: '', conversationKey: key };
 
+      const styleInstruction = buildChatbotStyleInstruction({ hostName, watchEnabled, watchSamples });
+      const systemPrompt = styleInstruction
+        ? `${KAIDO_SYSTEM_PROMPT}\n\n${styleInstruction}`
+        : KAIDO_SYSTEM_PROMPT;
       const messages = [
-        { role: 'system', content: KAIDO_SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         ...memory.getMessages(key),
         { role: 'user', content: userContent }
       ];
@@ -204,7 +209,7 @@ function createAiChatbot(options = {}) {
 
 function formatAiError(error) {
   if (error?.code === 'no_provider_configured') {
-    return 'Aucune API IA n’est configurée. Ajoute JINA_API_KEY, GEMINI_API_KEY, GROQ_API_KEY ou OPENROUTER_API_KEY dans .env, ou configure AI_COMPAT_BASE_URL + AI_COMPAT_API_KEY + AI_COMPAT_MODEL, puis redémarre le bot.';
+    return 'Aucune API IA n’est configurée. Ajoute JINA_API_KEY ou JINA_API_KEYS, GEMINI_API_KEY, GROQ_API_KEY ou OPENROUTER_API_KEY dans .env, ou configure AI_COMPAT_BASE_URL + AI_COMPAT_API_KEY + AI_COMPAT_MODEL, puis redémarre le bot.';
   }
   if (error?.code === 'queue_full') {
     return '🐉 Kaido est très sollicité. Réessaie dans quelques instants.';

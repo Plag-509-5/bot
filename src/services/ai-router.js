@@ -110,6 +110,7 @@ function makeOpenAiCompatibleProvider({
   name,
   endpoint,
   getApiKey,
+  getApiKeys,
   getModel,
   fetchImpl,
   timeoutMs,
@@ -118,43 +119,73 @@ function makeOpenAiCompatibleProvider({
   includeTemperature = true,
   extraHeaders = () => ({})
 }) {
+  let nextKeyIndex = 0;
+  const resolveKeys = () => {
+    const rawKeys = typeof getApiKeys === 'function' ? getApiKeys() : [getApiKey?.()];
+    return [...new Set((Array.isArray(rawKeys) ? rawKeys : [rawKeys])
+      .map(key => String(key || '').trim())
+      .filter(Boolean))];
+  };
+
   return {
     name,
     isConfigured() {
-      return Boolean(String(getApiKey() || '').trim() && String(getModel() || '').trim());
+      return Boolean(resolveKeys().length && String(getModel() || '').trim());
     },
     async complete(messages) {
-      const apiKey = String(getApiKey() || '').trim();
+      const keys = resolveKeys();
       const model = String(getModel() || '').trim();
-      if (!apiKey || !model) throw new AiProviderError(name, 'provider_not_configured', { code: 'not_configured' });
+      if (!keys.length || !model) throw new AiProviderError(name, 'provider_not_configured', { code: 'not_configured' });
 
+      const start = nextKeyIndex++ % keys.length;
+      const orderedKeys = [...keys.slice(start), ...keys.slice(0, start)];
       const request = createTimeoutFetch(fetchImpl, timeoutMs, name);
       const requestBody = { model, messages, stream: false };
       if (includeTemperature) requestBody.temperature = 0.7;
       if (maxTokenField) requestBody[maxTokenField] = maxOutputTokens;
-      const response = await request(endpoint, {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${apiKey}`,
-          'content-type': 'application/json',
-          ...extraHeaders()
-        },
-        body: JSON.stringify(requestBody)
-      });
-      const payload = await readResponsePayload(response);
-      if (!response?.ok) {
-        throw new AiProviderError(name, `provider_http_${response?.status || 0}`, {
-          status: response?.status,
-          retryAfterMs: retryAfterMs(response),
-          code: response?.status === 429 ? 'rate_limited' : 'http_error'
+      let lastRotatableError = null;
+
+      for (let index = 0; index < orderedKeys.length; index += 1) {
+        const apiKey = orderedKeys[index];
+        const response = await request(endpoint, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            'content-type': 'application/json',
+            ...extraHeaders()
+          },
+          body: JSON.stringify(requestBody)
         });
+        const payload = await readResponsePayload(response);
+        if (!response?.ok) {
+          const error = new AiProviderError(name, `provider_http_${response?.status || 0}`, {
+            status: response?.status,
+            retryAfterMs: retryAfterMs(response),
+            code: response?.status === 429 ? 'rate_limited' : 'http_error'
+          });
+          const canRotate = orderedKeys.length > 1
+            && index < orderedKeys.length - 1
+            && [401, 403, 429].includes(response?.status);
+          if (canRotate) {
+            lastRotatableError = error;
+            continue;
+          }
+          throw error;
+        }
+
+        const text = extractOpenAiText(payload);
+        if (!text) throw new AiProviderError(name, 'provider_empty_response', { code: 'empty_response' });
+        return { text, provider: name, model: String(payload?.model || model) };
       }
 
-      const text = extractOpenAiText(payload);
-      if (!text) throw new AiProviderError(name, 'provider_empty_response', { code: 'empty_response' });
-      return { text, provider: name, model: String(payload?.model || model) };
+      throw lastRotatableError || new AiProviderError(name, 'provider_http_429', { status: 429, code: 'rate_limited' });
     }
   };
+}
+
+function parseApiKeys(...values) {
+  const keys = values.flatMap(value => String(value || '').split(/[,;\r\n]+/));
+  return [...new Set(keys.map(key => key.trim()).filter(Boolean))];
 }
 
 function normalizeCompatibleEndpoint(value) {
@@ -231,6 +262,7 @@ function createDefaultProviders({ env = process.env, fetchImpl = globalThis.fetc
     name: 'jina',
     endpoint: 'https://deepsearch.jina.ai/v1/chat/completions',
     getApiKey: () => env.JINA_API_KEY,
+    getApiKeys: () => parseApiKeys(env.JINA_API_KEYS, env.JINA_API_KEY),
     getModel: () => env.JINA_MODEL || DEFAULT_MODELS.jina,
     fetchImpl,
     timeoutMs: boundedInteger(env.JINA_REQUEST_TIMEOUT_MS, 120_000, 1000, 120_000),
