@@ -146,6 +146,7 @@ test('.save sur réaction télécharge un média direct @lid même si le marqueu
   assert.equal(saved.content.image.toString(), 'saved from reaction');
   assert.equal(saved.content.caption, 'Vue unique directe');
   assert.equal(sent.some(event => event.content?.forward), false);
+  assert.equal(sent.some(event => event.content?.react?.text === '💾'), false, 'ne pas réagir sur une commande déjà déclenchée par réaction');
   assert.equal(sent.some(event => event.content?.text?.includes('Réponds à un média')), false);
 });
 

@@ -172,6 +172,7 @@ const {
   DEFAULT_MESSAGE_QUEUE_LIMIT
 } = require('../services/message-batch');
 const { createMediaAlbumStore, snapshotMessageEnvelope } = require('../services/media-album-store');
+const { createReactionTargetCache } = require('../services/reaction-target-cache');
 const {
   SESSION_KEEPALIVE_INTERVAL_MS,
   SESSION_HEALTH_CHECK_INTERVAL_MS,
@@ -966,6 +967,9 @@ const otpStore = new Map();
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
 const messageStoreTimes = new WeakMap(); // msgObject → storedAt (sans deuxième Map de clés par session)
+// Cache borné de cibles média pour les commandes par réaction, même si .setcmd
+// est créé après l'arrivée du média ou si l'antidelete est désactivé.
+const reactionTargetCache = createReactionTargetCache();
 
 const configuredStoreLimit = Number(process.env.ANTIDELETE_STORE_MAX);
 const STORE_MAX_PER_SESSION = Number.isInteger(configuredStoreLimit) && configuredStoreLimit > 0
@@ -1790,6 +1794,9 @@ function setupCommandHandlers(socket, number) {
     // index en mémoire par socket pour que .spack puisse récupérer ses photos.
     for (const incoming of messages) {
       mediaAlbumStore.record(incoming?.key?.remoteJid, incoming);
+      // Enregistre les cibles média de réaction sans dépendre de l'activation
+      // préalable d'un alias ou de l'antidelete (petit cache par session/TTL).
+      if (type !== 'append') reactionTargetCache.record(sanitizedNumber, incoming);
     }
     const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
     if (batchStats) {
@@ -1870,12 +1877,17 @@ function setupCommandHandlers(socket, number) {
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
         const targetMsg = await resolveReactionTargetMessage({
-          cachedMessage: getStoredMessage(sanitizedBot, targetMsgId),
+          cachedMessage: getStoredMessage(sanitizedBot, targetMsgId)
+            || reactionTargetCache.get(sanitizedBot, targetMsgId),
           socket,
           targetKey: { ...targetKey, remoteJid: targetChat }
         });
         if (!targetMsg) {
           console.warn(`[REACTION-CMD] Message cible ${targetMsgId || '(sans id)'} introuvable dans le cache de la session ${number}.`);
+          await socket.sendMessage(targetChat, {
+            text: '❌ Je ne retrouve pas le message visé par cette réaction. Réagis à nouveau après que le bot a reçu le média.'
+          }, { quoted: msg }).catch(() => {});
+          return;
         }
 
         const reactorJid = msg.key.fromMe 

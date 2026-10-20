@@ -224,7 +224,7 @@ module.exports = {
         const payload = buildViewOncePayload(viewOnceMedia, buffer);
         const saved = await socket.sendMessage(selfJid, payload);
         if (!saved) throw new Error('WhatsApp n’a pas confirmé la sauvegarde du média.');
-        if (msg?.key && from) {
+        if (!context.isReactionCommand && msg?.key && from) {
           await socket.sendMessage(from, { react: { text: '💾', key: msg.key } }).catch(() => {});
         }
         return saved;
@@ -251,7 +251,7 @@ module.exports = {
       });
       if (!forwarded) throw new Error('WhatsApp n’a pas confirmé le transfert.');
 
-      if (msg?.key) {
+      if (!context.isReactionCommand && msg?.key) {
         await socket.sendMessage(from, {
           react: { text: '💾', key: msg.key }
         }).catch(() => {});
