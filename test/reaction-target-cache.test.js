@@ -21,6 +21,23 @@ test('reaction target cache records media independently of reaction aliases and 
   assert.equal(cache.get('50900000001', 'view-once-1'), null);
 });
 
+test('reaction target cache retains media hydrated from Baileys history for later reactions', () => {
+  const cache = createReactionTargetCache();
+  const historicalMessage = {
+    key: { id: 'history-view-once', remoteJid: '246454467731604@lid' },
+    message: {
+      viewOnceMessageV2Extension: {
+        message: { videoMessage: { mimetype: 'video/mp4', viewOnce: true } }
+      }
+    }
+  };
+
+  // La réception `append` appelle le même record() que `notify`; l'event
+  // handler ne rejoue pas ce message comme une commande.
+  assert.equal(cache.record('50900000000', historicalMessage), true);
+  assert.equal(cache.get('50900000000', 'history-view-once').key.id, 'history-view-once');
+});
+
 test('reaction target cache includes album parents and evicts oldest entries at its per-session bound', () => {
   let clock = 1000;
   const cache = createReactionTargetCache({ maxMessagesPerSession: 2, ttlMs: 100, now: () => clock });

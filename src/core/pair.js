@@ -1794,9 +1794,10 @@ function setupCommandHandlers(socket, number) {
     // index en mémoire par socket pour que .spack puisse récupérer ses photos.
     for (const incoming of messages) {
       mediaAlbumStore.record(incoming?.key?.remoteJid, incoming);
-      // Enregistre les cibles média de réaction sans dépendre de l'activation
-      // préalable d'un alias ou de l'antidelete (petit cache par session/TTL).
-      if (type !== 'append') reactionTargetCache.record(sanitizedNumber, incoming);
+      // Cache aussi les médias reçus en `append` (rattrapage Baileys) : la cible
+      // peut déjà exister dans l'historique quand la réaction arrive. Le cache
+      // est borné et cet indexage n'exécute jamais les anciens messages.
+      reactionTargetCache.record(sanitizedNumber, incoming);
     }
     const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
     if (batchStats) {
@@ -1876,14 +1877,19 @@ function setupCommandHandlers(socket, number) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
+        const storedTarget = getStoredMessage(sanitizedBot, targetMsgId);
+        const reactionCachedTarget = reactionTargetCache.get(sanitizedBot, targetMsgId);
         const targetMsg = await resolveReactionTargetMessage({
-          cachedMessage: getStoredMessage(sanitizedBot, targetMsgId)
-            || reactionTargetCache.get(sanitizedBot, targetMsgId),
+          cachedMessage: storedTarget || reactionCachedTarget,
           socket,
           targetKey: { ...targetKey, remoteJid: targetChat }
         });
         if (!targetMsg) {
-          console.warn(`[REACTION-CMD] Message cible ${targetMsgId || '(sans id)'} introuvable dans le cache de la session ${number}.`);
+          console.warn(
+            `[REACTION-CMD] Cible ${targetMsgId || '(sans id)'} introuvable pour ${number}; `
+            + `antidelete=${Boolean(storedTarget)}, cacheMedia=${Boolean(reactionCachedTarget)}, `
+            + `tailleCacheMedia=${reactionTargetCache.size(sanitizedBot)}.`
+          );
           await socket.sendMessage(targetChat, {
             text: '❌ Je ne retrouve pas le message visé par cette réaction. Réagis à nouveau après que le bot a reçu le média.'
           }, { quoted: msg }).catch(() => {});

@@ -1,6 +1,6 @@
 'use strict';
 
-const DEFAULT_MAX_MESSAGES_PER_SESSION = 200;
+const DEFAULT_MAX_MESSAGES_PER_SESSION = 500;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const MEDIA_MESSAGE_FIELDS = ['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage', 'stickerMessage'];
 
