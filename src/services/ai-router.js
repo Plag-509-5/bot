@@ -1,7 +1,8 @@
 'use strict';
 
-const DEFAULT_PROVIDER_ORDER = ['gemini', 'groq', 'openrouter', 'compatible'];
+const DEFAULT_PROVIDER_ORDER = ['jina', 'gemini', 'groq', 'openrouter', 'compatible'];
 const DEFAULT_MODELS = Object.freeze({
+  jina: 'jina-deepsearch-v1',
   gemini: 'gemini-3.8-flash',
   groq: 'openai/gpt-oss-20b',
   openrouter: 'openrouter/free'
@@ -114,6 +115,7 @@ function makeOpenAiCompatibleProvider({
   timeoutMs,
   maxOutputTokens,
   maxTokenField = 'max_tokens',
+  includeTemperature = true,
   extraHeaders = () => ({})
 }) {
   return {
@@ -127,8 +129,9 @@ function makeOpenAiCompatibleProvider({
       if (!apiKey || !model) throw new AiProviderError(name, 'provider_not_configured', { code: 'not_configured' });
 
       const request = createTimeoutFetch(fetchImpl, timeoutMs, name);
-      const requestBody = { model, messages, temperature: 0.7, stream: false };
-      requestBody[maxTokenField] = maxOutputTokens;
+      const requestBody = { model, messages, stream: false };
+      if (includeTemperature) requestBody.temperature = 0.7;
+      if (maxTokenField) requestBody[maxTokenField] = maxOutputTokens;
       const response = await request(endpoint, {
         method: 'POST',
         headers: {
@@ -221,6 +224,21 @@ function createDefaultProviders({ env = process.env, fetchImpl = globalThis.fetc
     }
   };
 
+  // Jina DeepSearch uses the OpenAI Chat Completions shape but may spend up to
+  // roughly two minutes researching. Keep its longer timeout isolated from the
+  // faster chat providers, and send only the documented request fields.
+  const jina = makeOpenAiCompatibleProvider({
+    name: 'jina',
+    endpoint: 'https://deepsearch.jina.ai/v1/chat/completions',
+    getApiKey: () => env.JINA_API_KEY,
+    getModel: () => env.JINA_MODEL || DEFAULT_MODELS.jina,
+    fetchImpl,
+    timeoutMs: boundedInteger(env.JINA_REQUEST_TIMEOUT_MS, 120_000, 1000, 120_000),
+    maxOutputTokens,
+    maxTokenField: null,
+    includeTemperature: false
+  });
+
   const groq = makeOpenAiCompatibleProvider({
     name: 'groq',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
@@ -256,7 +274,7 @@ function createDefaultProviders({ env = process.env, fetchImpl = globalThis.fetc
   const isCompatibleConfigured = compatible.isConfigured.bind(compatible);
   compatible.isConfigured = () => Boolean(compatibleEndpoint && isCompatibleConfigured());
 
-  return [gemini, groq, openrouter, compatible];
+  return [jina, gemini, groq, openrouter, compatible];
 }
 
 function createAiRouter(options = {}) {

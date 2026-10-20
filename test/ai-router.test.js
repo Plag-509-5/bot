@@ -129,6 +129,33 @@ test('le provider Groq utilise l’endpoint OpenAI-compatible et conserve les me
   assert.equal(result.text, 'La réponse arrive.');
 });
 
+test('Jina DeepSearch utilise son endpoint, son modèle et uniquement les champs documentés', async () => {
+  let requestInfo;
+  const router = createAiRouter({
+    env: {
+      JINA_API_KEY: 'jina-test-key',
+      JINA_MODEL: 'jina-deepsearch-v1',
+      JINA_REQUEST_TIMEOUT_MS: '90000',
+      AI_PROVIDER_ORDER: 'jina'
+    },
+    fetchImpl: async (url, init) => {
+      requestInfo = { url, init, body: JSON.parse(init.body) };
+      return fakeResponse({ choices: [{ message: { content: 'Voici la réponse Jina.' } }] });
+    }
+  });
+  const messages = [
+    { role: 'system', content: 'Tu es Kaido.' },
+    { role: 'user', content: 'Réponds à ma question.' }
+  ];
+  const result = await router.complete(messages);
+
+  assert.equal(requestInfo.url, 'https://deepsearch.jina.ai/v1/chat/completions');
+  assert.equal(requestInfo.init.headers.authorization, 'Bearer jina-test-key');
+  assert.deepEqual(requestInfo.body, { model: 'jina-deepsearch-v1', messages, stream: false });
+  assert.equal(result.provider, 'jina');
+  assert.equal(result.text, 'Voici la réponse Jina.');
+});
+
 test('les modèles libres OpenRouter utilisent le routeur gratuit par défaut', async () => {
   let body;
   const router = createAiRouter({

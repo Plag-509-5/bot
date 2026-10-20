@@ -204,7 +204,7 @@ function createAiChatbot(options = {}) {
 
 function formatAiError(error) {
   if (error?.code === 'no_provider_configured') {
-    return 'Aucune API IA n’est configurée. Ajoute une clé (GEMINI_API_KEY, GROQ_API_KEY ou OPENROUTER_API_KEY) dans .env, ou configure AI_COMPAT_BASE_URL + AI_COMPAT_API_KEY + AI_COMPAT_MODEL, puis redémarre le bot.';
+    return 'Aucune API IA n’est configurée. Ajoute JINA_API_KEY, GEMINI_API_KEY, GROQ_API_KEY ou OPENROUTER_API_KEY dans .env, ou configure AI_COMPAT_BASE_URL + AI_COMPAT_API_KEY + AI_COMPAT_MODEL, puis redémarre le bot.';
   }
   if (error?.code === 'queue_full') {
     return '🐉 Kaido est très sollicité. Réessaie dans quelques instants.';
