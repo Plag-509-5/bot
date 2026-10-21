@@ -37,6 +37,10 @@ const {
   recentBotReplyTracker: chatbotReplyTracker
 } = require('../services/chatbot-watch');
 const {
+  MAX_PROFILE_BYTES,
+  parseChatbotProfileText
+} = require('../services/chatbot-profile');
+const {
   canonicalAdmin,
   collectMessageIdentifiers,
   addIdentifierCandidates,
@@ -250,6 +254,7 @@ const DEFAULT_SESSION_CONFIG = {
   CHATBOT_PENDING_HOST_NAME: null,
   CHATBOT_WATCH_ENABLED: false,
   CHATBOT_WATCH_SAMPLES: [],
+  CHATBOT_PROFILE_IMPORT_PENDING: false,
   STATUS_REPLY_FORWARD_ENABLED: false,
   STATUS_REPLY_KEYWORDS: []
 };
@@ -2272,6 +2277,67 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
+    // Le profil TXT est importé uniquement depuis un message privé de l’hôte,
+    // et uniquement pendant la fenêtre explicitement ouverte à la réactivation.
+    const profileSender = msg.key.participant || remoteJid;
+    const profileSenderNumber = String(profileSender || '').split('@')[0].split(':')[0];
+    const profileSenderIds = collectMessageIdentifiers(msg, profileSender, profileSenderNumber);
+    if (configEnabled(cfg.CHATBOT_PROFILE_IMPORT_PENDING, false)
+        && !msg.key.fromMe && isHostMessage(cfg, [...profileSenderIds])) {
+      const profileContent = unwrapContent(msg.message);
+      const profileDocument = profileContent.documentMessage;
+      if (profileDocument) {
+        const replyJid = remoteJid;
+        if (remoteJid.endsWith('@g.us')) {
+          await socket.sendMessage(profileSender, {
+            text: 'Pour protéger ton profil, renvoie le fichier TXT au bot dans un chat privé.'
+          });
+          return;
+        }
+        const isTextProfile = /\.txt$/i.test(String(profileDocument.fileName || ''))
+          || String(profileDocument.mimetype || '').toLowerCase() === 'text/plain';
+        if (!isTextProfile) {
+          await socket.sendMessage(replyJid, {
+            text: '❌ Le profil doit être renvoyé comme fichier TXT (`kaido-profil.txt`).'
+          });
+          return;
+        }
+        try {
+          const stream = await downloadContentFromMessage(profileDocument, 'document');
+          const chunks = [];
+          let size = 0;
+          let oversized = false;
+          for await (const chunk of stream) {
+            const buffer = Buffer.from(chunk);
+            size += buffer.length;
+            if (size > MAX_PROFILE_BYTES) {
+              oversized = true;
+              break;
+            }
+            chunks.push(buffer);
+          }
+          if (oversized) throw new Error('Le fichier dépasse la taille autorisée.');
+          const profile = parseChatbotProfileText(Buffer.concat(chunks));
+          const saved = await setUserConfigFieldsInMongo(sanitizedBot, {
+            CHATBOT_HOST_NAME: profile.hostName,
+            CHATBOT_WATCH_ENABLED: profile.watchEnabled,
+            CHATBOT_WATCH_SAMPLES: profile.watchSamples,
+            CHATBOT_PROFILE_IMPORT_PENDING: false
+          });
+          if (!saved) throw new Error('Enregistrement MongoDB impossible.');
+          await socket.sendMessage(replyJid, {
+            text: `✅ Profil TXT restauré. ${profile.watchSamples.length} exemple(s) Watch chargé(s); Watch est ${profile.watchEnabled ? 'activé' : 'désactivé'}.`
+          });
+          return;
+        } catch (error) {
+          await socket.sendMessage(replyJid, {
+            text: `❌ Profil TXT non restauré : ${error?.message || 'fichier invalide'}. Réessaie avec le fichier original reçu lors de la désactivation.`
+          });
+          return;
+        }
+      }
+    }
+
     // En mode chatbot, les messages média sont décrits sans téléverser leurs
     // octets; hors mode chatbot ils restent ignorés comme auparavant.
     const autoChatbotInput = configEnabled(cfg.CHATBOT_ENABLED, false) && !msg.key.fromMe
@@ -2330,7 +2396,7 @@ function setupCommandHandlers(socket, number) {
       }
     }
 
-    if (configEnabled(cfg.CHATBOT_WATCH_ENABLED, false) && isChatbotHost
+    if (configEnabled(cfg.CHATBOT_ENABLED, false) && configEnabled(cfg.CHATBOT_WATCH_ENABLED, false) && isChatbotHost
         && !isRegisteredCommand && !commandLike
         && !(msg.key.fromMe && chatbotReplyTracker.consume(sanitizedBot, remoteJid, extractMessageText(unwrapContent(msg.message))))) {
       const watchContent = unwrapContent(msg.message);

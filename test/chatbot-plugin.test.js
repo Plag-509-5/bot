@@ -35,6 +35,73 @@ test('le propriétaire peut désactiver le chatbot et effacer la mémoire de sa 
   assert.match(state.sent.at(-1).content.text, /mémoire.*effacée/i);
 });
 
+test('la désactivation envoie le profil appris en TXT dans le privé puis demande sa restauration future', async () => {
+  const state = fixture(['off'], {
+    isSessionOwner: true,
+    sender: '50911111111@s.whatsapp.net',
+    sessionCfg: {
+      CHATBOT_ENABLED: true,
+      CHATBOT_HOST_NAME: 'Mika',
+      CHATBOT_HOST_IDENTITIES: ['50911111111@s.whatsapp.net'],
+      CHATBOT_WATCH_ENABLED: true,
+      CHATBOT_WATCH_SAMPLES: ['Sak pase?']
+    }
+  });
+  await plugin.execute(state.context);
+
+  assert.equal(state.saved.length, 2);
+  const file = state.sent.find(entry => entry.content.fileName === 'kaido-profil.txt');
+  assert.ok(file);
+  assert.equal(file.jid, '50911111111@s.whatsapp.net');
+  assert.equal(file.content.mimetype, 'text/plain');
+  const exported = JSON.parse(file.content.document.toString('utf8'));
+  assert.equal(exported.hostName, 'Mika');
+  assert.deepEqual(exported.watchSamples, ['Sak pase?']);
+  assert.equal(state.saved.at(-1).config.CHATBOT_PROFILE_IMPORT_PENDING, true);
+  assert.deepEqual(state.saved.at(-1).config.CHATBOT_WATCH_SAMPLES, []);
+  assert.equal(state.saved.at(-1).config.CHATBOT_HOST_NAME, '');
+});
+
+test('à la réactivation, une demande privée invite à renvoyer le TXT même si le nom a été vidé', async () => {
+  const previous = process.env.JINA_API_KEY;
+  process.env.JINA_API_KEY = 'test-only';
+  try {
+    const state = fixture(['on'], {
+      isSessionOwner: true,
+      sender: '50911111111@s.whatsapp.net',
+      sessionCfg: {
+        CHATBOT_ENABLED: false,
+        CHATBOT_PROFILE_IMPORT_PENDING: true,
+        CHATBOT_HOST_IDENTITIES: ['50911111111@s.whatsapp.net'],
+        CHATBOT_HOST_NAME: '',
+        CHATBOT_WATCH_SAMPLES: []
+      }
+    });
+    await plugin.execute(state.context);
+    assert.equal(state.saved[0].config.CHATBOT_ENABLED, true);
+    assert.equal(state.saved[0].config.CHATBOT_PROFILE_IMPORT_PENDING, true);
+    assert.equal(state.sent[0].jid, '50911111111@s.whatsapp.net');
+    assert.match(state.sent[0].content.text, /renvoie ici le fichier TXT/i);
+  } finally {
+    if (previous === undefined) delete process.env.JINA_API_KEY;
+    else process.env.JINA_API_KEY = previous;
+  }
+});
+
+test('un administrateur ne peut pas remplacer l’identité persistante de l’hôte', () => {
+  const saved = ['50911111111@s.whatsapp.net'];
+  assert.deepEqual(plugin._test.resolveHostIdentities({ CHATBOT_HOST_IDENTITIES: saved }, {
+    senderNumber: '50922222222',
+    sessionNumber: '50911111111',
+    access: { candidates: new Set(['50922222222@s.whatsapp.net']) }
+  }), saved);
+  assert.deepEqual(plugin._test.resolveHostIdentities({ CHATBOT_HOST_IDENTITIES: saved }, {
+    senderNumber: '50911111111',
+    sessionNumber: '50911111111',
+    access: { candidates: new Set(['50911111111@s.whatsapp.net', 'host-lid@lid']) }
+  }), ['50911111111@s.whatsapp.net', 'host-lid@lid', '50911111111']);
+});
+
 test('un utilisateur non privilégié ne peut pas modifier le switch', async () => {
   const state = fixture(['on'], {
     senderNumber: '50922222222',
