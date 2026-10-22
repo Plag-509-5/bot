@@ -29,6 +29,7 @@ const {
 } = require('../services/presence-mode');
 const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
 const { animeQuiz, formatQuizVerdict } = require('../services/anime-quiz');
+const { setupMetaAiFakeQuote } = require('../services/meta-ai-fake-quote');
 const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
@@ -8754,8 +8755,8 @@ case 'bots': {
       break;
     }
 
-    const activeCount = activeSockets.size;
-    const activeNumbers = Array.from(activeSockets.keys());
+    const activeCount = activeSockets instanceof Map ? activeSockets.size : 0;
+    const activeNumbers = activeSockets instanceof Map ? Array.from(activeSockets.keys(), value => String(value)) : [];
 
     // Meta mention
     const metaQuote = {
@@ -8809,21 +8810,31 @@ case 'bots': {
       text += `• Attendre la reconnexion automatique`;
     }
 
-    // Image
-    const logo = cfg.logo || config.RCD_IMAGE_PATH;
-    let imagePayload = String(logo).startsWith('http') ? { url: logo } : fs.readFileSync(logo);
-
-    await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: text,
-      footer: `${botName} • Système de monitoring`,
-      headerType: 4
-    }, { quoted: metaQuote });
+    // Utilise l’image locale plutôt qu’un logo personnalisé inaccessible (URL
+    // expirée, chemin absent ou montage déployé sans ce fichier).
+    const activeBanner = path.join(__dirname, '../../assets/images/kaido-menu-banner.png');
+    let imagePayload = null;
+    try { imagePayload = fs.readFileSync(activeBanner); }
+    catch (imageError) { console.warn('[ACTIVE SESSIONS] Bannière locale indisponible :', imageError?.message || imageError); }
+    if (imagePayload) {
+      try {
+        await socket.sendMessage(sender, {
+          image: imagePayload,
+          mimetype: 'image/png',
+          caption: text
+        }, { quoted: metaQuote });
+      } catch (imageError) {
+        console.warn('[ACTIVE SESSIONS] Envoi de l’image impossible; repli texte :', imageError?.message || imageError);
+        await socket.sendMessage(sender, { text }, { quoted: metaQuote });
+      }
+    } else {
+      await socket.sendMessage(sender, { text }, { quoted: metaQuote });
+    }
 
   } catch(e) {
     console.error('❌ Erreur bots:', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible d\'accéder aux données des sessions.' 
+    await socket.sendMessage(sender, {
+      text: `❌ Impossible d'accéder aux données des sessions${e?.message ? ` : ${e.message}` : '.'}`
     }, { quoted: msg });
   }
   break;
@@ -11485,6 +11496,9 @@ const pairingReadyResult = socket.authState.creds.registered
 // safe-send vérifie l'état Baileys avant toute traduction ou autre travail.
 await setupTranslationWrapper(socket, sanitizedNumber);
 installSafeSend(socket);
+// Le fake contact Meta AI habille toutes les sorties utilisateur; les vrais
+// événements restent citables pour le menu décoré.
+setupMetaAiFakeQuote(socket);
 setupReplyPresenceWrapper(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);

@@ -33,10 +33,13 @@ test('un message ignoré ne met pas la présence en ligne et n’est pas marqué
   assert.deepEqual(socket.events, []);
 });
 
-test('la préparation d’une commande marque le message lu sans exposer la présence', async () => {
+test('la préparation d’une commande retarde l’accusé de lecture jusqu’à la réponse', async () => {
   const socket = fakeSocket();
   await wakeForCommand(socket, msg, { AUTO_ONLINE: false, AUTO_RECORDING: false });
-  assert.deepEqual(socket.events, [['read', [msg.key]]]);
+  assert.deepEqual(socket.events, []);
+  setupReplyPresenceWrapper(socket);
+  await socket.sendMessage('chat@s.whatsapp.net', { text: 'réponse' });
+  assert.deepEqual(socket.events.map(event => event[0]), ['presence', 'read', 'send', 'presence']);
 });
 
 test('alwaysonline off impose unavailable et on reste une option explicite', async () => {
@@ -90,7 +93,8 @@ test('les sockets démarrent hors ligne et installent le wrapper après safe-sen
   assert.match(pairSource, /markOnlineOnConnect:\s*false/);
   const safeAt = pairSource.indexOf('installSafeSend(socket)');
   const presenceAt = pairSource.indexOf('setupReplyPresenceWrapper(socket)');
-  assert.ok(safeAt > 0 && presenceAt > safeAt);
+  const metaQuoteAt = pairSource.indexOf('setupMetaAiFakeQuote(socket)');
+  assert.ok(safeAt > 0 && metaQuoteAt > safeAt && presenceAt > metaQuoteAt);
 });
 
 test('normalise les valeurs booléennes de configuration', () => {

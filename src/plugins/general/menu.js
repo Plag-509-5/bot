@@ -1,5 +1,63 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
+const MENU_IMAGE_PATH = path.join(__dirname, '../../../assets/images/kaido-menu-banner.png');
+
+function createFakeMenuEventQuote(botName = 'KAIDO-MD', now = Date.now()) {
+  const startTime = Math.floor(now / 1000);
+  return {
+    key: {
+      remoteJid: 'status@broadcast',
+      participant: '0@s.whatsapp.net',
+      fromMe: false,
+      id: `KAIDO_FAKE_MENU_EVENT_${startTime}`
+    },
+    message: {
+      eventMessage: {
+        name: `${String(botName || 'KAIDO-MD').slice(0, 60)} • Menu`,
+        description: 'Événement fictif utilisé comme habillage du menu Kaido MD.',
+        startTime,
+        endTime: startTime + 3600,
+        isCanceled: false,
+        extraGuestsAllowed: false,
+        isScheduleCall: false
+      }
+    }
+  };
+}
+
+async function sendMenuPresentation({ socket, from, msg, text, mentions, botName }) {
+  let eventQuote = createFakeMenuEventQuote(botName);
+  try {
+    const sentEvent = await socket.sendMessage(from, {
+      event: {
+        name: `${String(botName || 'KAIDO-MD').slice(0, 60)} • Menu`,
+        description: 'Bienvenue dans le menu des commandes Kaido MD.',
+        startDate: new Date(),
+        endDate: new Date(Date.now() + 60 * 60 * 1000),
+        extraGuestsAllowed: false,
+        isScheduleCall: false
+      }
+    });
+    if (sentEvent?.message?.eventMessage) eventQuote = sentEvent;
+  } catch (error) {
+    console.warn('[MENU] Événement natif indisponible; habillage fictif cité :', error?.message || error);
+  }
+
+  const image = fs.readFileSync(MENU_IMAGE_PATH);
+  await socket.sendMessage(from, {
+    image,
+    mimetype: 'image/png',
+    caption: `🐉 *${botName || 'KAIDO-MD'} — MENU DES COMMANDES*\n⚔️ Guide de la session Kaido MD`
+  }, { quoted: eventQuote || msg });
+  return socket.sendMessage(from, {
+    text,
+    mentions: mentions || []
+  }, { quoted: eventQuote || msg });
+}
+
 const SECTIONS = [
   { key: 'download', title: '𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃', categories: ['download'] },
   { key: 'ai', title: '𝐀𝐈 & 𝐒𝐄𝐀𝐑𝐂𝐇', categories: ['ai'] },
@@ -145,7 +203,14 @@ module.exports = {
       categories: getPluginsByCategory ? getPluginsByCategory() : {},
       legacyCommands: Array.isArray(legacyCommands) ? legacyCommands : []
     });
-    await socket.sendMessage(from, { text, mentions: sender ? [sender] : [] }, { quoted: msg });
+    await sendMenuPresentation({
+      socket,
+      from,
+      msg,
+      text,
+      mentions: sender ? [sender] : [],
+      botName: config?.BOT_NAME || 'KAIDO-MD'
+    });
   },
-  _test: { classifyLegacy, buildCommandSections, buildMenuText, formatUptime }
+  _test: { classifyLegacy, buildCommandSections, buildMenuText, formatUptime, createFakeMenuEventQuote, sendMenuPresentation, MENU_IMAGE_PATH }
 };

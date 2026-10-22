@@ -18,7 +18,7 @@ function configEnabled(value, fallback = false) {
 function getPresenceState(socket) {
   let state = presenceStates.get(socket);
   if (!state) {
-    state = { cache: new Map(), currentPresence: null, presenceUpdatedAt: 0, alwaysOnline: false, activeReplies: 0, transition: Promise.resolve() };
+    state = { cache: new Map(), currentPresence: null, presenceUpdatedAt: 0, alwaysOnline: false, activeReplies: 0, transition: Promise.resolve(), pendingReads: new Map() };
     presenceStates.set(socket, state);
   }
   return state;
@@ -57,15 +57,33 @@ function setupReplyPresenceWrapper(socket) {
   const original = socket.sendMessage;
   const state = getPresenceState(socket);
 
+  async function flushPendingReads(target, replyTo) {
+    const chats = [...new Set([target, replyTo].filter(Boolean))];
+    const keys = chats.flatMap(chat => {
+      const pending = state.pendingReads.get(chat) || [];
+      state.pendingReads.delete(chat);
+      return pending;
+    });
+    if (keys.length && typeof socket.readMessages === 'function') {
+      try { await socket.readMessages(keys); } catch (_) {}
+    }
+  }
+
   async function sendMessageWithReplyPresence(jid, ...args) {
     const target = String(jid || '');
-    if (state.alwaysOnline) return original.call(this, jid, ...args);
+    const sendOptions = args[1] || {};
+    const replyTo = String(sendOptions?.quoted?.key?.remoteJid || '');
+    if (state.alwaysOnline) {
+      await flushPendingReads(target, replyTo);
+      return original.call(this, jid, ...args);
+    }
 
     state.activeReplies += 1;
     if (state.activeReplies === 1) await enqueuePresence(socket, true, target).catch(() => {});
     else await state.transition.catch(() => {});
 
     try {
+      await flushPendingReads(target, replyTo);
       return await original.call(this, jid, ...args);
     } finally {
       state.activeReplies = Math.max(0, state.activeReplies - 1);
@@ -84,11 +102,18 @@ async function handleIgnoredMessage() {
 }
 
 async function wakeForCommand(socket, msg, sessionConfig = {}) {
-  if (!msg?.key?.fromMe && msg?.key && typeof socket?.readMessages === 'function') {
-    try { await socket.readMessages([msg.key]); } catch (_) {}
+  if (!msg?.key?.fromMe && msg?.key?.remoteJid && msg?.key?.id && socket) {
+    const state = getPresenceState(socket);
+    const chat = String(msg.key.remoteJid);
+    const pending = state.pendingReads.get(chat) || [];
+    if (!pending.some(key => key.id === msg.key.id)) {
+      pending.push(msg.key);
+      if (pending.length > 100) pending.shift();
+      state.pendingReads.set(chat, pending);
+    }
   }
-  // The socket remains unavailable while a command is working. Its actual
-  // reply temporarily sets availability inside setupReplyPresenceWrapper.
+  // Ne marque le message comme lu qu’au moment où une réponse sort réellement.
+  // La présence reste indisponible pendant le traitement.
   if (configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket?.sendPresenceUpdate === 'function') {
     try { await socket.sendPresenceUpdate('recording', msg?.key?.remoteJid); } catch (_) {}
   }
