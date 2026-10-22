@@ -4,12 +4,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   checkWinner,
+  chooseAiMove,
   deleteGame,
   getTicTacToeStats,
   handleTicTacToeMove,
   normalizeJid,
   parseMove,
   renderBoard,
+  startSoloTicTacToe,
   startTicTacToe
 } = require('../src/features/tictactoe');
 
@@ -80,6 +82,43 @@ test('la partie annonce les deux joueurs, les mentionne et affiche les cases num
   assert.match(sent[0].content.text, /C’est au tour de ❌ @50911111111/);
   assert.match(sent[0].content.text, /numéro de la case \(1 à 9\)/);
   assert.match(renderBoard(Array(9).fill(null)), /1️⃣ \| 2️⃣ \| 3️⃣/);
+});
+
+test('le mode solo démarre avec le bot et joue automatiquement après le propriétaire', async () => {
+  const { socket, sent } = createSocket('50933333400');
+  await startSoloTicTacToe(socket, incoming(chat, 'solo-start', playerX), chat, playerX);
+  assert.match(sent[0].content.text, /CONTRE KAIDO IA/);
+  assert.deepEqual(sent[0].content.mentions, [playerX]);
+
+  assert.equal(await move(socket, playerX, '1'), true);
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].content.text, /🤖 Kaido IA/);
+  assert.match(sent[1].content.text, /C’est au tour de ❌ @50911111111/);
+  assert.equal(sent[1].content.mentions.includes('50933333400@s.whatsapp.net'), false);
+});
+
+test('le propriétaire peut jouer même depuis le compte lié de la session', async () => {
+  const { socket, sent } = createSocket('50933333401');
+  const ownerJid = '50933333401@s.whatsapp.net';
+  await startSoloTicTacToe(socket, {
+    key: { remoteJid: ownerJid, id: 'from-me-solo', fromMe: true },
+    message: { conversation: '.ttt solo' }
+  }, ownerJid, ownerJid);
+  assert.match(sent[0].content.text, /CONTRE KAIDO IA/);
+  assert.deepEqual(sent[0].content.mentions, [ownerJid]);
+  assert.equal(await move(socket, ownerJid, '5', { from: ownerJid }), true);
+  assert.equal(sent.length, 2);
+});
+
+test('l’IA prend une victoire immédiate et ne peut pas être forcée à perdre', () => {
+  assert.equal(chooseAiMove(['X', 'X', null, 'O', 'O', null, null, null, null]), 5);
+  const board = Array(9).fill(null);
+  for (let turn = 0; turn < 9 && checkWinner(board) === null; turn += 1) {
+    const symbol = turn % 2 === 0 ? 'X' : 'O';
+    const moveIndex = symbol === 'O' ? chooseAiMove(board, 'O', 'X') : board.findIndex(cell => cell === null);
+    board[moveIndex] = symbol;
+  }
+  assert.notEqual(checkWinner(board), 'X');
 });
 
 test('refuse les parties sans adversaire, contre soi-même ou contre le compte du bot', async () => {

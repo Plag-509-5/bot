@@ -69,7 +69,10 @@ const {
   initReactionDb
 } = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
-const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
+const { startTicTacToe, startSoloTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
+const { resolveGroupCreationParticipant } = require('../services/group-creation');
+const { buildChannelInfoInteractiveMessage } = require('../services/channel-info-message');
+const { applyPairingCors } = require('../services/pairing-cors');
 const {
   configureTranslationStorage,
   setupTranslationWrapper,
@@ -2566,18 +2569,27 @@ case 'status': {
       case 'ttt':
 case 'tictactoe': {
   try {
-    // 1. Recherche si l'utilisateur répond au message de quelqu'un (Reply)
-    let opponentJid = msg.message?.extendedTextMessage?.contextInfo?.participant;
-
-    // 2. Si ce n'est pas un reply, on cherche s'il y a une mention @user
-    if (!opponentJid) {
-      opponentJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    if (String(args[0] || '').toLowerCase() === 'solo') {
+      if (!isSessionOwner) {
+        await socket.sendMessage(from, {
+          text: '⛔ Le mode solo est réservé au propriétaire de cette session.'
+        }, { quoted: msg });
+        break;
+      }
+      await startSoloTicTacToe(socket, msg, from, nowsender);
+      break;
     }
 
-    // Lancement de la partie modernisée
+    let opponentJid = msg.message?.extendedTextMessage?.contextInfo?.participant
+      || msg.message?.extendedTextMessage?.contextInfo?.participantAlt;
+    if (!opponentJid) {
+      opponentJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]
+        || msg.message?.extendedTextMessage?.contextInfo?.mentionedJidAlt?.[0];
+    }
     await startTicTacToe(socket, msg, from, nowsender, opponentJid);
   } catch (e) {
     console.error('[TTT COMMAND ERROR]', e);
+    await socket.sendMessage(from, { text: `❌ Impossible de lancer la partie : ${e?.message || 'erreur inconnue'}` }, { quoted: msg }).catch(() => {});
   }
   break;
 }
@@ -8086,58 +8098,68 @@ ${statusEmoji} *Statut :* ${status}
             // ============ CRÉATION DE GROUPE ============
             case 'creategroup':
             case 'cgroup': {
-                if (!args[0]) {
-                    await socket.sendMessage(sender, { 
-                        text: `Usage: !${command} [Nom du groupe]\n\nVous pouvez aussi répondre à une image pour l'utiliser comme photo de profil.` 
+                const groupName = args.join(' ').replace(/@\d+/g, '').trim();
+                if (!groupName) {
+                    await socket.sendMessage(sender, {
+                        text: `Usage : ${prefix}${command} <nom du groupe> [@membre]\n\nLa commande doit inclure un membre à ajouter si elle est envoyée depuis le compte du bot.`
+                    }, { quoted: msg });
+                    break;
+                }
+                if (Array.from(groupName).length > 25) {
+                    await socket.sendMessage(sender, { text: '❌ Le nom du groupe doit contenir au maximum 25 caractères.' }, { quoted: msg });
+                    break;
+                }
+
+                const groupParticipant = resolveGroupCreationParticipant(msg, socket);
+                if (!groupParticipant) {
+                    await socket.sendMessage(sender, {
+                        text: '❌ Je n’ai pas pu identifier un membre valide à ajouter. Utilise .cgroup <nom> depuis ton compte, ou mentionne un membre si tu envoies la commande depuis le compte du bot.'
                     }, { quoted: msg });
                     break;
                 }
 
-                const groupName = args.join(' ');
-                await socket.sendMessage(sender, { text: "⏳ Création du groupe en cours..." }, { quoted: msg });
-
+                await socket.sendMessage(sender, { text: '⏳ Création du groupe en cours…' }, { quoted: msg });
                 try {
-                    // Créer le groupe
-                    const group = await socket.groupCreate(groupName, [sender]);
-                    
-                    let response = `✅ Groupe "${groupName}" créé avec succès !`;
+                    const group = await socket.groupCreate(groupName, [groupParticipant]);
+                    if (!group?.id) throw new Error('WhatsApp n’a pas renvoyé l’identifiant du nouveau groupe.');
 
-                    // Promouvoir le créateur en admin
+                    let response = `✅ Groupe *${groupName}* créé avec succès !`;
                     try {
-                        await socket.groupParticipantsUpdate(group.id, [sender], "promote");
-                        response += `\n\n👑 ${sender.split("@")[0]} a été promu admin automatiquement.`;
-                    } catch (e) {
-                        response += `\n\n(Échec de la promotion automatique en admin.)`;
+                        await socket.groupParticipantsUpdate(group.id, [groupParticipant], 'promote');
+                        response += `\n\n👑 @${groupParticipant.split('@')[0]} a été promu administrateur.`;
+                    } catch (error) {
+                        console.warn('[CGROUP] Promotion du participant impossible :', error?.message || error);
+                        response += '\n\n⚠️ Le groupe est créé, mais la promotion automatique a échoué.';
                     }
-
-                    // Générer le lien d'invitation
                     try {
                         const code = await socket.groupInviteCode(group.id);
-                        const inviteLink = `https://chat.whatsapp.com/${code}`;
-                        response += `\n\n*Lien d'invitation :* ${inviteLink}`;
-                    } catch (e) {
-                        response += `\n\n(Impossible de générer un lien d'invitation.)`;
+                        response += `\n\n🔗 Lien d’invitation : https://chat.whatsapp.com/${code}`;
+                    } catch (error) {
+                        console.warn('[CGROUP] Récupération du lien impossible :', error?.message || error);
+                        response += '\n\n⚠️ Le groupe est créé, mais WhatsApp n’a pas fourni le lien d’invitation.';
                     }
 
-                    // Gérer la photo de profil si disponible
-                    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
+                    const quotedMessage = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+                    if (quotedMessage?.imageMessage && typeof socket.updateProfilePicture === 'function') {
                         try {
-                            const mediaMsg = msg.message.extendedTextMessage.contextInfo.quotedMessage;
-                            const media = await socket.downloadMediaMessage(mediaMsg);
-                            await socket.updateProfilePicture(group.id, media);
-                            response += `\n\n🖼️ Photo de profil mise à jour !`;
-                        } catch (e) {
-                            console.error(e);
-                            response += `\n\n(Échec de la mise à jour de la photo de profil.)`;
+                            const stream = await downloadContentFromMessage(quotedMessage.imageMessage, 'image');
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+                            await socket.updateProfilePicture(group.id, Buffer.concat(chunks));
+                            response += '\n\n🖼️ Photo du groupe mise à jour.';
+                        } catch (error) {
+                            console.warn('[CGROUP] Photo du groupe non modifiée :', error?.message || error);
                         }
                     }
-
-                    await socket.sendMessage(sender, { text: response }, { quoted: msg });
-
-                } catch (e) {
-                    console.error(e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors de la création du groupe : ${e.message}` 
+                    await socket.sendMessage(sender, {
+                        text: response,
+                        mentions: [groupParticipant]
+                    }, { quoted: msg });
+                } catch (error) {
+                    console.error('[CGROUP] Création impossible :', error?.message || error);
+                    const detail = error?.output?.payload?.message || error?.message || 'erreur inconnue';
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur lors de la création du groupe : ${detail}`
                     }, { quoted: msg });
                 }
                 break;
@@ -10169,34 +10191,26 @@ END:VCARD`
       const infoTextCached = buildChannelInfoText(metadata, botName);
       // Envoi interactif depuis le cache
       const previewUrlCached = normalizePreviewUrl(metadata.preview);
-      const interactiveCached = {
-        viewOnceMessage: {
-          message: {
-            interactiveMessage: {
-              body: { text: infoTextCached },
-              footer: { text: `© ${botName}` },
-              header: previewUrlCached ? { imageMessage: { url: previewUrlCached } } : { title: "Channel Info" },
-              nativeFlowMessage: {
-                buttons: [
-                  {
-                    name: "cta_copy",
-                    buttonParamsJson: JSON.stringify({
-                      display_text: "📋 Copier l'ID",
-                      id: "copy_id",
-                      copy_code: metadata.id
-                    })
-                  }
-                ]
-              }
-            }
-          }
+      const interactiveCached = buildChannelInfoInteractiveMessage({
+        infoText: infoTextCached,
+        botName,
+        copyCode: metadata.id
+      });
+      if (previewUrlCached) {
+        try {
+          await socket.sendMessage(sender, {
+            image: { url: previewUrlCached },
+            caption: `📡 *${metadata.name || 'WhatsApp Channel'}*`
+          }, { quoted: shonux });
+        } catch (error) {
+          console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
         }
-      };
+      }
       try {
-        await socket.relayMessage(sender, interactiveCached.viewOnceMessage.message, { messageId: `cid_${inviteId}_${Date.now()}` });
+        await socket.relayMessage(sender, interactiveCached, { messageId: `cid_${inviteId}_${Date.now()}` });
       } catch (e) {
-        // fallback texte si relay échoue
-        await socket.sendMessage(sender, { text: infoTextCached }, { quoted: shonux });
+        console.warn('[CID] CTA copy indisponible; repli texte :', e?.message || e);
+        await socket.sendMessage(sender, { text: `${infoTextCached}\n\n🆔 ID à copier : \`${metadata.id}\`` }, { quoted: shonux });
       }
       break;
     }
@@ -10287,45 +10301,31 @@ END:VCARD`
     const infoText = buildChannelInfoText(normalized, botName);
     const previewUrl = normalizePreviewUrl(normalized.preview);
 
-    // --- Construire le message interactif avec bouton "copy"
-    const interactive = {
-      viewOnceMessage: {
-        message: {
-          interactiveMessage: {
-            body: { text: infoText },
-            footer: { text: `© ${botName}` },
-            header: previewUrl ? { imageMessage: { url: previewUrl } } : { title: "Channel Info" },
-            nativeFlowMessage: {
-              buttons: [
-                {
-                  name: "cta_copy",
-                  buttonParamsJson: JSON.stringify({
-                    display_text: "📋 Copier l'ID",
-                    id: "copy_id",
-                    copy_code: normalized.id
-                  })
-                }
-              ]
-            }
-          }
-        }
+    const interactive = buildChannelInfoInteractiveMessage({
+      infoText,
+      botName,
+      copyCode: normalized.id
+    });
+    if (previewUrl) {
+      try {
+        await socket.sendMessage(sender, {
+          image: { url: previewUrl },
+          caption: `📡 *${normalized.name || 'WhatsApp Channel'}*`
+        }, { quoted: shonux });
+      } catch (error) {
+        console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
       }
-    };
+    }
 
-    // --- Envoyer le message interactif (relay) ; fallback sur texte si échec
+    // L’en-tête reste textuel : une URL ne peut pas être fournie comme
+    // imageMessage brut dans un relay interactif; le bouton CTA copy est natif.
     try {
-      await socket.relayMessage(sender, interactive.viewOnceMessage.message, { messageId: `cid_${inviteId}_${Date.now()}` });
+      await socket.relayMessage(sender, interactive, { messageId: `cid_${inviteId}_${Date.now()}` });
     } catch (errRelay) {
-      console.warn('[CID] relay interactive failed, fallback to text', errRelay?.message || errRelay);
-      if (previewUrl) {
-        try {
-          await socket.sendMessage(sender, { image: { url: previewUrl }, caption: infoText }, { quoted: shonux });
-        } catch (e) {
-          await socket.sendMessage(sender, { text: infoText }, { quoted: shonux });
-        }
-      } else {
-        await socket.sendMessage(sender, { text: infoText }, { quoted: shonux });
-      }
+      console.warn('[CID] relay interactif indisponible, repli texte :', errRelay?.message || errRelay);
+      await socket.sendMessage(sender, {
+        text: `${infoText}\n\n🆔 ID à copier : \`${normalized.id}\``
+      }, { quoted: shonux });
     }
 
   } catch (err) {
@@ -11839,7 +11839,15 @@ router.get('/', async (req, res) => {
   await EmpirePair(sanitized, res, { forceFresh: wantsFreshPairing(req), source: 'dashboard' });
 });
 
-router.get('/code', async (req, res) => {
+router.options('/code', (req, res) => {
+  applyPairingCors(req, res);
+  return res.sendStatus(204);
+});
+
+router.get('/code', (req, res, next) => {
+  applyPairingCors(req, res);
+  next();
+}, async (req, res) => {
   const { number } = req.query;
   if (!number) return res.status(400).send({ error: 'Number parameter is required' });
   const sanitized = number.replace(/[^0-9]/g, '');

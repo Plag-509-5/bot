@@ -184,6 +184,40 @@ function checkWinner(board) {
   return board.every(cell => cell !== null) ? 'tie' : null;
 }
 
+function minimax(board, maximizing, depth = 0, botSymbol = 'O', humanSymbol = 'X') {
+  const outcome = checkWinner(board);
+  if (outcome === botSymbol) return 10 - depth;
+  if (outcome === humanSymbol) return depth - 10;
+  if (outcome === 'tie') return 0;
+
+  let best = maximizing ? -Infinity : Infinity;
+  for (let index = 0; index < board.length; index += 1) {
+    if (board[index] !== null) continue;
+    board[index] = maximizing ? botSymbol : humanSymbol;
+    const score = minimax(board, !maximizing, depth + 1, botSymbol, humanSymbol);
+    board[index] = null;
+    best = maximizing ? Math.max(best, score) : Math.min(best, score);
+  }
+  return best;
+}
+
+function chooseAiMove(board, botSymbol = 'O', humanSymbol = 'X') {
+  if (!Array.isArray(board) || board.length !== 9 || checkWinner(board)) return null;
+  let bestScore = -Infinity;
+  let bestIndex = null;
+  for (let index = 0; index < board.length; index += 1) {
+    if (board[index] !== null) continue;
+    board[index] = botSymbol;
+    const score = minimax(board, false, 1, botSymbol, humanSymbol);
+    board[index] = null;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  }
+  return bestIndex;
+}
+
 function parseMove(text) {
   const value = String(text || '').trim();
   // Accepte aussi le chiffre-clé emoji (ex. 1️⃣) affiché sur le plateau.
@@ -256,38 +290,67 @@ function scoreLine(symbol, player, score) {
   return `${symbol} @${playerTag(player)} — ${score.wins} ${wins}, ${score.losses} ${losses}, ${score.draws} ${draws}`;
 }
 
+function playerLabel(game, symbol) {
+  if (game.mode === 'solo' && symbol === 'O') return '🤖 Kaido IA';
+  return `@${playerTag(game.players[symbol])}`;
+}
+
+function gameMentions(game) {
+  return game.mode === 'solo'
+    ? mentionJids([game.players.X])
+    : mentionJids([game.players.X, game.players.O]);
+}
+
 function buildStartMessage(game) {
   const xTag = playerTag(game.players.X);
-  const oTag = playerTag(game.players.O);
   return [
-    '🎮 *TIC-TAC-TOE — PARTIE LANCÉE !* 🎮',
+    game.mode === 'solo' ? '🤖 *TIC-TAC-TOE SOLO — CONTRE KAIDO IA* 🤖' : '🎮 *TIC-TAC-TOE — PARTIE LANCÉE !* 🎮',
     '',
     `❌ *Joueur X :* @${xTag}`,
-    `⭕ *Joueur O :* @${oTag}`,
+    `⭕ *Joueur O :* ${playerLabel(game, 'O')}`,
     '',
     renderBoard(game.board),
     '',
     `👉 C’est au tour de ❌ @${xTag}.`,
-    '📌 Répondez simplement avec le numéro de la case (1 à 9).'
+    '📌 Réponds avec le numéro de la case (1 à 9).'
   ].join('\n');
 }
 
 function buildTurnMessage(game) {
-  const xTag = playerTag(game.players.X);
-  const oTag = playerTag(game.players.O);
   const current = game.players[game.turn];
   const symbol = game.turn === 'X' ? '❌' : '⭕';
   return [
-    '🎮 *TIC-TAC-TOE* 🎮',
+    game.mode === 'solo' ? '🤖 *TIC-TAC-TOE SOLO* 🤖' : '🎮 *TIC-TAC-TOE* 🎮',
     '',
     renderBoard(game.board),
     '',
-    `❌ *Joueur X :* @${xTag}`,
-    `⭕ *Joueur O :* @${oTag}`,
+    `❌ *Joueur X :* ${playerLabel(game, 'X')}`,
+    `⭕ *Joueur O :* ${playerLabel(game, 'O')}`,
     '',
-    `👉 C’est au tour de ${symbol} @${playerTag(current)}.`,
-    '📌 Répondez avec le numéro de la case (1 à 9).'
+    `👉 C’est au tour de ${symbol} ${playerLabel(game, game.turn)}.`,
+    '📌 Réponds avec le numéro de la case (1 à 9).'
   ].join('\n');
+}
+
+function buildFinalMessage(game, outcome, scores) {
+  const winner = outcome === 'tie' ? null : outcome;
+  const lines = [
+    game.mode === 'solo' ? '🤖 *TIC-TAC-TOE SOLO — FIN DE LA PARTIE* 🤖' : '🎮 *TIC-TAC-TOE — FIN DE LA PARTIE* 🎮',
+    '',
+    renderBoard(game.board),
+    ''
+  ];
+  if (outcome === 'tie') lines.push('🤝 *Match nul !* Bien joué.');
+  else lines.push(`🏆 *Victoire de ${playerLabel(game, winner)} !*`);
+  const scoreLineFor = (symbol, score) => {
+    if (game.mode !== 'solo' || symbol !== 'O') return scoreLine(symbol === 'X' ? '❌' : '⭕', game.players[symbol], score);
+    const wins = `victoire${score.wins === 1 ? '' : 's'}`;
+    const losses = `défaite${score.losses === 1 ? '' : 's'}`;
+    const draws = `nul${score.draws === 1 ? '' : 's'}`;
+    return `⭕ 🤖 Kaido IA — ${score.wins} ${wins}, ${score.losses} ${losses}, ${score.draws} ${draws}`;
+  };
+  lines.push('', '📊 *Bilan des joueurs*', scoreLineFor('X', scores.X), scoreLineFor('O', scores.O));
+  return lines.join('\n');
 }
 
 async function startTicTacToe(socket, msg, from, sender, opponentJid) {
@@ -338,7 +401,43 @@ async function startTicTacToe(socket, msg, from, sender, opponentJid) {
   try {
     return await socket.sendMessage(from, {
       text: buildStartMessage(game),
-      mentions: mentionJids([playerX, playerO])
+      mentions: gameMentions(game)
+    }, { quoted: msg });
+  } catch (error) {
+    state.games.delete(chat);
+    throw error;
+  }
+}
+
+async function startSoloTicTacToe(socket, msg, from, sender) {
+  const chat = normalizeChatJid(from);
+  const playerX = getCurrentSessionPlayer(socket, msg, sender);
+  if (!chat || !playerX) {
+    return socket.sendMessage(from, { text: '❌ Impossible d’identifier le propriétaire de la session.' }, { quoted: msg });
+  }
+  // Identité interne fictive : le compte de session est aussi celui que la
+  // personne contrôle sur son appareil lié, les rôles ne doivent donc pas se confondre.
+  const botJid = `kaido-ai-${getSelfJids(socket)[0]?.split('@')[0] || 'session'}@s.whatsapp.net`;
+  const botPlayer = { jid: botJid, aliases: [botJid] };
+
+  const state = getSessionState(socket);
+  if (state.games.has(chat)) {
+    return socket.sendMessage(from, {
+      text: '❌ Une partie est déjà active dans ce salon. Utilisez *.delttt* pour l’annuler.'
+    }, { quoted: msg });
+  }
+
+  const game = {
+    board: Array(9).fill(null),
+    players: { X: playerX, O: botPlayer },
+    turn: 'X',
+    mode: 'solo'
+  };
+  state.games.set(chat, game);
+  try {
+    return await socket.sendMessage(from, {
+      text: buildStartMessage(game),
+      mentions: gameMentions(game)
     }, { quoted: msg });
   } catch (error) {
     state.games.delete(chat);
@@ -386,42 +485,39 @@ async function handleTicTacToeMove(socket, msg, from, sender, text) {
   }
 
   game.board[index] = game.turn;
-  const outcome = checkWinner(game.board);
+  let outcome = checkWinner(game.board);
   if (outcome) {
-    const score = recordOutcome(state, chat, game, outcome);
+    const scores = recordOutcome(state, chat, game, outcome);
     state.games.delete(chat);
-    const mentions = mentionJids([game.players.X, game.players.O]);
-    const finalLines = [
-      '🎮 *TIC-TAC-TOE — FIN DE LA PARTIE* 🎮',
-      '',
-      renderBoard(game.board),
-      ''
-    ];
-
-    if (outcome === 'tie') {
-      finalLines.push('🤝 *Match nul !* Bien joué à vous deux.');
-    } else {
-      const winner = game.players[outcome];
-      finalLines.push(`🏆 *Victoire de @${playerTag(winner)} !*`);
-    }
-    finalLines.push(
-      '',
-      '📊 *Bilan des joueurs*',
-      scoreLine('❌', game.players.X, score.X),
-      scoreLine('⭕', game.players.O, score.O)
-    );
-
     await socket.sendMessage(from, {
-      text: finalLines.join('\n'),
-      mentions
+      text: buildFinalMessage(game, outcome, scores),
+      mentions: gameMentions(game)
     }, { quoted: msg });
     return true;
   }
 
-  game.turn = game.turn === 'X' ? 'O' : 'X';
+  if (game.mode === 'solo') {
+    game.turn = 'O';
+    const aiMove = chooseAiMove(game.board, 'O', 'X');
+    if (aiMove === null) return false;
+    game.board[aiMove] = 'O';
+    outcome = checkWinner(game.board);
+    if (outcome) {
+      const scores = recordOutcome(state, chat, game, outcome);
+      state.games.delete(chat);
+      await socket.sendMessage(from, {
+        text: buildFinalMessage(game, outcome, scores),
+        mentions: gameMentions(game)
+      }, { quoted: msg });
+      return true;
+    }
+    game.turn = 'X';
+  } else {
+    game.turn = game.turn === 'X' ? 'O' : 'X';
+  }
   await socket.sendMessage(from, {
     text: buildTurnMessage(game),
-    mentions: mentionJids([game.players.X, game.players.O])
+    mentions: gameMentions(game)
   }, { quoted: msg });
   return true;
 }
@@ -434,11 +530,13 @@ function deleteGame(socket, from) {
 
 module.exports = {
   checkWinner,
+  chooseAiMove,
   deleteGame,
   getTicTacToeStats,
   handleTicTacToeMove,
   normalizeJid,
   parseMove,
   renderBoard,
+  startSoloTicTacToe,
   startTicTacToe
 };
