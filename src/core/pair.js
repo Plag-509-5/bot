@@ -28,6 +28,7 @@ const {
   setupReplyPresenceWrapper
 } = require('../services/presence-mode');
 const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
+const { animeQuiz, formatQuizVerdict } = require('../services/anime-quiz');
 const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
@@ -129,7 +130,9 @@ const {
   getContentType,
   Browsers,
   fetchLatestWaWebVersion,
-  downloadContentFromMessage
+  downloadContentFromMessage,
+  decryptPollVote,
+  getKeyAuthor
 } = require('@whiskeysockets/baileys');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 // -------- Sessions MongoDB uniquement --------
@@ -1862,6 +1865,38 @@ function setupCommandHandlers(socket, number) {
       type = getContentType(msg.message);
     }
 
+    // Les votes Baileys sont chiffrés; le secret et l’identifiant du sondage
+    // sont conservés dans le quiz actif, sans ouvrir de connexion WhatsApp tierce.
+    const pollUpdate = msg.message?.pollUpdateMessage;
+    if (pollUpdate) {
+      const sessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const creationKey = pollUpdate.pollCreationMessageKey;
+      const state = animeQuiz.getState(sessionId, remoteJid);
+      const pollMessage = state?.question?.pollMessage;
+      const matchesPoll = state?.question?.poll
+        && pollMessage?.key?.id
+        && pollMessage.key.id === creationKey?.id
+        && pollMessage.key.remoteJid === remoteJid;
+      if (!matchesPoll || typeof decryptPollVote !== 'function' || typeof getKeyAuthor !== 'function') return;
+      const pollContent = unwrapAntideleteMessage(pollMessage.message).message || {};
+      const pollSecret = pollContent.messageContextInfo?.messageSecret;
+      const vote = pollUpdate.vote;
+      if (!pollSecret || !vote?.encPayload || !vote?.encIv) return;
+      try {
+        const myJid = jidNormalizedUser(socket.user?.id || '');
+        const decryptedVote = decryptPollVote(vote, {
+          pollEncKey: pollSecret,
+          pollCreatorJid: getKeyAuthor(creationKey, myJid),
+          pollMsgId: creationKey.id,
+          voterJid: getKeyAuthor(msg.key, myJid)
+        });
+        animeQuiz.submitPollVote(sessionId, remoteJid, getKeyAuthor(msg.key, myJid), decryptedVote.selectedOptions || []);
+      } catch (error) {
+        console.warn('[ANIME QUIZ] Déchiffrement du vote impossible :', error?.message || error);
+      }
+      return;
+    }
+
     // ── INTERCEPTION DES RÉACTIONS EMOJIS ASSOCIÉES À DES COMMANDES (.setcmd <cmd>, <emoji>) ──
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
@@ -2248,6 +2283,29 @@ function setupCommandHandlers(socket, number) {
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
     const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
+    const activeQuiz = animeQuiz.getState(sanitizedBot, remoteJid);
+    const looksLikePrefixedCommand = Boolean(prefix && String(body || '').trim().startsWith(prefix));
+    if (!msg.key.fromMe && !parsedCommand && !looksLikePrefixedCommand
+      && activeQuiz?.question && !activeQuiz.question.poll && !activeQuiz.question.resolved) {
+      const quizSender = msg.key.participant || remoteJid;
+      const answerResult = animeQuiz.submitTextAnswer(sanitizedBot, remoteJid, quizSender, body);
+      if (answerResult.handled) {
+        await wakeForCommand(socket, msg, cfg);
+        if (answerResult.correct) {
+          const verdictMessage = formatQuizVerdict(answerResult.verdict);
+          await socket.sendMessage(remoteJid, {
+            text: verdictMessage.text,
+            mentions: verdictMessage.mentions
+          }, { quoted: msg });
+        } else if (answerResult.notify) {
+          await socket.sendMessage(remoteJid, {
+            text: `❌ Pas tout à fait, @${String(quizSender).split('@')[0]}. Réessaie si le temps n’est pas écoulé !`,
+            mentions: [quizSender]
+          }, { quoted: msg });
+        }
+        return;
+      }
+    }
     const shouldUseChatbot = shouldRouteToChatbot({
       enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
       fromMe: msg.key.fromMe,
