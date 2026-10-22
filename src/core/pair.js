@@ -24,22 +24,11 @@ const {
   configEnabled,
   handleIgnoredMessage,
   wakeForCommand,
-  applyAlwaysOnlineSetting
+  applyAlwaysOnlineSetting,
+  setupReplyPresenceWrapper
 } = require('../services/presence-mode');
 const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
-const { getChatbotInput, extractMessageText, unwrapContent, findMediaType } = require('../services/chatbot-message');
-const {
-  appendWatchSample,
-  isHostMessage,
-  matchesPendingHostName,
-  cleanHostName,
-  formatChatbotReply,
-  recentBotReplyTracker: chatbotReplyTracker
-} = require('../services/chatbot-watch');
-const {
-  MAX_PROFILE_BYTES,
-  parseChatbotProfileText
-} = require('../services/chatbot-profile');
+const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
   collectMessageIdentifiers,
@@ -70,12 +59,6 @@ const {
   buildAntideleteHeader,
   sendRecoveredMessage
 } = require('../services/antidelete');
-const {
-  withCommandTheme,
-  activateCommandTheme,
-  isOniThemeEnabled,
-  setupCommandThemeWrapper
-} = require('../services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd');
 const {
@@ -241,20 +224,13 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_RECORDING: false,
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
   PREFIX: '.',
-  AUTO_ONLINE: true,
+  AUTO_ONLINE: false,
   ANTI_TAG_MODE: 'off',
   antistatusmention: false,
   antistatusmention_threshold: 2,
   MODE: 'public',
-  THEME: 'onigashima',
   SUDO_USERS: [],
   CHATBOT_ENABLED: false,
-  CHATBOT_HOST_NAME: '',
-  CHATBOT_HOST_IDENTITIES: [],
-  CHATBOT_PENDING_HOST_NAME: null,
-  CHATBOT_WATCH_ENABLED: false,
-  CHATBOT_WATCH_SAMPLES: [],
-  CHATBOT_PROFILE_IMPORT_PENDING: false,
   STATUS_REPLY_FORWARD_ENABLED: false,
   STATUS_REPLY_KEYWORDS: []
 };
@@ -624,34 +600,6 @@ async function setUserConfigInMongo(number, conf) {
     return true;
   } catch (e) {
     console.error('setUserConfigInMongo', e);
-    return false;
-  }
-}
-
-async function setUserConfigFieldsInMongo(number, fields) {
-  try {
-    await initMongo();
-    const sanitized = String(number || '').replace(/[^0-9]/g, '');
-    if (!sanitized || !fields || typeof fields !== 'object') throw new Error('Numéro de session ou champs invalides');
-    const updates = { number: sanitized, updatedAt: new Date() };
-    for (const [key, value] of Object.entries(fields)) {
-      if (!/^[A-Z0-9_]+$/.test(key)) continue;
-      updates[`config.${key}`] = value;
-    }
-    if (Object.keys(updates).length <= 2) return false;
-    await configsCol.updateOne({ number: sanitized }, { $set: updates }, { upsert: true });
-    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
-    sessionConfigRefreshAfter.delete(sanitized);
-    const cached = sessionConfigCache.get(sanitized);
-    if (cached?.value) {
-      cached.value = { ...cached.value, ...fields };
-      cached.expiresAt = Date.now() + SESSION_CONFIG_CACHE_TTL_MS;
-    } else {
-      sessionConfigCache.delete(sanitized);
-    }
-    return true;
-  } catch (error) {
-    console.error('setUserConfigFieldsInMongo', error);
     return false;
   }
 }
@@ -1360,7 +1308,7 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     const cfg = await loadSessionConfigMerged(sessionId);
 
     try {
-      await applyAlwaysOnlineSetting(socket, true, message.key.remoteJid);
+      await applyAlwaysOnlineSetting(socket, false, message.key.remoteJid);
       if (configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
@@ -1796,9 +1744,6 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
       chatJid: remoteJid,
       senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
       text: input,
-      hostName: sessionConfig.CHATBOT_HOST_NAME,
-      watchEnabled: configEnabled(sessionConfig.CHATBOT_WATCH_ENABLED, false),
-      watchSamples: sessionConfig.CHATBOT_WATCH_SAMPLES,
       isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
       onStart: async () => {
         presenceStarted = true;
@@ -1809,9 +1754,8 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
       }
     });
     if (result.cancelled) return true;
-    chatbotReplyTracker.mark(sessionNumber, remoteJid, result.text);
     await socket.sendMessage(remoteJid, {
-      text: formatChatbotReply(result.text, sessionConfig.CHATBOT_HOST_NAME)
+      text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
     }, { quoted: msg });
   } catch (error) {
     console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
@@ -1876,7 +1820,7 @@ function setupCommandHandlers(socket, number) {
     // commandes après chaque reconnexion. Baileys signale les nouveaux messages
     // par `notify`; on garde les compteurs d'historique pour le diagnostic.
     if (type === 'append') return;
-    void dispatcher.processBatch(messages, msg => withCommandTheme(async () => {
+    void dispatcher.processBatch(messages, async msg => {
       if (!msg?.message || !msg?.key?.remoteJid) return;
 
     const remoteJid = msg.key.remoteJid;
@@ -1972,7 +1916,6 @@ function setupCommandHandlers(socket, number) {
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
         const cmdArgs = fullCmdStr.split(' ').slice(1);
-        activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
         const quotedParticipant = targetMsg?.key?.participant
@@ -2114,7 +2057,6 @@ function setupCommandHandlers(socket, number) {
           ? 'tostatus'
           : isStyledAudioSelection ? 'style' : 'swgc';
         const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
-        activateCommandTheme(selectionCommand, isOniThemeEnabled(cfg.THEME));
         await wakeForCommand(socket, msg, cfg);
 
         if (selection.status === 'selected' && isStatusAudienceSelection) {
@@ -2277,67 +2219,6 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Le profil TXT est importé uniquement depuis un message privé de l’hôte,
-    // et uniquement pendant la fenêtre explicitement ouverte à la réactivation.
-    const profileSender = msg.key.participant || remoteJid;
-    const profileSenderNumber = String(profileSender || '').split('@')[0].split(':')[0];
-    const profileSenderIds = collectMessageIdentifiers(msg, profileSender, profileSenderNumber);
-    if (configEnabled(cfg.CHATBOT_PROFILE_IMPORT_PENDING, false)
-        && !msg.key.fromMe && isHostMessage(cfg, [...profileSenderIds])) {
-      const profileContent = unwrapContent(msg.message);
-      const profileDocument = profileContent.documentMessage;
-      if (profileDocument) {
-        const replyJid = remoteJid;
-        if (remoteJid.endsWith('@g.us')) {
-          await socket.sendMessage(profileSender, {
-            text: 'Pour protéger ton profil, renvoie le fichier TXT au bot dans un chat privé.'
-          });
-          return;
-        }
-        const isTextProfile = /\.txt$/i.test(String(profileDocument.fileName || ''))
-          || String(profileDocument.mimetype || '').toLowerCase() === 'text/plain';
-        if (!isTextProfile) {
-          await socket.sendMessage(replyJid, {
-            text: '❌ Le profil doit être renvoyé comme fichier TXT (`kaido-profil.txt`).'
-          });
-          return;
-        }
-        try {
-          const stream = await downloadContentFromMessage(profileDocument, 'document');
-          const chunks = [];
-          let size = 0;
-          let oversized = false;
-          for await (const chunk of stream) {
-            const buffer = Buffer.from(chunk);
-            size += buffer.length;
-            if (size > MAX_PROFILE_BYTES) {
-              oversized = true;
-              break;
-            }
-            chunks.push(buffer);
-          }
-          if (oversized) throw new Error('Le fichier dépasse la taille autorisée.');
-          const profile = parseChatbotProfileText(Buffer.concat(chunks));
-          const saved = await setUserConfigFieldsInMongo(sanitizedBot, {
-            CHATBOT_HOST_NAME: profile.hostName,
-            CHATBOT_WATCH_ENABLED: profile.watchEnabled,
-            CHATBOT_WATCH_SAMPLES: profile.watchSamples,
-            CHATBOT_PROFILE_IMPORT_PENDING: false
-          });
-          if (!saved) throw new Error('Enregistrement MongoDB impossible.');
-          await socket.sendMessage(replyJid, {
-            text: `✅ Profil TXT restauré. ${profile.watchSamples.length} exemple(s) Watch chargé(s); Watch est ${profile.watchEnabled ? 'activé' : 'désactivé'}.`
-          });
-          return;
-        } catch (error) {
-          await socket.sendMessage(replyJid, {
-            text: `❌ Profil TXT non restauré : ${error?.message || 'fichier invalide'}. Réessaie avec le fichier original reçu lors de la désactivation.`
-          });
-          return;
-        }
-      }
-    }
-
     // En mode chatbot, les messages média sont décrits sans téléverser leurs
     // octets; hors mode chatbot ils restent ignorés comme auparavant.
     const autoChatbotInput = configEnabled(cfg.CHATBOT_ENABLED, false) && !msg.key.fromMe
@@ -2367,48 +2248,7 @@ function setupCommandHandlers(socket, number) {
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
     const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
-    const commandLike = Boolean(prefix && String(body || '').trimStart().startsWith(prefix));
-    const observedSender = msg.key.fromMe ? normalizedBotJid : (msg.key.participant || remoteJid);
-    const observedNumber = String(observedSender || '').split('@')[0].split(':')[0];
-    const observedIdentities = collectMessageIdentifiers(msg, observedSender, observedNumber);
-    const isChatbotHost = isHostMessage(cfg, [...observedIdentities]);
-
-    const pendingName = cfg.CHATBOT_PENDING_HOST_NAME;
-    if (!isRegisteredCommand && !commandLike && pendingName
-        && matchesPendingHostName(pendingName, { chatJid: remoteJid, identities: [...observedIdentities] })) {
-      const pendingContent = unwrapContent(msg.message);
-      const pendingText = findMediaType(pendingContent) ? '' : extractMessageText(pendingContent);
-      const hostName = cleanHostName(pendingText);
-      if (hostName) {
-        const fields = {
-          CHATBOT_HOST_NAME: hostName,
-          CHATBOT_HOST_IDENTITIES: Array.isArray(pendingName.identities) ? pendingName.identities : [],
-          CHATBOT_PENDING_HOST_NAME: null,
-          ...(pendingName.enableAfterName ? { CHATBOT_ENABLED: true } : {})
-        };
-        const saved = await setUserConfigFieldsInMongo(sanitizedBot, fields);
-        await socket.sendMessage(remoteJid, {
-          text: saved
-            ? `✅ Nom de l’hôte enregistré dans MongoDB : *${hostName}*.${pendingName.enableAfterName ? ' Kaido est maintenant activé.' : ''}`
-            : '❌ Je n’ai pas pu enregistrer ton nom dans MongoDB; réessaie avec `.kaido name <nom>`. '
-        }, { quoted: msg });
-        return;
-      }
-    }
-
-    if (configEnabled(cfg.CHATBOT_ENABLED, false) && configEnabled(cfg.CHATBOT_WATCH_ENABLED, false) && isChatbotHost
-        && !isRegisteredCommand && !commandLike
-        && !(msg.key.fromMe && chatbotReplyTracker.consume(sanitizedBot, remoteJid, extractMessageText(unwrapContent(msg.message))))) {
-      const watchContent = unwrapContent(msg.message);
-      const watchText = findMediaType(watchContent) ? '' : extractMessageText(watchContent);
-      const learned = appendWatchSample(cfg.CHATBOT_WATCH_SAMPLES, watchText);
-      if (learned.changed) {
-        const saved = await setUserConfigFieldsInMongo(sanitizedBot, { CHATBOT_WATCH_SAMPLES: learned.samples });
-        if (!saved) console.warn(`[CHATBOT WATCH] Échantillon non enregistré pour la session ${sanitizedBot}.`);
-      }
-    }
-
-    const shouldUseChatbot = !isChatbotHost && shouldRouteToChatbot({
+    const shouldUseChatbot = shouldRouteToChatbot({
       enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
       fromMe: msg.key.fromMe,
       parsedCommand,
@@ -2430,10 +2270,6 @@ function setupCommandHandlers(socket, number) {
       return;
     }
     const { command, args } = parsedCommand;
-    // Toutes les réponses textuelles produites dans ce contexte adoptent le
-    // thème Onigashima. AsyncLocalStorage isole les commandes concurrentes.
-    activateCommandTheme(command, isOniThemeEnabled(cfg.THEME));
-
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
     const sender = from;
@@ -2481,8 +2317,8 @@ function setupCommandHandlers(socket, number) {
       return;
     }
 
-    // Les commandes peuvent être marquées comme lues; la présence reste déjà
-    // disponible et n'est plus basculée hors ligne après leur exécution.
+    // Marquer la commande comme lue sans afficher la présence; seuls les
+    // envois de réponse repassent temporairement le socket en ligne.
     await wakeForCommand(socket, msg, sessionCfg);
     // Évite les écritures de logs synchrones et l’exposition du contenu privé
     // à chaque commande; le détail n’est activé qu’en mode debug.
@@ -2539,7 +2375,6 @@ function setupCommandHandlers(socket, number) {
         activeSockets,
         loadUserConfigFromMongo,
         setUserConfigInMongo,
-        setUserConfigFieldsInMongo,
         getPluginsByCategory,
         getAllPluginsList,
         getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
@@ -4619,18 +4454,18 @@ case 'config': {
       case 'online': {
         const val = (args[1] || '').toLowerCase();
         if (val === 'on' || val === 'off') {
-          // Ancienne option conservée pour compatibilité : le mode indisponible
-          // après une commande a été retiré, et la session reste toujours en ligne.
-          cfg.AUTO_ONLINE = true;
+          // L’état inactif reste hors ligne; seule chaque réponse du bot annonce
+          // temporairement sa disponibilité. `on` est gardé comme alias historique.
+          cfg.AUTO_ONLINE = false;
           await setUserConfigInMongo(sanitized, cfg);
-          await applyAlwaysOnlineSetting(socket, true, sender);
+          await applyAlwaysOnlineSetting(socket, false, sender);
           await socket.sendMessage(sender, {
             text: val === 'off'
-              ? 'ℹ️ Le mode hors ligne a été retiré. La session reste disponible en permanence.'
-              : '✅ Présence en ligne permanente activée.'
+              ? '✅ Kaido restera hors ligne lorsqu’il ne répond pas.'
+              : 'ℹ️ La présence en ligne permanente est désactivée; Kaido ne sera visible que pendant ses réponses.'
           }, { quoted: msg });
         } else {
-          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off (off est conservé pour compatibilité)` }, { quoted: msg });
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline off` }, { quoted: msg });
         }
         break;
       }
@@ -4676,7 +4511,7 @@ case 'config': {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
-          AUTO_ONLINE: true,
+          AUTO_ONLINE: false,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
           PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
@@ -4686,7 +4521,7 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
-          `AUTO_ONLINE: ON (permanent) — le mode OFFLINE est retiré`,
+          `AUTO_ONLINE: OFF — Kaido est visible uniquement pendant ses réponses`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
           `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
@@ -11091,7 +10926,7 @@ case 'resetconfig': {
       console.error('Command handler error:', err);
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
-    }), (error, { index, message, queueDelayMs, processingDurationMs } = {}) => {
+    }, (error, { index, message, queueDelayMs, processingDurationMs } = {}) => {
       if (batchStats) {
         if (Number.isFinite(queueDelayMs)) {
           batchStats.lastQueueDelayMs = queueDelayMs;
@@ -11122,8 +10957,8 @@ case 'resetconfig': {
 // ---------------- message handlers ----------------
 
 function setupMessageHandlers() {
-  // La disponibilité est maintenue à l'ouverture du socket Baileys. Ce handler
-  // ne doit ni envoyer unavailable ni modifier la présence des messages ignorés.
+  // Le socket reste unavailable au repos. setupReplyPresenceWrapper ne publie
+  // une présence available que pendant un sendMessage, puis revient offline.
 }
 
 // ---------------- cleanup helper ----------------
@@ -11516,7 +11351,6 @@ async function EmpirePair(number, res, options = {}) {
   }
   const { state } = auth;
   authStates.set(sanitizedNumber, auth);
-  const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
   let socket = null;
 
  try {
@@ -11561,7 +11395,7 @@ async function EmpirePair(number, res, options = {}) {
       printQRInTerminal: false,
       logger,
       keepAliveIntervalMs: SESSION_KEEPALIVE_INTERVAL_MS,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,
       browser: WA_BROWSER
     });
 
@@ -11592,8 +11426,8 @@ const pairingReadyResult = socket.authState.creds.registered
 // Les wrappers fonctionnels sont installés avant le garde-fou afin que
 // safe-send vérifie l'état Baileys avant toute traduction ou autre travail.
 await setupTranslationWrapper(socket, sanitizedNumber);
-setupCommandThemeWrapper(socket);
 installSafeSend(socket);
+setupReplyPresenceWrapper(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
@@ -11699,7 +11533,7 @@ handleMessageRevocation(socket, sanitizedNumber);
           await auth.saveCreds();
           await addNumberToMongo(sanitizedNumber);
 
-          await applyAlwaysOnlineSetting(socket, true);
+          await applyAlwaysOnlineSetting(socket, false);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -11785,7 +11619,7 @@ Le bot est maintenant connecté et fonctionnel.`,
             console.error('Failed during connect-message edit sequence:', e);
           }
 
-          await applyAlwaysOnlineSetting(socket, true);
+          await applyAlwaysOnlineSetting(socket, false);
 
         } catch (e) {
           // Ne JAMAIS redémarrer tout le processus ici : ça tuerait toutes les

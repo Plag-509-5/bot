@@ -10,6 +10,7 @@ const {
   handleIgnoredMessage,
   wakeForCommand,
   applyAlwaysOnlineSetting,
+  setupReplyPresenceWrapper,
   _test
 } = require('../src/services/presence-mode');
 const pairSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
@@ -19,47 +20,77 @@ function fakeSocket() {
   return {
     events,
     async sendPresenceUpdate(value, jid) { events.push(['presence', value, jid]); },
-    async readMessages(keys) { events.push(['read', keys]); }
+    async readMessages(keys) { events.push(['read', keys]); },
+    async sendMessage(jid, content) { events.push(['send', jid, content]); return { key: { id: 'sent' } }; }
   };
 }
 
 const msg = { key: { id: 'm1', remoteJid: 'chat@s.whatsapp.net', fromMe: false } };
 
-test('un message ordinaire ignoré ne met jamais la présence hors ligne et n’est pas marqué lu', async () => {
+test('un message ignoré ne met pas la présence en ligne et n’est pas marqué lu', async () => {
   const socket = fakeSocket();
   assert.equal(await handleIgnoredMessage(socket, msg, { AUTO_ONLINE: false }), false);
   assert.deepEqual(socket.events, []);
 });
 
-test('les commandes peuvent être lues sans minuterie qui repasse la session hors ligne', async () => {
+test('la préparation d’une commande marque le message lu sans exposer la présence', async () => {
   const socket = fakeSocket();
   await wakeForCommand(socket, msg, { AUTO_ONLINE: false, AUTO_RECORDING: false });
-  assert.equal(socket.events[0][0], 'read');
-  assert.deepEqual(socket.events[1], ['presence', 'available', 'chat@s.whatsapp.net']);
-  assert.equal(socket.events.some(event => event[1] === 'unavailable'), false);
+  assert.deepEqual(socket.events, [['read', [msg.key]]]);
 });
 
-test('alwaysonline off est rétrocompatible mais ne peut plus envoyer unavailable', async () => {
+test('alwaysonline off impose unavailable et on reste une option explicite', async () => {
   const socket = fakeSocket();
-  assert.equal(await applyAlwaysOnlineSetting(socket, 'on'), true);
-  assert.equal(await applyAlwaysOnlineSetting(socket, 'off'), true);
-  assert.deepEqual(socket.events.map(event => event[1]), ['available']);
-  assert.equal(await setSessionPresence(socket, false, 'chat@s.whatsapp.net'), false);
-  assert.equal(socket.events.some(event => event[1] === 'unavailable'), false);
+  assert.equal(await applyAlwaysOnlineSetting(socket, false), true);
+  assert.equal(await applyAlwaysOnlineSetting(socket, true), true);
+  assert.equal(await applyAlwaysOnlineSetting(socket, false), true);
+  assert.deepEqual(socket.events.map(event => event[1]), ['unavailable', 'available', 'unavailable']);
 });
 
-test('la présence available redondante est dédupliquée par socket et JID', async () => {
+test('chaque réponse passe temporairement en available puis revient unavailable', async () => {
   const socket = fakeSocket();
-  assert.equal(await setSessionPresence(socket, true, 'chat@s.whatsapp.net'), true);
-  assert.equal(await setSessionPresence(socket, true, 'chat@s.whatsapp.net'), true);
-  assert.equal(socket.events.length, 1);
+  setupReplyPresenceWrapper(socket);
+  await socket.sendMessage('chat@s.whatsapp.net', { text: 'réponse' });
+  assert.deepEqual(socket.events.map(event => event[1]), ['available', 'chat@s.whatsapp.net', 'unavailable']);
   _test.clearPresenceCache(socket);
 });
 
-test('les sockets Baileys sont marqués disponibles dès la connexion, sans présence offline par commande', () => {
-  assert.match(pairSource, /markOnlineOnConnect:\s*true/);
-  assert.match(pairSource, /await applyAlwaysOnlineSetting\(socket, true\)/);
-  assert.doesNotMatch(pairSource, /markOnlineOnConnect:\s*configEnabled/);
+test('les envois concurrents restent disponibles jusqu’à la fin du dernier envoi', async () => {
+  const events = [];
+  let finishFirst;
+  let finishSecond;
+  let startedCount = 0;
+  let markBothStarted;
+  const bothStarted = new Promise(resolve => { markBothStarted = resolve; });
+  const socket = {
+    async sendPresenceUpdate(value) { events.push(['presence', value]); },
+    sendMessage(_jid, content) {
+      events.push(['start', content.text]);
+      startedCount += 1;
+      if (startedCount === 2) markBothStarted();
+      return new Promise(resolve => {
+        if (content.text === 'one') finishFirst = resolve;
+        else finishSecond = resolve;
+      });
+    }
+  };
+  setupReplyPresenceWrapper(socket);
+  const first = socket.sendMessage('chat', { text: 'one' });
+  const second = socket.sendMessage('chat', { text: 'two' });
+  await bothStarted;
+  finishFirst('one');
+  await first;
+  assert.equal(events.some(event => event[0] === 'presence' && event[1] === 'unavailable'), false);
+  finishSecond('two');
+  await second;
+  assert.deepEqual(events.filter(event => event[0] === 'presence').map(event => event[1]), ['available', 'unavailable']);
+});
+
+test('les sockets démarrent hors ligne et installent le wrapper après safe-send', () => {
+  assert.match(pairSource, /markOnlineOnConnect:\s*false/);
+  const safeAt = pairSource.indexOf('installSafeSend(socket)');
+  const presenceAt = pairSource.indexOf('setupReplyPresenceWrapper(socket)');
+  assert.ok(safeAt > 0 && presenceAt > safeAt);
 });
 
 test('normalise les valeurs booléennes de configuration', () => {

@@ -2,8 +2,6 @@
 
 const { createAiMemory } = require('./ai-memory');
 const { createAiRouter, AiRouterError } = require('./ai-router');
-const { buildChatbotStyleInstruction } = require('./chatbot-watch');
-
 const KAIDO_SYSTEM_PROMPT = [
   'Tu es Kaido, le Roi des Bêtes, la personnalité conversationnelle intégrée à Kaido-MD.',
   'Tu es imposant, fier, direct, sûr de toi et énergique, avec un humour sec; sous cette force, tu restes loyal, protecteur et utile.',
@@ -133,7 +131,7 @@ function createAiChatbot(options = {}) {
     return `${session}::${chat}`;
   }
 
-  async function respond({ sessionNumber, chatJid, senderName, text, hostName, watchEnabled, watchSamples, onStart, isActive } = {}) {
+  async function respond({ sessionNumber, chatJid, senderName, text, onStart, isActive } = {}) {
     const session = cleanSessionNumber(sessionNumber);
     const key = conversationKey(session, chatJid);
     const messageText = String(text || '').replace(/\u0000/g, '').trim().slice(0, maxInputChars);
@@ -157,12 +155,8 @@ function createAiChatbot(options = {}) {
       }
       if (!(await stillCurrent())) return { cancelled: true, text: '', provider: '', model: '', conversationKey: key };
 
-      const styleInstruction = buildChatbotStyleInstruction({ hostName, watchEnabled, watchSamples });
-      const systemPrompt = styleInstruction
-        ? `${KAIDO_SYSTEM_PROMPT}\n\n${styleInstruction}`
-        : KAIDO_SYSTEM_PROMPT;
       const messages = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: KAIDO_SYSTEM_PROMPT },
         ...memory.getMessages(key),
         { role: 'user', content: userContent }
       ];
