@@ -16,11 +16,13 @@ const LOCALE_DIR = path.join(__dirname, '../locales');
 
 let initMongoProvider = null;
 let getDbProvider = null;
+let sessionConfigProvider = null;
 let languageLookupTimeoutMs = DEFAULT_LANGUAGE_LOOKUP_TIMEOUT_MS;
 const languageCache = new Map();
 const languageLoads = new Map();
+const fontThemeCache = new Map();
+const fontThemeLoads = new Map();
 const localeCache = new Map();
-let styleSequence = 0;
 
 function normaliseSessionId(sessionId) {
   return String(sessionId || '').replace(/[^0-9]/g, '');
@@ -180,7 +182,85 @@ const SMALL_CAPS = Object.freeze({
   j: 'ᴊ', k: 'ᴋ', l: 'ʟ', m: 'ᴍ', n: 'ɴ', o: 'ᴏ', p: 'ᴘ', q: 'ǫ', r: 'ʀ',
   s: 's', t: 'ᴛ', u: 'ᴜ', v: 'ᴠ', w: 'ᴡ', x: 'x', y: 'ʏ', z: 'ᴢ'
 });
-const FONT_STYLES = Object.freeze(['sans-bold', 'small-caps', 'serif-bold', 'typewriter']);
+const FONT_THEME_OPTIONS = Object.freeze({
+  a: Object.freeze({ style: 'small-caps', label: 'Small Caps' }),
+  b: Object.freeze({ style: 'sans-bold', label: 'Sans Bold' }),
+  c: Object.freeze({ style: 'serif-bold', label: 'Serif Bold' }),
+  d: Object.freeze({ style: 'typewriter', label: 'Typewriter' })
+});
+const DEFAULT_FONT_THEME = 'b';
+const FONT_THEME_CACHE_TTL_MS = 5 * 60 * 1000;
+const FONT_THEME_ERROR_TTL_MS = 30 * 1000;
+const FONT_THEME_CACHE_MAX_ENTRIES = 500;
+
+function normaliseFontTheme(value) {
+  const code = String(value || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(FONT_THEME_OPTIONS, code) ? code : DEFAULT_FONT_THEME;
+}
+
+function rememberFontTheme(sessionId, theme, ttlMs = FONT_THEME_CACHE_TTL_MS) {
+  if (!sessionId) return;
+  fontThemeCache.delete(sessionId);
+  fontThemeCache.set(sessionId, { theme: normaliseFontTheme(theme), expiresAt: Date.now() + Math.max(0, ttlMs) });
+  while (fontThemeCache.size > FONT_THEME_CACHE_MAX_ENTRIES) {
+    fontThemeCache.delete(fontThemeCache.keys().next().value);
+  }
+}
+
+function getCachedFontTheme(sessionId) {
+  const entry = fontThemeCache.get(sessionId);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    fontThemeCache.delete(sessionId);
+    return null;
+  }
+  fontThemeCache.delete(sessionId);
+  fontThemeCache.set(sessionId, entry);
+  return entry.theme;
+}
+
+function primeSessionFontTheme(sessionId) {
+  const key = normaliseSessionId(sessionId);
+  if (!key) return Promise.resolve(DEFAULT_FONT_THEME);
+  const cached = getCachedFontTheme(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = fontThemeLoads.get(key);
+  if (pending) return pending.promise;
+  const token = Symbol(key);
+  const promise = withTimeout(
+    sessionConfigProvider ? Promise.resolve().then(() => sessionConfigProvider(key)) : Promise.resolve(null),
+    languageLookupTimeoutMs,
+    null
+  )
+    .then(config => {
+      const theme = normaliseFontTheme(config?.FONT_THEME);
+      if (fontThemeLoads.get(key)?.token === token) {
+        rememberFontTheme(key, theme, config ? FONT_THEME_CACHE_TTL_MS : FONT_THEME_ERROR_TTL_MS);
+      }
+      return theme;
+    })
+    .catch(() => {
+      if (fontThemeLoads.get(key)?.token === token) rememberFontTheme(key, DEFAULT_FONT_THEME, FONT_THEME_ERROR_TTL_MS);
+      return DEFAULT_FONT_THEME;
+    })
+    .finally(() => {
+      if (fontThemeLoads.get(key)?.token === token) fontThemeLoads.delete(key);
+    });
+  fontThemeLoads.set(key, { token, promise });
+  return promise;
+}
+
+function setSessionFontTheme(sessionId, theme) {
+  const key = normaliseSessionId(sessionId);
+  if (!key) throw new Error('Numéro de session invalide');
+  const code = String(theme || '').trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(FONT_THEME_OPTIONS, code)) {
+    throw new TypeError(`Thème indisponible. Choisis : ${Object.keys(FONT_THEME_OPTIONS).join(', ')}.`);
+  }
+  fontThemeLoads.delete(key);
+  rememberFontTheme(key, code);
+  return code;
+}
 
 function mapStyledCharacter(character, style) {
   const code = character.codePointAt(0);
@@ -225,10 +305,10 @@ function styleStaticText(value, style) {
 function formatStaticContent(content, language, style) {
   if (!content || typeof content !== 'object') return content;
   const translated = { ...content };
-  // Style/localize textual bot replies only. Media captions can contain user or
-  // API-provided text, so leave them byte-for-byte unchanged.
-  if (typeof translated.text === 'string' && translated.text) {
-    translated.text = styleStaticText(translateStaticText(translated.text, language), style);
+  for (const field of ['text', 'caption']) {
+    if (typeof translated[field] === 'string' && translated[field]) {
+      translated[field] = styleStaticText(translateStaticText(translated[field], language), style);
+    }
   }
   return translated;
 }
@@ -240,7 +320,10 @@ function setupTranslationWrapper(socket, number, options = {}) {
   const lookupTimeoutMs = Number.isFinite(options.languageLookupTimeoutMs)
     ? Math.max(0, options.languageLookupTimeoutMs)
     : languageLookupTimeoutMs;
-  if (sessionId) void primeSessionLanguage(sessionId, lookupTimeoutMs);
+  if (sessionId) {
+    void primeSessionLanguage(sessionId, lookupTimeoutMs);
+    void primeSessionFontTheme(sessionId);
+  }
 
   socket.sendMessage = async (jid, content, sendOptions = {}) => {
     const { [SKIP_FORMATTING_OPTION]: skipFormatting, ...safeOptions } = sendOptions || {};
@@ -250,16 +333,18 @@ function setupTranslationWrapper(socket, number, options = {}) {
       language = getCachedLanguage(sessionId) || DEFAULT_LANGUAGE;
       if (!getCachedLanguage(sessionId)) void primeSessionLanguage(sessionId, lookupTimeoutMs);
     }
-    const hasTextReply = typeof content?.text === 'string' && Boolean(content.text);
-    const style = FONT_STYLES[hasTextReply ? styleSequence++ % FONT_STYLES.length : 0];
+    const themeCode = sessionId ? getCachedFontTheme(sessionId) || DEFAULT_FONT_THEME : DEFAULT_FONT_THEME;
+    if (sessionId && !getCachedFontTheme(sessionId)) void primeSessionFontTheme(sessionId);
+    const style = FONT_THEME_OPTIONS[themeCode].style;
     return originalSendMessage(jid, formatStaticContent(content, language, style), safeOptions);
   };
   Object.defineProperty(socket, TRANSLATION_WRAPPER_MARK, { value: true, enumerable: false });
 }
 
-function configureTranslationStorage({ initMongo, getDb, languageLookupTimeoutMs: timeoutMs } = {}) {
+function configureTranslationStorage({ initMongo, getDb, getSessionConfig, languageLookupTimeoutMs: timeoutMs } = {}) {
   initMongoProvider = typeof initMongo === 'function' ? initMongo : null;
   getDbProvider = typeof getDb === 'function' ? getDb : null;
+  sessionConfigProvider = typeof getSessionConfig === 'function' ? getSessionConfig : null;
   if (Number.isFinite(timeoutMs)) languageLookupTimeoutMs = Math.max(0, timeoutMs);
 }
 
@@ -267,21 +352,29 @@ module.exports = {
   COLLECTION_NAME,
   DEFAULT_LANGUAGE,
   SUPPORTED_LANGUAGES,
+  FONT_THEME_OPTIONS,
+  DEFAULT_FONT_THEME,
   SKIP_FORMATTING_OPTION,
   DEFAULT_LANGUAGE_CACHE_TTL_MS,
   DEFAULT_LANGUAGE_LOOKUP_TIMEOUT_MS,
   configureTranslationStorage,
   saveSessionLanguage,
   getSessionLanguage,
+  setSessionFontTheme,
   setupTranslationWrapper,
   _test: {
     clearCache() {
       languageCache.clear();
       languageLoads.clear();
+      fontThemeCache.clear();
+      fontThemeLoads.clear();
       localeCache.clear();
-      styleSequence = 0;
     },
     cacheLanguage: rememberLanguage,
+    cacheFontTheme: rememberFontTheme,
+    getCachedFontTheme,
+    primeSessionFontTheme,
+    normaliseFontTheme,
     getCachedLanguage,
     translateStaticText,
     styleStaticText,

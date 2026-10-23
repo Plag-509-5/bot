@@ -9,6 +9,7 @@ const {
   normaliseEmojiList,
   resolveNewsletterEmojis,
   parseNewsletterMessageReference,
+  resolveNewsletterJid,
   extractNewsletterServerId,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
@@ -26,11 +27,11 @@ test('normalise le même JID pour le dashboard et la commande cfn', () => {
 test('analyse les références de publication depuis un lien ou un JID de chaîne', () => {
   assert.deepEqual(
     parseNewsletterMessageReference('https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175?text=hello'),
-    { jid: '0029Vb761O39mrGTZvQ8UQ02@newsletter', serverId: '175' }
+    { jid: '0029Vb761O39mrGTZvQ8UQ02@newsletter', serverId: '175', channelKey: '0029Vb761O39mrGTZvQ8UQ02' }
   );
   assert.deepEqual(
     parseNewsletterMessageReference('120363402094635383@newsletter/987654'),
-    { jid: '120363402094635383@newsletter', serverId: '987654' }
+    { jid: '120363402094635383@newsletter', serverId: '987654', channelKey: '120363402094635383@newsletter' }
   );
   assert.equal(parseNewsletterMessageReference('https://whatsapp.com/channel/invalid'), null);
   assert.equal(parseNewsletterMessageReference('https://example.com/channel/0029Vb761O39mrGTZvQ8UQ02/175'), null);
@@ -65,25 +66,45 @@ test('lit le server_id officiel depuis la clé NYXCORE et utilise newsletterReac
   ]]);
 });
 
-test('la réaction ne suit jamais le canal et démarre directement via NYXCORE', async () => {
+test('resolve un code de lien WhatsApp en JID canonique avec newsletterMetadata', async () => {
   const calls = [];
   const socket = {
-    async newsletterFollow(jid) { calls.push(['follow', jid]); throw new Error('follow interdit pour ce test'); },
+    async newsletterMetadata(type, key) {
+      calls.push([type, key]);
+      return { id: '120363402094635383@newsletter' };
+    }
+  };
+  const reference = parseNewsletterMessageReference('https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175');
+  assert.equal(await resolveNewsletterJid(socket, reference), '120363402094635383@newsletter');
+  assert.deepEqual(calls, [['invite', '0029Vb761O39mrGTZvQ8UQ02']]);
+  assert.equal(await resolveNewsletterJid(socket, '120363402094635383@newsletter'), '120363402094635383@newsletter');
+  assert.equal(calls.length, 1, 'un JID numérique ne nécessite pas de lookup invite');
+  await resolveNewsletterJid(socket, parseNewsletterMessageReference('00291234567890/175'));
+  assert.deepEqual(calls[1], ['invite', '00291234567890']);
+});
+
+test('le follow optionnel est mémorisé par socket et précède la réaction', async () => {
+  const calls = [];
+  const socket = {
+    async newsletterFollow(jid) { calls.push(['follow', jid]); },
     async newsletterReactMessage(jid, serverId, emoji) { calls.push(['reaction', jid, serverId, emoji]); }
   };
-  await reactToNewsletterMessage(socket, '0029Vb761O39mrGTZvQ8UQ02', '175', '👍', { ensureFollow: true });
+  await reactToNewsletterMessage(socket, '120363402094635383', '175', '👍', { ensureFollow: true });
+  await reactToNewsletterMessage(socket, '120363402094635383', '176', '🔥', { ensureFollow: true });
   assert.deepEqual(calls, [
-    ['reaction', '0029Vb761O39mrGTZvQ8UQ02@newsletter', '175', '👍']
+    ['follow', '120363402094635383@newsletter'],
+    ['reaction', '120363402094635383@newsletter', '175', '👍'],
+    ['reaction', '120363402094635383@newsletter', '176', '🔥']
   ]);
 });
 
-test('breact lance immédiatement toutes les sessions uniques sans follow préalable', async () => {
+test('breact réagit sur les sessions uniques sans imposer d’abonnement', async () => {
   const calls = [];
   const createSocket = id => ({
     user: { id: `${id}@s.whatsapp.net` },
-    async newsletterFollow() { throw new Error('aucun follow attendu'); },
+    async newsletterFollow() { throw new Error('breact ne doit pas suivre le canal'); },
     async newsletterReactMessage(jid, serverId, emoji) {
-      calls.push([id, jid, serverId, emoji]);
+      calls.push([id, 'reaction', jid, serverId, emoji]);
     }
   });
   const first = createSocket('bot-1');
@@ -96,6 +117,7 @@ test('breact lance immédiatement toutes les sessions uniques sans follow préal
   assert.equal(results.filter(result => result.ok).length, 2);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map(call => call[0]).sort(), ['bot-1', 'bot-2']);
+  assert.ok(calls.every(call => call[1] === 'reaction'));
 });
 
 test('refuse de réagir sans server_id au lieu d’utiliser le stanza id', async () => {

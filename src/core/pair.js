@@ -48,6 +48,7 @@ const {
   normaliseEmojiList,
   resolveNewsletterEmojis,
   parseNewsletterMessageReference,
+  resolveNewsletterJid,
   extractNewsletterServerId,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
@@ -352,7 +353,8 @@ const authBackend = createMongoAuthBackend({
 });
 configureTranslationStorage({
   initMongo,
-  getDb: () => mongoDB
+  getDb: () => mongoDB,
+  getSessionConfig: loadUserConfigFromMongo
 });
 configureGitHubUpdateSettings({
   initMongo,
@@ -7286,18 +7288,16 @@ case 'breact': {
     const [rawReference, ...emojiParts] = q.split(',');
     const reference = parseNewsletterMessageReference(rawReference.trim());
     const reactEmoji = emojiParts.join(',').trim();
-    const channelJid = reference?.jid || '';
     const messageId = reference?.serverId || '';
-    if (!channelJid || !messageId || !reactEmoji) {
+    if (!reference || !messageId || !reactEmoji) {
       await socket.sendMessage(sender, {
         text: "❌ Format invalide. Utilise !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍 ou un lien whatsapp.com/channel/<id>/<server_id>."
       }, { quoted: msg });
       break;
     }
 
-    // Réagir avec les sockets déjà actifs; la session qui reçoit la commande
-    // est ajoutée si elle n'est pas encore inscrite dans la Map. Aucun fetch
-    // Mongo ni abonnement newsletter n'est requis avant le premier envoi.
+    // Résolution du code d’invitation en JID canonique et réactions en arrière-plan;
+    // aucun abonnement ni attente réseau ne bloque l’accusé de réception initial.
     const sessions = [...activeSockets.entries()]
       .filter(([, botSocket]) => botSocket)
       .map(([session, botSocket]) => ({ session, socket: botSocket }));
@@ -7310,16 +7310,19 @@ case 'breact': {
       break;
     }
 
-    const reactionRun = reactAcrossNewsletterSockets(
-      sessions,
+    const reactionRun = resolveNewsletterJid(socket, reference).then(async channelJid => ({
       channelJid,
-      messageId,
-      reactEmoji,
-      async session => {
-        const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
-        if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
-      }
-    ).then(async results => {
+      results: await reactAcrossNewsletterSockets(
+        sessions,
+        channelJid,
+        messageId,
+        reactEmoji,
+        async session => {
+          const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
+          if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
+        }
+      )
+    })).then(async ({ channelJid, results }) => {
       const succeeded = results.filter(result => result.ok).length;
       const failed = results.filter(result => !result.ok).length;
       const persistenceWarnings = results.filter(result => result.ok && result.persistenceError);
@@ -7334,13 +7337,13 @@ case 'breact': {
       await socket.sendMessage(sender, { text: report });
     }).catch(async error => {
       console.error('[BREACT REPORT ERROR]', error);
-      await socket.sendMessage(sender, { text: `⚠️ Les réactions ont commencé, mais le rapport a échoué : ${error?.message || error}` }).catch(() => {});
+      await socket.sendMessage(sender, { text: `❌ Impossible de résoudre ou réagir au lien : ${error?.message || error}` }).catch(() => {});
     });
 
-    // Lancer en arrière-plan sans attendre le nombre de bots ni un délai de follow.
+    // Lancer en arrière-plan; l’envoi de la commande ne bloque pas sur les sockets.
     void reactionRun;
     await socket.sendMessage(sender, {
-      text: `🚀 Réaction lancée immédiatement.\n📢 Canal : ${channelJid.split('@')[0]}\n📝 Publication : ${messageId}\n😊 Emoji : ${reactEmoji}\n🤖 Sessions actives : ${sessions.length}\n\nAucun abonnement préalable n'est nécessaire.`
+      text: `🚀 Réaction lancée immédiatement.\n🔗 Référence : ${reference.channelKey || reference.jid}/${messageId}\n😊 Emoji : ${reactEmoji}\n🤖 Sessions actives : ${sessions.length}\n\nLe lien est résolu en JID canonique; aucun abonnement des bots n’est requis.`
     }, { quoted: msg });
   } catch (error) {
     console.error('❌ Erreur commande breact:', error);
@@ -7725,7 +7728,7 @@ case 'chr': {
   const reactEmoji = parts[1].trim();
 
   const reference = parseNewsletterMessageReference(channelRef);
-  const channelJid = reference?.jid || '';
+  let channelJid = reference?.jid || '';
   const messageId = reference?.serverId || '';
 
   // Validation finale
@@ -7738,10 +7741,8 @@ case 'chr': {
   }
 
   try {
-    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, {
-      ensureFollow: true,
-      followDelayMs: 1500
-    });
+    channelJid = await resolveNewsletterJid(socket, reference);
+    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, { ensureFollow: true });
     await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
 
     // BotName meta mention

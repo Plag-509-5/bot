@@ -33,7 +33,28 @@ function parseNewsletterMessageReference(value) {
   serverId = String(serverId || '').replace(/[?#].*$/, '').trim();
   const jid = normaliseNewsletterJid(channel);
   if (!jid || !/^[a-z0-9._-]{1,128}$/i.test(serverId)) return null;
-  return { jid, serverId };
+  return { jid, serverId, channelKey: channel };
+}
+
+async function resolveNewsletterJid(socket, reference) {
+  const channelKey = String(reference?.channelKey || reference?.jid || reference || '').trim();
+  const normalized = normaliseNewsletterJid(channelKey);
+  if (!normalized) throw new Error('Lien ou identifiant de chaîne invalide');
+  const identifier = normalized.slice(0, -'@newsletter'.length);
+
+  // Les liens whatsapp.com/channel/<invite-code>/<server_id> portent un code
+  // d’invitation, pas un JID. Les IDs de chaîne Baileys sont du type 120363…;
+  // ne pas prendre un code d’invitation numérique (souvent préfixé par 0029) pour un JID.
+  if (/^120363\d{6,}$/.test(identifier)) return normalized;
+  if (typeof socket?.newsletterMetadata !== 'function') {
+    throw new Error('Impossible de résoudre le code d’invitation : newsletterMetadata indisponible sur NYXCORE');
+  }
+  const metadata = await socket.newsletterMetadata('invite', identifier);
+  const canonicalJid = normaliseNewsletterJid(metadata?.id);
+  if (!canonicalJid || !/^\d{6,}@newsletter$/.test(canonicalJid)) {
+    throw new Error('Le lien de chaîne ne renvoie pas de JID newsletter canonique');
+  }
+  return canonicalJid;
 }
 
 function extractNewsletterServerId(message) {
@@ -43,7 +64,28 @@ function extractNewsletterServerId(message) {
   return value === undefined || value === null ? '' : String(value).trim();
 }
 
-async function reactToNewsletterMessage(socket, jid, serverId, reaction) {
+const followedNewsletterChannels = new WeakMap();
+
+async function ensureNewsletterFollow(socket, jid) {
+  if (typeof socket?.newsletterFollow !== 'function') return false;
+  let channels = followedNewsletterChannels.get(socket);
+  if (!channels) {
+    channels = new Map();
+    followedNewsletterChannels.set(socket, channels);
+  }
+  if (channels.has(jid)) return channels.get(jid);
+  const pending = Promise.resolve().then(() => socket.newsletterFollow(jid)).then(
+    () => true,
+    error => {
+      channels.delete(jid);
+      throw error;
+    }
+  );
+  channels.set(jid, pending);
+  return pending;
+}
+
+async function reactToNewsletterMessage(socket, jid, serverId, reaction, options = {}) {
   const normalizedJid = normaliseNewsletterJid(jid);
   const normalizedServerId = String(serverId || '').trim();
   const emoji = String(reaction || '').trim();
@@ -54,14 +96,15 @@ async function reactToNewsletterMessage(socket, jid, serverId, reaction) {
     throw new Error('newsletterReactMessage indisponible sur le socket NYXCORE');
   }
 
-  // newsletterReactMessage ne requiert pas que le compte suive la chaîne.
-  // Ne jamais appeler newsletterFollow ici : cela retardait les réactions et
-  // faisait échouer les bots invités à réagir sans abonnement préalable.
+  // Les deux appels existent dans Baileys/NYXCORE : newsletterFollow reçoit le
+  // JID canonique, puis newsletterReactMessage cible le server_id de la publication.
+  // Le suivi est mémorisé par socket pour ne pas répéter le WMex query à chaque réaction.
+  if (options.ensureFollow) await ensureNewsletterFollow(socket, normalizedJid);
   await socket.newsletterReactMessage(normalizedJid, normalizedServerId, emoji);
   return { jid: normalizedJid, serverId: normalizedServerId, reaction: emoji };
 }
 
-async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, onSuccess) {
+async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, onSuccess, options = {}) {
   const unique = new Map();
   for (const entry of Array.isArray(sessions) ? sessions : []) {
     const socket = entry?.socket || entry;
@@ -71,7 +114,7 @@ async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, o
 
   return Promise.all([...unique].map(async ([socket, session]) => {
     try {
-      const result = await reactToNewsletterMessage(socket, jid, serverId, reaction);
+      const result = await reactToNewsletterMessage(socket, jid, serverId, reaction, options);
       let persistenceError = '';
       if (typeof onSuccess === 'function') {
         try { await onSuccess(session, result); }
@@ -144,7 +187,9 @@ module.exports = {
   normaliseEmojiList,
   resolveNewsletterEmojis,
   parseNewsletterMessageReference,
+  resolveNewsletterJid,
   extractNewsletterServerId,
+  ensureNewsletterFollow,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
   syncNewsletterSockets

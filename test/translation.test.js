@@ -8,12 +8,14 @@ const {
   saveSessionLanguage,
   getSessionLanguage,
   setupTranslationWrapper,
+  setSessionFontTheme,
+  FONT_THEME_OPTIONS,
   SKIP_FORMATTING_OPTION,
   SUPPORTED_LANGUAGES,
   _test
 } = require('../src/features/translation');
 
-function configureStorage({ findOne = async () => null, updateOne = async () => ({ acknowledged: true }) } = {}) {
+function configureStorage({ findOne = async () => null, updateOne = async () => ({ acknowledged: true }), getSessionConfig } = {}) {
   configureTranslationStorage({
     initMongo: async () => {},
     getDb: () => ({
@@ -22,6 +24,7 @@ function configureStorage({ findOne = async () => null, updateOne = async () => 
         return { findOne, updateOne };
       }
     }),
+    getSessionConfig,
     languageLookupTimeoutMs: 25
   });
 }
@@ -67,6 +70,29 @@ test('les phrases statiques utilisent le catalogue local choisi et préservent l
   assert.ok(socket.sent[0].content.text.includes('.quiz.'));
   assert.equal(original.text, 'Aucun quiz en cours. Lance-en un avec .quiz.');
   assert.equal(socket.sent[0].options.quoted.key.id, 'q');
+  _test.clearCache();
+});
+
+test('restaure le thème sélectionné depuis la configuration persistée de la session', async () => {
+  _test.clearCache();
+  configureStorage({ getSessionConfig: async () => ({ FONT_THEME: 'a' }) });
+  assert.equal(await _test.primeSessionFontTheme('50947440869'), 'a');
+  assert.equal(_test.getCachedFontTheme('50947440869'), 'a');
+  _test.clearCache();
+});
+
+test('le thème sélectionné reste stable et s’applique aux textes et légendes statiques', async () => {
+  _test.clearCache();
+  configureStorage();
+  setSessionFontTheme('50947440869', 'a');
+  const socket = fakeSocket();
+  setupTranslationWrapper(socket, '50947440869');
+  await socket.sendMessage('chat@s.whatsapp.net', { text: 'Réponse stable', caption: 'Légende stable' });
+  await socket.sendMessage('chat@s.whatsapp.net', { text: 'Deuxième réponse' });
+  assert.equal(socket.sent[0].content.text, _test.styleStaticText('Réponse stable', 'small-caps'));
+  assert.equal(socket.sent[0].content.caption, _test.styleStaticText('Légende stable', 'small-caps'));
+  assert.equal(socket.sent[1].content.text, _test.styleStaticText('Deuxième réponse', 'small-caps'));
+  assert.equal(Object.keys(FONT_THEME_OPTIONS).join(''), 'abcd');
   _test.clearCache();
 });
 
