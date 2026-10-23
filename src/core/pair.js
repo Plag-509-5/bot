@@ -177,8 +177,11 @@ const { installSafeSend, getSendStats } = require('../lib/safe-send');
 const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
 const {
   createMessageDispatcher,
+  createMessageProcessingPool,
   DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
-  DEFAULT_MESSAGE_QUEUE_LIMIT
+  DEFAULT_MESSAGE_QUEUE_LIMIT,
+  DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT
 } = require('../services/message-batch');
 const { createMediaAlbumStore, snapshotMessageEnvelope } = require('../services/media-album-store');
 const { createReactionTargetCache } = require('../services/reaction-target-cache');
@@ -903,6 +906,10 @@ const pairingGuard = createPairingGuard({
 const lastConnectionActivity = new Map();
 const messageProcessingStats = new Map();
 const messageDispatchers = new Map();
+const messageProcessingPool = createMessageProcessingPool({
+  concurrency: process.env.MESSAGE_GLOBAL_PROCESSING_CONCURRENCY || DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  maxQueued: process.env.MESSAGE_GLOBAL_QUEUE_LIMIT || DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT
+});
 const eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
 eventLoopDelayMonitor.enable();
 
@@ -1797,7 +1804,8 @@ function setupCommandHandlers(socket, number) {
   const sanitizedNumber = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
   const dispatcher = createMessageDispatcher({
     concurrency: process.env.MESSAGE_PROCESSING_CONCURRENCY || DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
-    maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT
+    maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT,
+    processingPool: messageProcessingPool
   });
   const mediaAlbumStore = createMediaAlbumStore();
   if (sanitizedNumber) messageDispatchers.set(sanitizedNumber, dispatcher);
@@ -11997,6 +12005,17 @@ router.get('/api/session/health', async (req, res) => {
       ok: true,
       stockageSessions: 'mongodb',
       mongodbConnecte: mongoConnection.isConnected(),
+      capaciteProcessus: {
+        sessionsActives: activeSockets.size,
+        appairagesEnCours: pairingSockets.size,
+        uptimeSecondes: Math.floor(process.uptime()),
+        node: process.version,
+        memoireMiB: Object.fromEntries(
+          Object.entries(process.memoryUsage()).map(([key, value]) => [key, Number((value / 1024 / 1024).toFixed(1))])
+        ),
+        poolMongoMax: mongoConnection.clientOptions.maxPoolSize,
+        traitementMessagesGlobal: messageProcessingPool.getStats()
+      },
       boucleEvenement: readEventLoopDelayStats(),
       versionWhatsAppWeb: baileysVersionResolver.snapshot(),
       appairages,

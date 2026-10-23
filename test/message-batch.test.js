@@ -4,7 +4,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { processMessageBatch, createMessageDispatcher } = require('../src/services/message-batch');
+const {
+  processMessageBatch,
+  createMessageProcessingPool,
+  createMessageDispatcher
+} = require('../src/services/message-batch');
 
 const pairSource = fs.readFileSync(path.join(__dirname, '../src/core/pair.js'), 'utf8');
 
@@ -85,6 +89,62 @@ test('les chats différents sont traités en parallèle sans dépasser la limite
   assert.deepEqual(await batch, ['a', 'b', 'c']);
 });
 
+test('un pool global plafonne le traitement partagé entre plusieurs sessions', async () => {
+  const pool = createMessageProcessingPool({ concurrency: 2, maxQueued: 10 });
+  const dispatchers = Array.from({ length: 4 }, () => createMessageDispatcher({
+    concurrency: 3,
+    processingPool: pool
+  }));
+  let running = 0;
+  let peak = 0;
+  const batches = dispatchers.map((dispatcher, sessionIndex) => dispatcher.processBatch(
+    Array.from({ length: 3 }, (_, index) => ({
+      id: `${sessionIndex}-${index}`,
+      key: { remoteJid: `chat-${sessionIndex}-${index}` }
+    })),
+    async message => {
+      running += 1;
+      peak = Math.max(peak, running);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      running -= 1;
+      return message.id;
+    }
+  ));
+
+  await Promise.all(batches);
+  assert.equal(peak, 2);
+  assert.deepEqual(pool.getStats(), {
+    inFlight: 0,
+    queued: 0,
+    concurrency: 2,
+    maxQueued: 10,
+    rejected: 0
+  });
+});
+
+test('le plafond de file global rejette la surcharge et la mesure', async () => {
+  const pool = createMessageProcessingPool({ concurrency: 1, maxQueued: 0 });
+  const dispatcher = createMessageDispatcher({ concurrency: 1, processingPool: pool });
+  const overflowDispatcher = createMessageDispatcher({ concurrency: 1, processingPool: pool });
+  let finish;
+  const first = dispatcher.processBatch([
+    { id: 'running', key: { remoteJid: 'chat-one' } }
+  ], () => new Promise(resolve => { finish = resolve; }));
+  await new Promise(resolve => setImmediate(resolve));
+
+  const errors = [];
+  const overflow = await overflowDispatcher.processBatch([
+    { id: 'overflow', key: { remoteJid: 'chat-two' } }
+  ], async () => 'must-not-run', (error, context) => errors.push({ error, context }));
+  assert.deepEqual(overflow, [undefined]);
+  assert.match(errors[0].error.message, /File globale des messages pleine/);
+  assert.equal(errors[0].context.rejected, true);
+  assert.equal(overflowDispatcher.getStats().rejected, 1);
+  assert.equal(pool.getStats().rejected, 1);
+  finish('ok');
+  await first;
+});
+
 test('un chat garde un ordre FIFO entre lots successifs', async () => {
   const dispatcher = createMessageDispatcher({ concurrency: 3 });
   const started = [];
@@ -124,6 +184,10 @@ test('une surcharge est explicitement mesurée au lieu de faire grossir la mémo
 test('le handler WhatsApp route les items de messages.upsert au processeur de lot', () => {
   assert.match(pairSource, /dispatcher\.processBatch\(messages/);
   assert.match(pairSource, /createMessageDispatcher\(/);
+  assert.match(pairSource, /processingPool:\s*messageProcessingPool/);
+  assert.match(pairSource, /traitementMessagesGlobal:\s*messageProcessingPool\.getStats\(\)/);
+  assert.match(pairSource, /capaciteProcessus:\s*\{/);
+  assert.match(pairSource, /memoireMiB:/);
   assert.doesNotMatch(pairSource, /const msg = messages\[0\];/);
   assert.match(pairSource, /batchStats\.received \+= messages\.length/);
   assert.match(pairSource, /if \(type === 'append'\) return/);

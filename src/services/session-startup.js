@@ -1,7 +1,7 @@
 'use strict';
 
-const DEFAULT_SESSION_STARTUP_CONCURRENCY = 4;
-const MAX_SESSION_STARTUP_CONCURRENCY = 16;
+const DEFAULT_SESSION_STARTUP_CONCURRENCY = 8;
+const MAX_SESSION_STARTUP_CONCURRENCY = 32;
 
 function resolveSessionStartupConcurrency(value) {
   const parsed = Number(value);

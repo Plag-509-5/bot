@@ -137,6 +137,52 @@ compté mais n'exécute pas d'anciennes commandes après une reconnexion (`histo
 `received` n'augmente pas après un message WhatsApp, le défaut est avant le routeur de commandes;
 si `queued` ou `lastQueueDelayMs` monte, le traitement applicatif est en retard.
 
+### Profil de déploiement pour 100 sessions et plus
+
+Le processus ne fixe pas de plafond bas au nombre de sessions : toutes les sessions
+validées dans MongoDB sont restaurées. Pour une charge importante, les démarrages
+sont étalés (`SESSION_STARTUP_CONCURRENCY`, 8 par défaut, maximum 32) et les messages
+utilisent un pool de travail **global partagé** (`MESSAGE_GLOBAL_PROCESSING_CONCURRENCY`)
+plutôt que de multiplier quatre workers par chaque socket. Les files sont bornées par
+session et par processus; la surcharge est comptée dans le diagnostic plutôt que de
+faire croître la RAM sans limite.
+
+Pour viser 100 sockets actifs, commence avec les réglages ci-dessus, un cluster MongoDB
+dont le quota de connexions permet un pool de 100, et un hôte de production de l'ordre
+de **4 vCPU / 8 Gio de RAM ou davantage** comme point de départ de test (ce n'est pas
+une garantie ni un minimum universel : la mémoire par session dépend du trafic, des
+clés Signal, des chats et des médias). Surveille `capaciteProcessus.memoireMiB`,
+`capaciteProcessus.sessionsActives`, `capaciteProcessus.traitementMessagesGlobal` et
+`boucleEvenement` dans `/api/session/health`; augmente les ressources si le RSS approche
+la limite du conteneur ou si la file globale/latence monte. `MONGO_MAX_POOL_SIZE` est
+un plafond d'opérations MongoDB par serveur Mongo, **pas** un socket par session; vérifie
+le quota de ton fournisseur avant de l'augmenter.
+
+Les sessions restent persistées en write-through dans MongoDB et sont restaurées après
+un redémarrage. En production, utilise un superviseur avec redémarrage automatique et
+**un seul processus Node** : ne lance pas PM2 en cluster, plusieurs instances Docker ou
+plusieurs réplicas, car chaque processus pourrait ouvrir son propre socket pour les
+mêmes numéros. Le fichier `ecosystem.config.cjs` configure PM2 en mode `fork`, une seule
+instance, redémarrage automatique et un délai d'arrêt assez long pour vider MongoDB :
+
+```bash
+npm install -g pm2
+pm2 start ecosystem.config.cjs --env production
+pm2 save
+pm2 startup   # exécuter aussi la commande système affichée par PM2
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 20M
+pm2 set pm2-logrotate:retain 14
+```
+
+Sur systemd, configure au minimum `Restart=always`, `RestartSec=5`, `TimeoutStopSec=180`
+et `LimitNOFILE=8192`. Les 100 connexions WhatsApp sont sortantes, mais le processus a
+également besoin de descripteurs pour MongoDB, HTTP et les fichiers temporaires. Un test
+réaliste à 100 comptes doit être fait sur le VPS cible avec des sessions autorisées et
+surveiller au moins la RAM, les descripteurs, le quota Mongo et les reconnexions; le
+code seul ne peut pas compenser les limites du plan VPS/Mongo ou les limites réseau de
+WhatsApp.
+
 ---
 
 ## 🔁 Appairage et purge fiable
@@ -253,6 +299,17 @@ ADMIN_PASS=un-mot-de-passe-long-et-aleatoire
 # Obligatoire : unique stockage des sessions WhatsApp
 MONGO_URI=mongodb+srv://user:password@cluster.mongodb.net
 MONGO_DB=MUGIWARA_NO_PLAG
+# Pool partagé; augmente-le uniquement si le quota du cluster le permet.
+MONGO_MAX_POOL_SIZE=100
+MONGO_MAX_CONNECTING=10
+
+# Restaure les sessions par vagues; maximum applicatif : 32.
+SESSION_STARTUP_CONCURRENCY=8
+# Plafonds de messages par session et pour tout le processus.
+MESSAGE_PROCESSING_CONCURRENCY=2
+MESSAGE_QUEUE_LIMIT=100
+MESSAGE_GLOBAL_PROCESSING_CONCURRENCY=32
+MESSAGE_GLOBAL_QUEUE_LIMIT=2048
 
 # Keepalive WhatsApp par session; valeurs par défaut : 30 s / 90 s.
 SESSION_KEEPALIVE_INTERVAL_MS=30000

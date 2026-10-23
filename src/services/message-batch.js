@@ -1,7 +1,71 @@
 'use strict';
 
-const DEFAULT_MESSAGE_PROCESSING_CONCURRENCY = 4;
-const DEFAULT_MESSAGE_QUEUE_LIMIT = 500;
+const DEFAULT_MESSAGE_PROCESSING_CONCURRENCY = 2;
+const DEFAULT_MESSAGE_QUEUE_LIMIT = 100;
+const DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY = 32;
+const DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT = 2048;
+
+function positiveLimit(value, fallback, maximum) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
+}
+
+/** One fair FIFO worker pool shared by every WhatsApp session in this process. */
+function createMessageProcessingPool({
+  concurrency = DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  maxQueued = DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT
+} = {}) {
+  const workerLimit = positiveLimit(concurrency, DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY, 512);
+  const queueLimit = Number.isInteger(Number(maxQueued)) && Number(maxQueued) >= 0
+    ? Math.min(Number(maxQueued), 100_000)
+    : DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT;
+  const queue = [];
+  let inFlight = 0;
+  let rejected = 0;
+
+  function run(entry) {
+    inFlight += 1;
+    Promise.resolve()
+      .then(entry.task)
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        inFlight = Math.max(0, inFlight - 1);
+        drain();
+      });
+  }
+
+  function drain() {
+    while (inFlight < workerLimit && queue.length) run(queue.shift());
+  }
+
+  function submit(task) {
+    if (typeof task !== 'function') return Promise.reject(new TypeError('task must be a function'));
+    if (inFlight < workerLimit) {
+      return new Promise((resolve, reject) => run({ task, resolve, reject }));
+    }
+    if (queue.length >= queueLimit) {
+      rejected += 1;
+      const error = new Error(`File globale des messages pleine (${queueLimit}); message refusé pour protéger le processus.`);
+      error.code = 'GLOBAL_MESSAGE_QUEUE_FULL';
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => {
+      queue.push({ task, resolve, reject });
+    });
+  }
+
+  function getStats() {
+    return {
+      inFlight,
+      queued: queue.length,
+      concurrency: workerLimit,
+      maxQueued: queueLimit,
+      rejected
+    };
+  }
+
+  return { submit, getStats };
+}
 
 /**
  * Traite chaque message d'un `messages.upsert` Baileys. Une mise à jour peut
@@ -49,6 +113,7 @@ function createMessageDispatcher({
   concurrency = DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
   maxPending = DEFAULT_MESSAGE_QUEUE_LIMIT,
   keyFor = message => message?.key?.remoteJid || '__unknown__',
+  processingPool = null,
   now = Date.now
 } = {}) {
   const workerLimit = boundedInteger(concurrency, DEFAULT_MESSAGE_PROCESSING_CONCURRENCY, 1, 64);
@@ -85,9 +150,11 @@ function createMessageDispatcher({
     maxQueueDelayMs = Math.max(maxQueueDelayMs, queueDelayMs);
     lastQueueDelayMs = queueDelayMs;
 
-    Promise.resolve()
-      .then(() => task.processMessage(task.message))
-      .then(result => {
+    const processing = processingPool && typeof processingPool.submit === 'function'
+      ? processingPool.submit(() => task.processMessage(task.message))
+      : Promise.resolve().then(() => task.processMessage(task.message));
+
+    processing.then(result => {
         completed += 1;
         safeCallback(task.onProcessed, result, {
           message: task.message,
@@ -98,13 +165,16 @@ function createMessageDispatcher({
         });
         task.resolve(result);
       }, error => {
-        failed += 1;
+        const wasRejected = error?.code === 'GLOBAL_MESSAGE_QUEUE_FULL';
+        if (wasRejected) rejected += 1;
+        else failed += 1;
         safeCallback(task.onError, error, {
           message: task.message,
           index: task.index,
           chat,
           queueDelayMs,
-          processingDurationMs: Math.max(0, now() - startedAt)
+          processingDurationMs: Math.max(0, now() - startedAt),
+          rejected: wasRejected
         });
         task.resolve(undefined);
       })
@@ -199,6 +269,9 @@ function createMessageDispatcher({
 module.exports = {
   DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
   DEFAULT_MESSAGE_QUEUE_LIMIT,
+  DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT,
   processMessageBatch,
+  createMessageProcessingPool,
   createMessageDispatcher
 };
