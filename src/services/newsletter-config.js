@@ -147,6 +147,12 @@ function normaliseEmojiList(value, limit = 20) {
   return emojis;
 }
 
+function formatBReactSummary(succeeded, failed) {
+  const sentCount = Number.isFinite(Number(succeeded)) ? Math.max(0, Math.floor(Number(succeeded))) : 0;
+  const failedCount = Number.isFinite(Number(failed)) ? Math.max(0, Math.floor(Number(failed))) : 0;
+  return `✅ Tâche accomplie.\nRéactions envoyées : ${sentCount}\nÉchecs : ${failedCount}`;
+}
+
 function resolveNewsletterEmojis(primary, secondary, fallback = DEFAULT_NEWSLETTER_EMOJIS) {
   const preferred = normaliseEmojiList(primary);
   if (preferred.length) return preferred;
@@ -186,6 +192,7 @@ module.exports = {
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  formatBReactSummary,
   parseNewsletterMessageReference,
   resolveNewsletterJid,
   extractNewsletterServerId,

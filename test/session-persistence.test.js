@@ -69,10 +69,12 @@ test('Baileys officiel pour les sessions et NYXCORE pour le plugin de statut', a
     assert.equal(packageJson.dependencies[forbidden], undefined, `fork interdit : ${forbidden}`);
   }
   assert.doesNotMatch(packageJson.dependencies['@whiskeysockets/baileys'], /^npm:/);
-  // libsignal doit toujours être remplacé par le commit officiel de Baileys.
+  // La version publiée sur npm est issue du même commit upstream, sans
+  // téléchargement codeload pendant chaque déploiement.
+  assert.equal(packageJson.overrides?.libsignal, '6.0.0');
   assert.equal(
-    packageJson.overrides?.libsignal,
-    'github:whiskeysockets/libsignal-node#bcea72df9ec34d9d9140ab30619cf479c7c144c7'
+    require('../package-lock.json').packages['node_modules/libsignal'].resolved,
+    'https://registry.npmjs.org/libsignal/-/libsignal-6.0.0.tgz'
   );
 });
 

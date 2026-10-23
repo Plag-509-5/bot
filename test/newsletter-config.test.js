@@ -8,6 +8,7 @@ const {
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  formatBReactSummary,
   parseNewsletterMessageReference,
   resolveNewsletterJid,
   extractNewsletterServerId,
@@ -127,6 +128,14 @@ test('refuse de réagir sans server_id au lieu d’utiliser le stanza id', async
     reactToNewsletterMessage({ newsletterReactMessage: async () => {} }, '0029Vb761O39mrGTZvQ8UQ02', '', '🔥'),
     /server_id de publication manquant/
   );
+});
+
+test('résume la tâche breact avec uniquement les totaux demandés', () => {
+  assert.equal(
+    formatBReactSummary(8, 2),
+    '✅ Tâche accomplie.\nRéactions envoyées : 8\nÉchecs : 2'
+  );
+  assert.equal(formatBReactSummary(-1, Number.NaN), '✅ Tâche accomplie.\nRéactions envoyées : 0\nÉchecs : 0');
 });
 
 test('normalise les emojis venant du textarea ou de cfn sans doublons', () => {

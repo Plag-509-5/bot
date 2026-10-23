@@ -47,6 +47,7 @@ const {
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  formatBReactSummary,
   parseNewsletterMessageReference,
   resolveNewsletterJid,
   extractNewsletterServerId,
@@ -7270,17 +7271,10 @@ case 'firstadmin': {
 
 case 'breact': {
   try {
-    if (!isPrivileged) {
-      await socket.sendMessage(sender, {
-        text: "❌ Accès refusé. Cette commande est réservée aux administrateurs."
-      }, { quoted: msg });
-      break;
-    }
-
     const q = body.split(' ').slice(1).join(' ').trim();
     if (!q.includes(',')) {
       await socket.sendMessage(sender, {
-        text: "❌ Format : !breact <channelJid/messageId>,<emoji>\nExemple : !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍"
+        text: `Utilisation : ${prefix}breact <lien-ou-référence>,<emoji>`
       }, { quoted: msg });
       break;
     }
@@ -7290,14 +7284,10 @@ case 'breact': {
     const reactEmoji = emojiParts.join(',').trim();
     const messageId = reference?.serverId || '';
     if (!reference || !messageId || !reactEmoji) {
-      await socket.sendMessage(sender, {
-        text: "❌ Format invalide. Utilise !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍 ou un lien whatsapp.com/channel/<id>/<server_id>."
-      }, { quoted: msg });
+      await socket.sendMessage(sender, { text: 'Référence ou réaction invalide.' }, { quoted: msg });
       break;
     }
 
-    // Résolution du code d’invitation en JID canonique et réactions en arrière-plan;
-    // aucun abonnement ni attente réseau ne bloque l’accusé de réception initial.
     const sessions = [...activeSockets.entries()]
       .filter(([, botSocket]) => botSocket)
       .map(([session, botSocket]) => ({ session, socket: botSocket }));
@@ -7305,51 +7295,36 @@ case 'breact': {
       sessions.push({ session: number || socket.user?.id || 'session-courante', socket });
     }
 
-    if (!sessions.length) {
-      await socket.sendMessage(sender, { text: "❌ Aucun bot actuellement connecté." }, { quoted: msg });
-      break;
-    }
+    await socket.sendMessage(sender, { text: '⏳ Tâche débutée.' }, { quoted: msg });
 
-    const reactionRun = resolveNewsletterJid(socket, reference).then(async channelJid => ({
-      channelJid,
-      results: await reactAcrossNewsletterSockets(
-        sessions,
-        channelJid,
-        messageId,
-        reactEmoji,
-        async session => {
-          const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
-          if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
-        }
-      )
-    })).then(async ({ channelJid, results }) => {
-      const succeeded = results.filter(result => result.ok).length;
-      const failed = results.filter(result => !result.ok).length;
-      const persistenceWarnings = results.filter(result => result.ok && result.persistenceError);
-      let report = `📊 RAPPORT B.REACT\n\n✅ Réactions envoyées : ${succeeded}\n❌ Échecs : ${failed}\n🤖 Sessions essayées : ${results.length}\n\n📢 Canal : ${channelJid.split('@')[0]}\n📝 Publication : ${messageId}\n😊 Emoji : ${reactEmoji}`;
-      const failedSessions = results.filter(result => !result.ok);
-      if (failedSessions.length) {
-        report += `\n\nÉchecs :\n${failedSessions.slice(0, 10).map(item => `• ${item.session} : ${item.error}`).join('\n')}`;
+    const reactionRun = (async () => {
+      let succeeded = 0;
+      let failed = sessions.length;
+      try {
+        const channelJid = await resolveNewsletterJid(socket, reference);
+        const results = await reactAcrossNewsletterSockets(
+          sessions,
+          channelJid,
+          messageId,
+          reactEmoji,
+          async session => {
+            const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
+            if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
+          }
+        );
+        succeeded = results.filter(result => result.ok).length;
+        failed = results.filter(result => !result.ok).length;
+      } catch (error) {
+        console.warn('[BREACT] La tâche n’a pas pu être exécutée :', error?.message || error);
       }
-      if (persistenceWarnings.length) {
-        report += `\n⚠️ ${persistenceWarnings.length} réaction(s) envoyée(s), mais non enregistrée(s) dans MongoDB.`;
-      }
-      await socket.sendMessage(sender, { text: report });
-    }).catch(async error => {
-      console.error('[BREACT REPORT ERROR]', error);
-      await socket.sendMessage(sender, { text: `❌ Impossible de résoudre ou réagir au lien : ${error?.message || error}` }).catch(() => {});
-    });
-
-    // Lancer en arrière-plan; l’envoi de la commande ne bloque pas sur les sockets.
+      await socket.sendMessage(sender, {
+        text: formatBReactSummary(succeeded, failed)
+      }).catch(error => console.warn('[BREACT] Résumé non envoyé :', error?.message || error));
+    })();
     void reactionRun;
-    await socket.sendMessage(sender, {
-      text: `🚀 Réaction lancée immédiatement.\n🔗 Référence : ${reference.channelKey || reference.jid}/${messageId}\n😊 Emoji : ${reactEmoji}\n🤖 Sessions actives : ${sessions.length}\n\nLe lien est résolu en JID canonique; aucun abonnement des bots n’est requis.`
-    }, { quoted: msg });
   } catch (error) {
-    console.error('❌ Erreur commande breact:', error);
-    try {
-      await socket.sendMessage(sender, { text: `❌ Erreur interne : ${error.message || error}` }, { quoted: msg });
-    } catch (_) {}
+    console.error('[BREACT] Impossible de démarrer la tâche :', error?.message || error);
+    await socket.sendMessage(sender, { text: '❌ Impossible de démarrer la tâche.' }, { quoted: msg }).catch(() => {});
   }
   break;
 }

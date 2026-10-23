@@ -28,7 +28,6 @@
     "fluent-ffmpeg": "^2.1.2",
     "form-data": "^4.0.5",
     "fs-extra": "^11.2.0",
-    "google-translate-api": "^2.3.0",
     "jimp": "^0.22.10",
     "moment-timezone": "^0.6.0",
     "mongodb": "^5.7.0",
@@ -43,7 +42,7 @@
     "node": ">=22.12.0"
   },
   "overrides": {
-    "libsignal": "github:whiskeysockets/libsignal-node#bcea72df9ec34d9d9140ab30619cf479c7c144c7"
+    "libsignal": "6.0.0"
   },
   "keywords": [
     "whatsapp",

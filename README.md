@@ -230,8 +230,12 @@ n'écrivait plus le code dans un attribut et copiait donc parfois le libellé
 ```bash
 git clone https://github.com/Plag-509-5/bot.git
 cd bot
-npm install
+bash scripts/install-dependencies.sh
 ```
+
+Le script exige FFmpeg système, puis exécute `npm ci` sans scripts d’installation tiers ni audit/fund. Il applique ensuite explicitement le correctif Baileys nécessaire. `libsignal@6.0.0` est résolu depuis npm; son `gitHead` est la révision officielle déjà utilisée par Baileys, ce qui évite le téléchargement GitHub/codeload.
+
+Chromium, utilisé uniquement par `.tgs`, est installé à la première conversion plutôt qu’au déploiement. Un Chromium système peut être réutilisé via `CHROME_BIN` ou `PUPPETEER_EXECUTABLE_PATH`. FFmpeg est détecté dans le `PATH`; sinon, définissez `FFMPEG_BIN`.
 
 ### 3. Configuration de l'environnement
 Copiez le fichier `.env.example` en `.env` :

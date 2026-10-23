@@ -1,11 +1,26 @@
 'use strict';
 
+const { execFileSync } = require('node:child_process');
+if (process.env.CHROME_BIN && !process.env.PUPPETEER_EXECUTABLE_PATH) {
+  process.env.PUPPETEER_EXECUTABLE_PATH = process.env.CHROME_BIN;
+}
+if (!process.env.FFMPEG_BIN) {
+  try {
+    process.env.FFMPEG_BIN = execFileSync(
+      process.platform === 'win32' ? 'where' : 'which',
+      ['ffmpeg'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim().split(/\r?\n/)[0];
+  } catch {}
+}
+
 const axios = require('axios');
 const fs = require('fs-extra');
 const os = require('os');
 const path = require('path');
 const TGS = require('tgs-to');
 const crypto = require('crypto');
+const { ensurePuppeteerBrowser, resetBrowserInstallState } = require('../../services/puppeteer-browser');
 const webp = require('node-webpmux');
 const { createStickerFromMedia, sendSticker } = require('../../lib/s-utils');
 const { getTelegramStickerEntries } = require('../../services/telegram-stickers');
@@ -54,6 +69,7 @@ async function downloadStickerFile(entry, token, http = axios) {
 async function convertToWhatsAppSticker(entry, source, work, index) {
   const extension = String(entry.extension || 'tgs').toLowerCase();
   if (extension === 'tgs') {
+    await ensurePuppeteerBrowser();
     const input = path.join(work, `${index}.tgs`);
     const output = path.join(work, `${index}.webp`);
     await fs.writeFile(input, source);
@@ -125,5 +141,12 @@ module.exports = {
       await fs.remove(work).catch(() => {});
     }
   },
-  _test: { parseInput, downloadStickerFile, convertToWhatsAppSticker, addExif }
+  _test: {
+    parseInput,
+    downloadStickerFile,
+    ensurePuppeteerBrowser,
+    convertToWhatsAppSticker,
+    addExif,
+    resetBrowserInstallState
+  }
 };
