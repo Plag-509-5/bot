@@ -190,6 +190,10 @@ const {
   forceCloseSessionSocket,
   createSessionHealthWatcher
 } = require('../services/session-health-watcher');
+const {
+  reconnectInactiveSessions,
+  formatForceReconnectReport
+} = require('../services/force-reconnect');
 
 function resolveGroupActionTargets(metadata, identities) {
   const candidates = Array.isArray(identities) ? identities : [identities];
@@ -8654,6 +8658,57 @@ case 'upscale': {
   break;
 }
             
+
+case 'forcereconnect':
+case 'force': {
+  if (!isPrivileged) {
+    await socket.sendMessage(sender, {
+      text: '❌ Accès réservé aux administrateurs.'
+    }, { quoted: msg });
+    break;
+  }
+
+  await socket.sendMessage(sender, {
+    text: '⏳ Reconnexion des sessions inactives lancée.'
+  }, { quoted: msg });
+
+  let report;
+  try {
+    const numbers = await getAllNumbersFromMongo();
+    const outcome = await reconnectInactiveSessions(numbers, {
+      activeSockets,
+      isPairingLocked: number => pairingGuard.isLocked(number),
+      getOpenState: getSocketOpenState,
+      markIntentionalClose: candidate => intentionalSocketClosures.add(candidate),
+      clearSocketMetadata: number => socketCreationTime.delete(number),
+      closeSocket: candidate => forceCloseSessionSocket(candidate, error => {
+        console.warn('[FORCE-RECONNECT] fermeture du socket :', error?.message || error);
+      }),
+      launchSessions: inactiveNumbers => inactiveNumbers.map(inactiveNumber => {
+        const scheduled = reconnectScheduler.scheduleImmediate(inactiveNumber, {
+          reason: 'commande forcereconnect'
+        });
+        return {
+          number: inactiveNumber,
+          status: scheduled.scheduled
+            ? 'scheduled'
+            : scheduled.reason === 'deja-programmee'
+              ? 'already_starting'
+              : 'failed'
+        };
+      })
+    });
+    report = formatForceReconnectReport(outcome);
+  } catch (error) {
+    console.error('[FORCE-RECONNECT] échec de la commande :', error?.message || error);
+    report = formatForceReconnectReport({ fatalErrors: 1 });
+  }
+
+  await socket.sendMessage(sender, { text: report }).catch(error => {
+    console.warn('[FORCE-RECONNECT] rapport final non envoyé :', error?.message || error);
+  });
+  break;
+}
 
 case 'active':
 case 'bots': {
