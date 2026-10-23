@@ -143,6 +143,9 @@ async function personalStatus(socket, content, options = {}) {
       messageId: generated.key.id,
       statusJidList,
       useCachedGroupMetadata: false,
+      // A stale PN/LID device cache is a known cause of Baileys 7 smax-invalid
+      // (479) acknowledgements. Status fanout must resolve the current devices.
+      useUserDevicesCache: false,
       ...(options.additionalAttributes && typeof options.additionalAttributes === 'object'
         ? { additionalAttributes: options.additionalAttributes }
         : {}),

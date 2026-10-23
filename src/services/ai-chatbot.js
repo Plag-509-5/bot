@@ -2,6 +2,13 @@
 
 const { createAiMemory } = require('./ai-memory');
 const { createAiRouter, AiRouterError } = require('./ai-router');
+const RESPONSE_LANGUAGE_NAMES = Object.freeze({
+  fr: 'français',
+  en: 'anglais',
+  es: 'espagnol',
+  ht: 'créole haïtien (kreyòl ayisyen)'
+});
+
 const KAIDO_SYSTEM_PROMPT = [
   'Tu es Kaido, le Roi des Bêtes, la personnalité conversationnelle intégrée à Kaido-MD.',
   'Tu es imposant, fier, direct, sûr de toi et énergique, avec un humour sec; sous cette force, tu restes loyal, protecteur et utile.',
@@ -131,7 +138,7 @@ function createAiChatbot(options = {}) {
     return `${session}::${chat}`;
   }
 
-  async function respond({ sessionNumber, chatJid, senderName, text, onStart, isActive } = {}) {
+  async function respond({ sessionNumber, chatJid, senderName, text, language = 'fr', onStart, isActive } = {}) {
     const session = cleanSessionNumber(sessionNumber);
     const key = conversationKey(session, chatJid);
     const messageText = String(text || '').replace(/\u0000/g, '').trim().slice(0, maxInputChars);
@@ -155,8 +162,13 @@ function createAiChatbot(options = {}) {
       }
       if (!(await stillCurrent())) return { cancelled: true, text: '', provider: '', model: '', conversationKey: key };
 
+      const languageCode = String(language || 'fr').trim().toLowerCase();
+      const languageName = RESPONSE_LANGUAGE_NAMES[languageCode] || RESPONSE_LANGUAGE_NAMES.fr;
       const messages = [
-        { role: 'system', content: KAIDO_SYSTEM_PROMPT },
+        {
+          role: 'system',
+          content: `${KAIDO_SYSTEM_PROMPT} Réponds exclusivement en ${languageName}, même si la question est posée dans une autre langue; conserve les noms propres et les citations nécessaires.`
+        },
         ...memory.getMessages(key),
         { role: 'user', content: userContent }
       ];
@@ -218,6 +230,7 @@ const defaultChatbot = createAiChatbot();
 
 module.exports = {
   KAIDO_SYSTEM_PROMPT,
+  RESPONSE_LANGUAGE_NAMES,
   AiQueueFullError,
   createAiChatbot,
   createKeyedTaskQueue,

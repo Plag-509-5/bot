@@ -43,7 +43,7 @@ function extractNewsletterServerId(message) {
   return value === undefined || value === null ? '' : String(value).trim();
 }
 
-async function reactToNewsletterMessage(socket, jid, serverId, reaction, options = {}) {
+async function reactToNewsletterMessage(socket, jid, serverId, reaction) {
   const normalizedJid = normaliseNewsletterJid(jid);
   const normalizedServerId = String(serverId || '').trim();
   const emoji = String(reaction || '').trim();
@@ -54,21 +54,34 @@ async function reactToNewsletterMessage(socket, jid, serverId, reaction, options
     throw new Error('newsletterReactMessage indisponible sur le socket NYXCORE');
   }
 
-  if (options.ensureFollow && typeof socket.newsletterFollow === 'function') {
-    let followed = false;
-    try {
-      await socket.newsletterFollow(normalizedJid);
-      followed = true;
-    } catch {
-      // La chaîne peut déjà être suivie; la réaction reste la vérification finale.
-    }
-    if (followed && Number(options.followDelayMs) > 0) {
-      await new Promise(resolve => setTimeout(resolve, Number(options.followDelayMs)));
-    }
-  }
-
+  // newsletterReactMessage ne requiert pas que le compte suive la chaîne.
+  // Ne jamais appeler newsletterFollow ici : cela retardait les réactions et
+  // faisait échouer les bots invités à réagir sans abonnement préalable.
   await socket.newsletterReactMessage(normalizedJid, normalizedServerId, emoji);
   return { jid: normalizedJid, serverId: normalizedServerId, reaction: emoji };
+}
+
+async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, onSuccess) {
+  const unique = new Map();
+  for (const entry of Array.isArray(sessions) ? sessions : []) {
+    const socket = entry?.socket || entry;
+    if (!socket || unique.has(socket)) continue;
+    unique.set(socket, String(entry?.session || socket?.user?.id || 'session-inconnue').split('@')[0]);
+  }
+
+  return Promise.all([...unique].map(async ([socket, session]) => {
+    try {
+      const result = await reactToNewsletterMessage(socket, jid, serverId, reaction);
+      let persistenceError = '';
+      if (typeof onSuccess === 'function') {
+        try { await onSuccess(session, result); }
+        catch (error) { persistenceError = String(error?.message || error); }
+      }
+      return { session, ok: true, persistenceError };
+    } catch (error) {
+      return { session, ok: false, error: String(error?.message || error) };
+    }
+  }));
 }
 
 function normaliseEmojiList(value, limit = 20) {
@@ -133,5 +146,6 @@ module.exports = {
   parseNewsletterMessageReference,
   extractNewsletterServerId,
   reactToNewsletterMessage,
+  reactAcrossNewsletterSockets,
   syncNewsletterSockets
 };

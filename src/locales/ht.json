@@ -1,0 +1,27 @@
+{
+  "languageName": "Kreyòl ayisyen",
+  "responses": {
+    "Configuration réussie !": "Konfigirasyon an anrejistre!",
+    "Aucun quiz n’est en cours dans ce salon.": "Pa gen okenn tès k ap dewoule nan konvèsasyon sa a.",
+    "Aucun quiz en cours. Lance-en un avec .quiz.": "Pa gen tès k ap dewoule. Kòmanse youn ak .quiz.",
+    "La question actuelle est toujours ouverte. Attends le verdict avant de continuer.": "Kesyon an poko fini. Tann rezilta a anvan ou kontinye.",
+    "Aucun score pour le moment.": "Poko gen okenn pwen.",
+    "Réponse directe : écris ta réponse dans le groupe.": "Repons dirèk: ekri repons ou nan gwoup la.",
+    "Vote dans le sondage ci-dessous. Le vote se ferme dans 30 secondes.": "Vote nan sondaj ki anba a. Vòt la ap fèmen nan 30 segonn.",
+    "Statut publié, visible par": "Mete estati a; moun sa yo ka wè l:",
+    "Publication annulée :": "Anilasyon piblikasyon an:",
+    "Impossible de générer la question :": "Nou pa t kapab kreye kesyon an:",
+    "Impossible de générer le quiz :": "Nou pa t kapab kreye tès la:",
+    "Les API IA sont temporairement limitées. Réessaie dans quelques instants.": "Sèvis entèlijans atifisyèl yo limite pou kounye a. Eseye ankò talè.",
+    "Pose une question après la commande.": "Poze yon kesyon apre kòmand lan.",
+    "Téléchargement YouTube impossible :": "Telechajman YouTube la pa mache:",
+    "Aucun résultat trouvé sur YouTube.": "Nou pa jwenn rezilta sou YouTube.",
+    "Sessions actives :": "Sesyon ki aktif yo:",
+    "Aucun bot actuellement connecté.": "Pa gen okenn bot ki konekte kounye a.",
+    "Aucun abonnement préalable n'est nécessaire.": "Ou pa bezwen abòne ak chanèl la anvan.",
+    "Les réponses statiques utilisent désormais le catalogue local": "Repons estatik yo ap itilize katalòg lokal la kounye a",
+    "L’IA et les quiz répondront dans cette langue.": "IA a ak tès yo ap reponn nan lang sa a.",
+    "Langue manquante ou non prise en charge.": "Lang lan manke oswa li pa disponib.",
+    "Catalogues locaux disponibles :": "Katalòg lokal ki disponib yo:"
+  }
+}

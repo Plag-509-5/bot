@@ -2,6 +2,9 @@ const express = require('express');
 const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
+const { configureWhatsAppMediaTempDir } = require('../services/media-temp-dir');
+const mediaTemp = configureWhatsAppMediaTempDir();
+if (mediaTemp.configured) console.log(`[MEDIA TEMP] Baileys media files: ${mediaTemp.directory}`);
 const { exec } = require('child_process');
 const router = express.Router();
 const pino = require('pino');
@@ -47,6 +50,7 @@ const {
   parseNewsletterMessageReference,
   extractNewsletterServerId,
   reactToNewsletterMessage,
+  reactAcrossNewsletterSockets,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
@@ -76,7 +80,9 @@ const { applyPairingCors } = require('../services/pairing-cors');
 const {
   configureTranslationStorage,
   setupTranslationWrapper,
-  saveSessionLanguage
+  saveSessionLanguage,
+  getSessionLanguage,
+  SKIP_FORMATTING_OPTION
 } = require('../features/translation');
 const githubUpdater = require('../services/github-updater');
 const githubUpdateSettings = require('../services/github-update-settings');
@@ -126,7 +132,6 @@ const {
   setGoodbyeTemplate,
   handleParticipantUpdate
 } = require('../handlers/welcome_goodbye');
-const translate = require('google-translate-api');
 const {
   default: makeWASocket,
   initAuthCreds,
@@ -1746,11 +1751,13 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
 
   let presenceStarted = false;
   try {
+    const responseLanguage = await getSessionLanguage(sessionNumber);
     const result = await respondToAi({
       sessionNumber,
       chatJid: remoteJid,
       senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
       text: input,
+      language: responseLanguage,
       isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
       onStart: async () => {
         presenceStarted = true;
@@ -1763,7 +1770,7 @@ async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig,
     if (result.cancelled) return true;
     await socket.sendMessage(remoteJid, {
       text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
-    }, { quoted: msg });
+    }, { quoted: msg, [SKIP_FORMATTING_OPTION]: true });
   } catch (error) {
     console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
     try {
@@ -2608,17 +2615,17 @@ case 'removettt': {
       case 'setlang': {
   try {
     const newLang = args[0]?.toLowerCase()?.trim();
-    if (!newLang || newLang.length !== 2) {
-      await socket.sendMessage(sender, { 
+    if (!newLang || !['fr', 'en', 'es', 'ht'].includes(newLang)) {
+      await socket.sendMessage(sender, {
         text: `╭━━━━━━━━━━━━━━━━━━╮\n` +
               `┃ 🌐 *KAIDO MULTILANG* ┃\n` +
               `╰━━━━━━━━━━━━━━━━━━╯\n\n` +
-              `❌ Code langue manquant ou invalide.\n\n` +
-              `📌 *Exemples d'utilisation :*\n` +
-              `• ${prefix}setlang en _(Anglais)_\n` +
+              `❌ Langue manquante ou non prise en charge.\n\n` +
+              `📌 *Catalogues locaux disponibles :*\n` +
               `• ${prefix}setlang fr _(Français)_\n` +
-              `• ${prefix}setlang es _(Espagnol)_\n\n` +
-              `📋 Codes ISO valides : https://cloud.google.com/translate/docs/languages` 
+              `• ${prefix}setlang en _(English)_\n` +
+              `• ${prefix}setlang es _(Español)_\n` +
+              `• ${prefix}setlang ht _(Kreyòl ayisyen)_`
       }, { quoted: msg });
       break;
     }
@@ -2630,7 +2637,7 @@ case 'removettt': {
 
     await socket.sendMessage(from, { react: { text: '🌐', key: msg.key } });
     await socket.sendMessage(sender, { 
-      text: `✅ *Configuration réussie !*\n\nToutes les réponses du bot seront désormais automatiquement traduites en : *${newLang.toUpperCase()}* avant envoi.` 
+      text: `✅ *Configuration réussie !*\n\nLes réponses statiques utilisent désormais le catalogue local *${newLang.toUpperCase()}*. L’IA et les quiz répondront dans cette langue.`
     }, { quoted: msg });
 
   } catch (e) {
@@ -7261,154 +7268,85 @@ case 'firstadmin': {
 
 case 'breact': {
   try {
-    // Les propriétaires et les admins Mongo partagent ce droit global.
     if (!isPrivileged) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Accès refusé. Cette commande est réservée aux administrateurs." 
+      await socket.sendMessage(sender, {
+        text: "❌ Accès refusé. Cette commande est réservée aux administrateurs."
       }, { quoted: msg });
       break;
     }
 
-    // Extraction des paramètres
     const q = body.split(' ').slice(1).join(' ').trim();
     if (!q.includes(',')) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Format : !breact <channelJid/messageId>,<emoji>\nExemple : !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍" 
+      await socket.sendMessage(sender, {
+        text: "❌ Format : !breact <channelJid/messageId>,<emoji>\nExemple : !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍"
       }, { quoted: msg });
       break;
     }
 
-    const parts = q.split(',');
-    let channelRef = parts[0].trim();
-    const reactEmoji = parts[1].trim();
-
-    // Les réactions de chaîne exigent le server_id de la publication.
-    const reference = parseNewsletterMessageReference(channelRef);
+    const [rawReference, ...emojiParts] = q.split(',');
+    const reference = parseNewsletterMessageReference(rawReference.trim());
+    const reactEmoji = emojiParts.join(',').trim();
     const channelJid = reference?.jid || '';
     const messageId = reference?.serverId || '';
-
-    // Validation du format
     if (!channelJid || !messageId || !reactEmoji) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Format invalide. Utilisez :\n1. `!breact 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n2. `!breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`" 
+      await socket.sendMessage(sender, {
+        text: "❌ Format invalide. Utilise !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍 ou un lien whatsapp.com/channel/<id>/<server_id>."
       }, { quoted: msg });
       break;
     }
 
-    // Récupérer tous les bots connectés depuis MongoDB
-    const allNumbers = await getAllNumbersFromMongo();
-    
-    if (!allNumbers || allNumbers.length === 0) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Aucun bot trouvé dans la base de données." 
-      }, { quoted: msg });
+    // Réagir avec les sockets déjà actifs; la session qui reçoit la commande
+    // est ajoutée si elle n'est pas encore inscrite dans la Map. Aucun fetch
+    // Mongo ni abonnement newsletter n'est requis avant le premier envoi.
+    const sessions = [...activeSockets.entries()]
+      .filter(([, botSocket]) => botSocket)
+      .map(([session, botSocket]) => ({ session, socket: botSocket }));
+    if (!sessions.some(entry => entry.socket === socket)) {
+      sessions.push({ session: number || socket.user?.id || 'session-courante', socket });
+    }
+
+    if (!sessions.length) {
+      await socket.sendMessage(sender, { text: "❌ Aucun bot actuellement connecté." }, { quoted: msg });
       break;
     }
 
-    // Filtrer les bots actuellement connectés
-    const connectedNumbers = allNumbers.filter(num => activeSockets.has(num));
-    
-    if (connectedNumbers.length === 0) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Aucun bot actuellement connecté." 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Réagir avec ☑️ pour confirmer la commande
-    await socket.sendMessage(sender, { react: { text: "☑️", key: msg.key } });
-
-    // Envoyer un message d'information
-    await socket.sendMessage(sender, { 
-      text: `🚀 Lancement de la commande multi-bots...
-
-📢 Canal : ${channelJid.split('@')[0]}
-📝 Message ID : ${messageId}
-😊 Émoji : ${reactEmoji}
-🤖 Bots concernés : ${connectedNumbers.length}
-
-L'opération est en cours...`
-    }, { quoted: msg });
-
-    // Lancer les réactions en arrière-plan
-    (async () => {
-      const results = [];
-      
-      for (const botNumber of connectedNumbers) {
-        try {
-          const botSocket = activeSockets.get(botNumber);
-          
-          // NYXCORE expose newsletterReactMessage(jid, serverId, reaction).
-          await reactToNewsletterMessage(botSocket, channelJid, messageId, reactEmoji, {
-            ensureFollow: true,
-            followDelayMs: 1500
-          });
-          
-          // Sauvegarder dans MongoDB
-          await saveNewsletterReaction(channelJid, messageId, reactEmoji, botNumber);
-          
-          results.push({ bot: botNumber, status: '✅' });
-          
-        } catch (error) {
-          console.error(`❌ Erreur pour le bot ${botNumber}:`, error.message);
-          results.push({ bot: botNumber, status: '❌', error: error.message });
-        }
-        
-        // Pause pour éviter le rate limiting
-        await delay(1000);
+    const reactionRun = reactAcrossNewsletterSockets(
+      sessions,
+      channelJid,
+      messageId,
+      reactEmoji,
+      async session => {
+        const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
+        if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
       }
-      
-      // Compter les résultats
-      const successCount = results.filter(r => r.status === '✅').length;
-      const failCount = results.filter(r => r.status === '❌').length;
-      
-      // Envoyer un rapport final
-      let report = `📊 **RAPPORT D'EXÉCUTION** 📊
-
-✅ Commandes envoyées : ${connectedNumbers.length}
-✅ Réussites : ${successCount}
-❌ Échecs : ${failCount}
-📈 Taux de succès : ${Math.round((successCount / connectedNumbers.length) * 100)}%
-
-━━━━━━━━━━━━━━━━━━
-
-📢 Cible : ${channelJid.split('@')[0]}
-📝 Message : ${messageId}
-😊 Émoji : ${reactEmoji}
-🕒 Terminé à : ${getHaitiTimestamp()}
-
-━━━━━━━━━━━━━━━━━━`;
-
-      // Ajouter les détails des échecs si nécessaire
-      const failedBots = results.filter(r => r.status === '❌');
-      if (failedBots.length > 0) {
-        report += `\n\n📋 **Bots en échec :**\n`;
-        failedBots.slice(0, 10).forEach(bot => {
-          report += `• ${bot.bot} : ${bot.error?.substring(0, 50)}${bot.error?.length > 50 ? '...' : ''}\n`;
-        });
-        if (failedBots.length > 10) {
-          report += `\n... et ${failedBots.length - 10} autres`;
-        }
+    ).then(async results => {
+      const succeeded = results.filter(result => result.ok).length;
+      const failed = results.filter(result => !result.ok).length;
+      const persistenceWarnings = results.filter(result => result.ok && result.persistenceError);
+      let report = `📊 RAPPORT B.REACT\n\n✅ Réactions envoyées : ${succeeded}\n❌ Échecs : ${failed}\n🤖 Sessions essayées : ${results.length}\n\n📢 Canal : ${channelJid.split('@')[0]}\n📝 Publication : ${messageId}\n😊 Emoji : ${reactEmoji}`;
+      const failedSessions = results.filter(result => !result.ok);
+      if (failedSessions.length) {
+        report += `\n\nÉchecs :\n${failedSessions.slice(0, 10).map(item => `• ${item.session} : ${item.error}`).join('\n')}`;
       }
-      
-      // Envoyer le rapport
+      if (persistenceWarnings.length) {
+        report += `\n⚠️ ${persistenceWarnings.length} réaction(s) envoyée(s), mais non enregistrée(s) dans MongoDB.`;
+      }
       await socket.sendMessage(sender, { text: report });
-      
-    })(); // Fin de l'exécution asynchrone
+    }).catch(async error => {
+      console.error('[BREACT REPORT ERROR]', error);
+      await socket.sendMessage(sender, { text: `⚠️ Les réactions ont commencé, mais le rapport a échoué : ${error?.message || error}` }).catch(() => {});
+    });
 
+    // Lancer en arrière-plan sans attendre le nombre de bots ni un délai de follow.
+    void reactionRun;
+    await socket.sendMessage(sender, {
+      text: `🚀 Réaction lancée immédiatement.\n📢 Canal : ${channelJid.split('@')[0]}\n📝 Publication : ${messageId}\n😊 Emoji : ${reactEmoji}\n🤖 Sessions actives : ${sessions.length}\n\nAucun abonnement préalable n'est nécessaire.`
+    }, { quoted: msg });
   } catch (error) {
     console.error('❌ Erreur commande breact:', error);
     try {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: `❌ Erreur interne : ${error.message}` 
-      }, { quoted: msg });
-    } catch (e) {}
+      await socket.sendMessage(sender, { text: `❌ Erreur interne : ${error.message || error}` }, { quoted: msg });
+    } catch (_) {}
   }
   break;
 }
@@ -7558,39 +7496,18 @@ case 'code': {
 
     const code = result.code.trim();
 
-    // Message interactif avec bouton copy
-    await socket.relayMessage(codeChat, {
-      viewOnceMessage: {
-        message: {
-          interactiveMessage: {
-            body: {
-              text: `*✅ CODE DE CONNEXION TROUVÉ*\n\n` +
-                    `*📱 Numéro:* ${cleanNumber}\n` +
-                    `*🔑 Code:* \`${code}\`\n\n` +
-                    `*📋 INSTRUCTIONS:*\n` +
-                    `1. Ouvrez WhatsApp → Paramètres → Appareils liés\n` +
-                    `2. Connecter un appareil → Lier avec un code\n` +
-                    `3. Entrez le code ci-dessus\n\n` +
-                    `⚠️ Le code expire dans 20 secondes`
-            },
-            footer: { text: "> © KAIDO-MD" },
-            header: { hasMediaAttachment: false, title: "Connexion WhatsApp" },
-            nativeFlowMessage: {
-              buttons: [
-                {
-                  name: "cta_copy",
-                  buttonParamsJson: JSON.stringify({
-                    display_text: "📋 Copier le code",
-                    id: "copy_code",
-                    copy_code: code
-                  })
-                }
-              ]
-            }
-          }
-        }
-      }
-    }, { quoted: msg });
+    // Texte simple pour rester compatible avec tous les clients WhatsApp.
+    // Le payload interactif instable n'est pas nécessaire pour copier le code.
+    await socket.sendMessage(codeChat, {
+      text: `*✅ CODE DE CONNEXION TROUVÉ*\n\n` +
+            `*📱 Numéro:* ${cleanNumber}\n` +
+            `*🔑 Code:* \`${code}\`\n\n` +
+            `*📋 INSTRUCTIONS:*\n` +
+            `1. Ouvre WhatsApp → Paramètres → Appareils liés\n` +
+            `2. Connecter un appareil → Lier avec un code\n` +
+            `3. Saisis le code ci-dessus\n\n` +
+            `⚠️ Le code expire dans 20 secondes`
+    }, { quoted: msg, __kaidoSkipLocalFormatting: true });
 
     await socket.sendMessage(codeChat, { react: { text: "✅", key: msg.key } });
 

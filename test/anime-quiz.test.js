@@ -53,6 +53,34 @@ test('quiz starts with an AI-generated QCM and does not expose its answer in the
   assert.equal(service.getState('15550001111', '120363@g.us').question.poll, false);
 });
 
+test('le quiz génère et conserve la langue choisie sur les questions suivantes', async () => {
+  const prompts = [];
+  const service = createAnimeQuizService({
+    router: {
+      async complete(messages) {
+        prompts.push(messages);
+        return { text: JSON.stringify({
+          question: '¿Quién es Luffy?',
+          options: ['Luffy', 'Zoro', 'Nami', 'Sanji'],
+          answer: 'Luffy',
+          explanation: 'Es el protagonista.'
+        }) };
+      }
+    }
+  });
+  const session = '5091';
+  const chat = 'quiz@g.us';
+  await service.start({ sessionNumber: session, chatJid: chat, topic: 'One Piece', language: 'es' });
+  service.submitTextAnswer(session, chat, '1@s.whatsapp.net', 'A');
+  await service.next(session, chat);
+
+  assert.equal(prompts.length, 2);
+  for (const messages of prompts) {
+    assert.match(messages[0].content, /exclusivement en espagnol/);
+    assert.match(messages[1].content, /en espagnol/);
+  }
+});
+
 test('text answers accept the correct option letter and mention/score the winner in the verdict', async () => {
   const { service } = createService();
   await service.start({ sessionNumber: '1', chatJid: 'group@g.us', topic: 'One Piece' });
@@ -137,6 +165,33 @@ test('plugin scoreboard includes participant mentions', () => {
   ]);
   assert.match(result.text, /@333/);
   assert.deepEqual(result.mentions, ['333@s.whatsapp.net']);
+});
+
+test('les messages fixes de quiz et le verdict suivent aussi la langue sélectionnée', async () => {
+  const render = quizPlugin._test.renderQuestion({
+    language: 'en',
+    topic: 'Frieren',
+    questionIndex: 0,
+    question: { mode: 'multiple_choice', poll: false, question: 'Who is Frieren?', options: ['Mage', 'King', 'Knight', 'Dragon'] }
+  });
+  assert.match(render, /ANIME QUIZ/);
+  assert.match(render, /Reply with A, B, C, D/);
+  assert.match(render, /To stop:/);
+  const help = quizPlugin._test.renderHelp('!', 'es');
+  assert.match(help, /Cuestionario de anime/);
+  assert.match(help, /elegir un anime/);
+  assert.match(help, /!quiz next — siguiente pregunta/);
+  const verdict = formatQuizVerdict({
+    language: 'ht',
+    topic: 'One Piece',
+    answer: 'Luffy',
+    winners: [],
+    scores: [],
+    explanation: 'Se pèsonaj prensipal la.'
+  });
+  assert.match(verdict.text, /Tan an fini/);
+  assert.match(verdict.text, /Repons/);
+  assert.match(verdict.text, /Se pèsonaj prensipal la/);
 });
 
 test('failed AI generation does not leave a phantom active quiz', async () => {

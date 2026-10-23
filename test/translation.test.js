@@ -8,7 +8,8 @@ const {
   saveSessionLanguage,
   getSessionLanguage,
   setupTranslationWrapper,
-  MAX_CONCURRENT_TRANSLATIONS,
+  SKIP_FORMATTING_OPTION,
+  SUPPORTED_LANGUAGES,
   _test
 } = require('../src/features/translation');
 
@@ -36,7 +37,7 @@ function fakeSocket() {
   };
 }
 
-test('MongoDB lent ou bloqué ne retarde pas les réponses WhatsApp', async () => {
+test('MongoDB lent ne retarde pas les réponses et les réponses statiques sont stylisées localement', async () => {
   _test.clearCache();
   configureStorage({ findOne: () => new Promise(() => {}) });
   const socket = fakeSocket();
@@ -44,81 +45,65 @@ test('MongoDB lent ou bloqué ne retarde pas les réponses WhatsApp', async () =
 
   const startedAt = Date.now();
   await socket.sendMessage('chat@s.whatsapp.net', { text: 'Réponse immédiate' });
-  assert.ok(Date.now() - startedAt < 100, 'la recherche de langue ne doit pas être sur le chemin critique');
-  assert.equal(socket.sent[0].content.text, 'Réponse immédiate');
+  assert.ok(Date.now() - startedAt < 100, 'la recherche de langue reste hors du chemin critique');
+  assert.match(socket.sent[0].content.text, /[\u{1D400}-\u{1D7FF}]/u);
   assert.equal(await getSessionLanguage('50947440869'), 'fr');
   _test.clearCache();
 });
 
-test('la traduction en cache fonctionne sans modifier le contenu original', async () => {
+test('les phrases statiques utilisent le catalogue local choisi et préservent les commandes', async () => {
   _test.clearCache();
   configureStorage();
   await saveSessionLanguage('50947440869', 'en');
   const socket = fakeSocket();
-  setupTranslationWrapper(socket, '50947440869', {
-    translate: async text => ({ text: `EN: ${text}` }),
-    translationTimeoutMs: 50
-  });
-  const content = { text: 'Bonjour', caption: 'Légende' };
+  setupTranslationWrapper(socket, '50947440869');
+  const original = { text: 'Aucun quiz en cours. Lance-en un avec .quiz.' };
 
-  await socket.sendMessage('chat@s.whatsapp.net', content, { quoted: { key: { id: 'q' } } });
-  assert.deepEqual(socket.sent[0].content, { text: 'EN: Bonjour', caption: 'EN: Légende' });
-  assert.equal(content.text, 'Bonjour');
-  assert.equal(content.caption, 'Légende');
+  await socket.sendMessage('chat@s.whatsapp.net', original, { quoted: { key: { id: 'q' } } });
+  assert.equal(
+    socket.sent[0].content.text,
+    _test.styleStaticText('No quiz is running. Start one with .quiz.', 'sans-bold')
+  );
+  assert.ok(socket.sent[0].content.text.includes('.quiz.'));
+  assert.equal(original.text, 'Aucun quiz en cours. Lance-en un avec .quiz.');
   assert.equal(socket.sent[0].options.quoted.key.id, 'q');
   _test.clearCache();
 });
 
-test('une API de traduction bloquée retombe sur le texte original avec délai borné', async () => {
+test('les réponses IA et codes peuvent ignorer traduction et stylisation sans transmettre l’option interne', async () => {
   _test.clearCache();
   configureStorage();
-  await saveSessionLanguage('50947440869', 'en');
+  await saveSessionLanguage('50947440869', 'ht');
   const socket = fakeSocket();
-  let resolveTranslation;
-  setupTranslationWrapper(socket, '50947440869', {
-    translate: () => new Promise(resolve => { resolveTranslation = resolve; }),
-    translationTimeoutMs: 15
+  setupTranslationWrapper(socket, '50947440869');
+  const aiText = 'Kaido answers in English, even if that is not the selected language.';
+
+  await socket.sendMessage('chat@s.whatsapp.net', { text: aiText }, {
+    quoted: { key: { id: 'q' } },
+    [SKIP_FORMATTING_OPTION]: true
   });
-
-  const startedAt = Date.now();
-  await socket.sendMessage('chat@s.whatsapp.net', { text: 'Toujours livrer' });
-  assert.ok(Date.now() - startedAt < 150, 'la traduction ne doit pas bloquer indéfiniment');
-  assert.equal(socket.sent[0].content.text, 'Toujours livrer');
-  resolveTranslation({ text: 'late translation' });
-  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(socket.sent[0].content.text, aiText);
+  assert.deepEqual(socket.sent[0].options, { quoted: { key: { id: 'q' } } });
   _test.clearCache();
 });
 
-test('borne le nombre de requêtes de traduction concurrentes entre sessions', async () => {
-  _test.clearCache();
-  configureStorage();
-  await saveSessionLanguage('50947440869', 'en');
-  let started = 0;
-  const finish = [];
-  const sockets = Array.from({ length: 5 }, () => fakeSocket());
-  for (const socket of sockets) {
-    setupTranslationWrapper(socket, '50947440869', {
-      translate: () => new Promise(resolve => {
-        started += 1;
-        finish.push(() => resolve({ text: 'translated' }));
-      }),
-      translationTimeoutMs: 100
-    });
+test('le style garde les commandes, numéros et mentions techniquement copiables', () => {
+  const styled = _test.styleStaticText('Réponds avec .quiz à @50912345678 ou au 50911111111.', 'sans-bold');
+  assert.ok(styled.includes('.quiz'));
+  assert.ok(styled.includes('@50912345678'));
+  assert.ok(styled.includes('50911111111'));
+});
+
+test('les catalogues locaux existent pour toutes les langues sélectionnables', () => {
+  assert.deepEqual(SUPPORTED_LANGUAGES, ['fr', 'en', 'es', 'ht']);
+  for (const language of SUPPORTED_LANGUAGES) {
+    assert.ok(_test.loadLocale(language));
   }
-
-  const sends = sockets.map(socket => socket.sendMessage('chat@s.whatsapp.net', {
-    text: 'hello',
-    caption: 'caption'
-  }));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(started, MAX_CONCURRENT_TRANSLATIONS);
-  for (const resolve of finish) resolve();
-  await Promise.all(sends);
-  assert.ok(sockets.every(socket => socket.sent.length === 1));
-  _test.clearCache();
+  assert.equal(_test.translateStaticText('Configuration réussie !', 'ht'), 'Konfigirasyon an anrejistre!');
+  assert.throws(() => _test.assertLanguage('de'), /Langue indisponible/);
 });
 
-test('enregistre immédiatement une langue confirmée en MongoDB dans le cache mémoire', async () => {
+test('enregistre immédiatement la langue confirmée dans MongoDB et le cache mémoire', async () => {
   _test.clearCache();
   let saved;
   configureStorage({

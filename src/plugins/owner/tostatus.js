@@ -704,7 +704,7 @@ async function executeToStatus(context, dependencies = {}) {
       label = '📝 Texte';
     }
 
-    const messageOptions = { statusJidList, broadcast: true };
+    const messageOptions = { statusJidList, broadcast: true, useUserDevicesCache: false };
     if (addressingMode === 'lid') {
       messageOptions.additionalAttributes = { addressing_mode: 'lid' };
     }

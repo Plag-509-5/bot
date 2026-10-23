@@ -11,6 +11,7 @@ const {
   parseNewsletterMessageReference,
   extractNewsletterServerId,
   reactToNewsletterMessage,
+  reactAcrossNewsletterSockets,
   syncNewsletterSockets
 } = require('../src/services/newsletter-config');
 
@@ -64,17 +65,37 @@ test('lit le server_id officiel depuis la clé NYXCORE et utilise newsletterReac
   ]]);
 });
 
-test('le helper de réaction peut suivre le canal avant d’utiliser l’API NYXCORE', async () => {
+test('la réaction ne suit jamais le canal et démarre directement via NYXCORE', async () => {
   const calls = [];
   const socket = {
-    async newsletterFollow(jid) { calls.push(['follow', jid]); },
+    async newsletterFollow(jid) { calls.push(['follow', jid]); throw new Error('follow interdit pour ce test'); },
     async newsletterReactMessage(jid, serverId, emoji) { calls.push(['reaction', jid, serverId, emoji]); }
   };
   await reactToNewsletterMessage(socket, '0029Vb761O39mrGTZvQ8UQ02', '175', '👍', { ensureFollow: true });
   assert.deepEqual(calls, [
-    ['follow', '0029Vb761O39mrGTZvQ8UQ02@newsletter'],
     ['reaction', '0029Vb761O39mrGTZvQ8UQ02@newsletter', '175', '👍']
   ]);
+});
+
+test('breact lance immédiatement toutes les sessions uniques sans follow préalable', async () => {
+  const calls = [];
+  const createSocket = id => ({
+    user: { id: `${id}@s.whatsapp.net` },
+    async newsletterFollow() { throw new Error('aucun follow attendu'); },
+    async newsletterReactMessage(jid, serverId, emoji) {
+      calls.push([id, jid, serverId, emoji]);
+    }
+  });
+  const first = createSocket('bot-1');
+  const second = createSocket('bot-2');
+  const results = await reactAcrossNewsletterSockets([
+    { session: '5091', socket: first },
+    { session: '5092', socket: second },
+    { session: '5091-duplicate', socket: first }
+  ], '120363402094635383', '175', '🔥');
+  assert.equal(results.filter(result => result.ok).length, 2);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(call => call[0]).sort(), ['bot-1', 'bot-2']);
 });
 
 test('refuse de réagir sans server_id au lieu d’utiliser le stanza id', async () => {

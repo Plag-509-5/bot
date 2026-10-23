@@ -52,12 +52,31 @@ test('la mémoire partagée reste identique quand le routeur change de fournisse
   assert.equal(prompts[0][0].role, 'system');
   assert.match(prompts[0][0].content, /Kaido, le Roi des Bêtes/);
   assert.deepEqual(prompts[1].slice(0, 4), [
-    { role: 'system', content: KAIDO_SYSTEM_PROMPT },
+    { role: 'system', content: `${KAIDO_SYSTEM_PROMPT} Réponds exclusivement en français, même si la question est posée dans une autre langue; conserve les noms propres et les citations nécessaires.` },
     { role: 'user', content: 'Alice : Bonjour Kaido' },
     { role: 'assistant', content: 'réponse-1' },
     { role: 'user', content: 'Bob : Tu te souviens de ma question ?' }
   ]);
   assert.equal(chatbot.getStatus().memory.conversations, 1);
+});
+
+test('la langue sélectionnée devient la langue obligatoire des réponses IA', async () => {
+  let systemPrompt = '';
+  const chatbot = createAiChatbot({
+    env: {},
+    router: fakeRouter(async messages => {
+      systemPrompt = messages[0].content;
+      return { text: 'M reponn an kreyòl.', provider: 'provider-a' };
+    })
+  });
+  const result = await chatbot.respond({
+    sessionNumber: '5091',
+    chatJid: 'chat@s.whatsapp.net',
+    text: 'What time is it?',
+    language: 'ht'
+  });
+  assert.match(systemPrompt, /exclusivement en créole haïtien/);
+  assert.equal(result.text, 'M reponn an kreyòl.');
 });
 
 test('les chats et sessions gardent des historiques distincts', async () => {

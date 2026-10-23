@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const MENU_IMAGE_PATH = path.join(__dirname, '../../../assets/images/kaido-menu-banner.png');
+const MENU_THUMBNAIL_PATH = path.join(__dirname, '../../../assets/images/kaido-menu-thumbnail.jpg');
 
 function createFakeMenuEventQuote(botName = 'KAIDO-MD', now = Date.now()) {
   const startTime = Math.floor(now / 1000);
@@ -29,32 +30,26 @@ function createFakeMenuEventQuote(botName = 'KAIDO-MD', now = Date.now()) {
 }
 
 async function sendMenuPresentation({ socket, from, msg, text, mentions, botName }) {
-  let eventQuote = createFakeMenuEventQuote(botName);
-  try {
-    const sentEvent = await socket.sendMessage(from, {
-      event: {
-        name: `${String(botName || 'KAIDO-MD').slice(0, 60)} • Menu`,
-        description: 'Bienvenue dans le menu des commandes Kaido MD.',
-        startDate: new Date(),
-        endDate: new Date(Date.now() + 60 * 60 * 1000),
-        extraGuestsAllowed: false,
-        isScheduleCall: false
-      }
-    });
-    if (sentEvent?.message?.eventMessage) eventQuote = sentEvent;
-  } catch (error) {
-    console.warn('[MENU] Événement natif indisponible; habillage fictif cité :', error?.message || error);
-  }
+  // WhatsApp ne permet pas de combiner dans un même payload un eventMessage
+  // natif, une image-message et le long texte du menu. Envoyer séparément
+  // produisait trois messages; on garde donc un message texte unique, avec
+  // l'image en vignette externalAdReply et l'événement décoratif cité.
+  const thumbnail = fs.readFileSync(MENU_THUMBNAIL_PATH);
 
-  const image = fs.readFileSync(MENU_IMAGE_PATH);
-  await socket.sendMessage(from, {
-    image,
-    mimetype: 'image/png',
-    caption: `🐉 *${botName || 'KAIDO-MD'} — MENU DES COMMANDES*\n⚔️ Guide de la session Kaido MD`
-  }, { quoted: eventQuote || msg });
+  const eventQuote = createFakeMenuEventQuote(botName);
   return socket.sendMessage(from, {
     text,
-    mentions: mentions || []
+    mentions: mentions || [],
+    contextInfo: {
+      externalAdReply: {
+        title: `${String(botName || 'KAIDO-MD').slice(0, 60)} — Menu`,
+        body: 'Guide de la session Kaido MD',
+        thumbnail,
+        mediaType: 1,
+        showAdAttribution: false,
+        renderLargerThumbnail: true
+      }
+    }
   }, { quoted: eventQuote || msg });
 }
 
@@ -212,5 +207,5 @@ module.exports = {
       botName: config?.BOT_NAME || 'KAIDO-MD'
     });
   },
-  _test: { classifyLegacy, buildCommandSections, buildMenuText, formatUptime, createFakeMenuEventQuote, sendMenuPresentation, MENU_IMAGE_PATH }
+  _test: { classifyLegacy, buildCommandSections, buildMenuText, formatUptime, createFakeMenuEventQuote, sendMenuPresentation, MENU_IMAGE_PATH, MENU_THUMBNAIL_PATH }
 };

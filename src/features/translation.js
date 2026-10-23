@@ -1,21 +1,26 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+
 const COLLECTION_NAME = 'session_languages';
 const DEFAULT_LANGUAGE = 'fr';
+const SUPPORTED_LANGUAGES = Object.freeze(['fr', 'en', 'es', 'ht']);
 const DEFAULT_LANGUAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_LANGUAGE_ERROR_TTL_MS = 30 * 1000;
 const DEFAULT_LANGUAGE_LOOKUP_TIMEOUT_MS = 1_500;
-const DEFAULT_TRANSLATION_TIMEOUT_MS = 500;
-const MAX_CONCURRENT_TRANSLATIONS = 8;
 const LANGUAGE_CACHE_MAX_ENTRIES = 500;
 const TRANSLATION_WRAPPER_MARK = Symbol.for('kaido.translationWrapper');
+const SKIP_FORMATTING_OPTION = '__kaidoSkipLocalFormatting';
+const LOCALE_DIR = path.join(__dirname, '../locales');
 
 let initMongoProvider = null;
 let getDbProvider = null;
 let languageLookupTimeoutMs = DEFAULT_LANGUAGE_LOOKUP_TIMEOUT_MS;
 const languageCache = new Map();
 const languageLoads = new Map();
-let activeTranslations = 0;
+const localeCache = new Map();
+let styleSequence = 0;
 
 function normaliseSessionId(sessionId) {
   return String(sessionId || '').replace(/[^0-9]/g, '');
@@ -23,13 +28,13 @@ function normaliseSessionId(sessionId) {
 
 function normaliseLanguage(langCode) {
   const language = String(langCode || '').trim().toLowerCase();
-  return /^[a-z]{2}$/.test(language) ? language : DEFAULT_LANGUAGE;
+  return SUPPORTED_LANGUAGES.includes(language) ? language : DEFAULT_LANGUAGE;
 }
 
 function assertLanguage(langCode) {
   const language = String(langCode || '').trim().toLowerCase();
-  if (!/^[a-z]{2}$/.test(language)) {
-    throw new TypeError('Le code langue doit contenir deux lettres ISO.');
+  if (!SUPPORTED_LANGUAGES.includes(language)) {
+    throw new TypeError(`Langue indisponible. Choisis : ${SUPPORTED_LANGUAGES.join(', ')}.`);
   }
   return language;
 }
@@ -68,7 +73,6 @@ function withTimeout(promise, timeoutMs, fallback) {
       if (timer !== null) clearTimeout(timer);
       resolve(value);
     };
-
     timer = setTimeout(() => finish(fallback), Math.max(0, timeoutMs));
     Promise.resolve(promise).then(finish, () => finish(fallback));
   });
@@ -76,7 +80,7 @@ function withTimeout(promise, timeoutMs, fallback) {
 
 async function translationCollection() {
   if (!initMongoProvider || !getDbProvider) {
-    throw new Error('Stockage de traduction MongoDB non configuré');
+    throw new Error('Stockage de langue MongoDB non configuré');
   }
   await initMongoProvider();
   const db = getDbProvider();
@@ -90,14 +94,9 @@ async function readSessionLanguage(sessionId) {
   return normaliseLanguage(doc?.lang);
 }
 
-/**
- * Charge la langue en arrière-plan. Une panne ou une requête Mongo lente ne
- * doit jamais retarder l'envoi d'une réponse WhatsApp.
- */
 function primeSessionLanguage(sessionId, timeoutMs = languageLookupTimeoutMs) {
   const key = normaliseSessionId(sessionId);
   if (!key) return Promise.resolve(DEFAULT_LANGUAGE);
-
   const cached = getCachedLanguage(key);
   if (cached) return Promise.resolve(cached);
   const pending = languageLoads.get(key);
@@ -121,15 +120,10 @@ function primeSessionLanguage(sessionId, timeoutMs = languageLookupTimeoutMs) {
     .finally(() => {
       if (languageLoads.get(key)?.token === token) languageLoads.delete(key);
     });
-
   languageLoads.set(key, { token, promise });
   return promise;
 }
 
-/**
- * Resolve instantanément depuis le cache; sinon lance une lecture Mongo limitée
- * dans le temps et renvoie le français par défaut pour cette réponse.
- */
 async function getSessionLanguage(sessionId) {
   const key = normaliseSessionId(sessionId);
   if (!key) return DEFAULT_LANGUAGE;
@@ -139,7 +133,6 @@ async function getSessionLanguage(sessionId) {
   return DEFAULT_LANGUAGE;
 }
 
-/** Sauvegarde la langue d'une session dans le MongoDB central. */
 async function saveSessionLanguage(sessionId, langCode) {
   const key = normaliseSessionId(sessionId);
   if (!key) throw new Error('Numéro de session invalide');
@@ -150,110 +143,133 @@ async function saveSessionLanguage(sessionId, langCode) {
     { $set: { lang: language, updatedAt: new Date() } },
     { upsert: true }
   );
-
-  // Une lecture Mongo démarrée avant la commande ne doit pas écraser son choix.
   languageLoads.delete(key);
   rememberLanguage(key, language);
   return true;
 }
 
-function resolveTranslateFunction(override) {
-  if (typeof override === 'function') return override;
+function loadLocale(language) {
+  const lang = normaliseLanguage(language);
+  if (localeCache.has(lang)) return localeCache.get(lang);
+  let catalog = {};
   try {
-    const provider = require('@vitalets/google-translate-api');
-    return provider.translate || provider.default?.translate || provider.default || null;
-  } catch (_) {
-    return null;
+    catalog = JSON.parse(fs.readFileSync(path.join(LOCALE_DIR, `${lang}.json`), 'utf8'));
+  } catch (error) {
+    console.warn(`[LANG] Catalogue local ${lang} indisponible :`, error?.message || error);
   }
+  const responseMap = catalog && typeof catalog.responses === 'object' ? catalog.responses : {};
+  localeCache.set(lang, responseMap);
+  return responseMap;
 }
 
-async function translateContent(content, targetLanguage, translateFn, timeoutMs) {
+function translateStaticText(value, language) {
+  const input = String(value || '');
+  const lang = normaliseLanguage(language);
+  if (!input || lang === DEFAULT_LANGUAGE) return input;
+  const translations = loadLocale(lang);
+  const phrases = Object.entries(translations)
+    .filter(([source, target]) => source && typeof target === 'string' && source !== target)
+    .sort((a, b) => b[0].length - a[0].length);
+  let output = input;
+  for (const [source, target] of phrases) output = output.split(source).join(target);
+  return output;
+}
+
+const SMALL_CAPS = Object.freeze({
+  a: 'ᴀ', b: 'ʙ', c: 'ᴄ', d: 'ᴅ', e: 'ᴇ', f: 'ғ', g: 'ɢ', h: 'ʜ', i: 'ɪ',
+  j: 'ᴊ', k: 'ᴋ', l: 'ʟ', m: 'ᴍ', n: 'ɴ', o: 'ᴏ', p: 'ᴘ', q: 'ǫ', r: 'ʀ',
+  s: 's', t: 'ᴛ', u: 'ᴜ', v: 'ᴠ', w: 'ᴡ', x: 'x', y: 'ʏ', z: 'ᴢ'
+});
+const FONT_STYLES = Object.freeze(['sans-bold', 'small-caps', 'serif-bold', 'typewriter']);
+
+function mapStyledCharacter(character, style) {
+  const code = character.codePointAt(0);
+  const upper = code >= 65 && code <= 90;
+  const lower = code >= 97 && code <= 122;
+  const digit = code >= 48 && code <= 57;
+  if (!upper && !lower && !digit) return character;
+  if (style === 'small-caps') {
+    return lower ? (SMALL_CAPS[character] || character) : character;
+  }
+  const base = style === 'sans-bold'
+    ? { upper: 0x1D5D4, lower: 0x1D5EE, digit: 0x1D7EC }
+    : style === 'serif-bold'
+      ? { upper: 0x1D400, lower: 0x1D41A, digit: 0x1D7CE }
+      : { upper: 0x1D670, lower: 0x1D68A, digit: 0x1D7F6 };
+  const offset = upper ? code - 65 : lower ? code - 97 : code - 48;
+  return String.fromCodePoint((upper ? base.upper : lower ? base.lower : base.digit) + offset);
+}
+
+function styleStaticText(value, style) {
+  const text = String(value || '');
+  // Leave values that need exact typing/copying readable: URLs, inline code,
+  // WhatsApp identifiers, and bot command names.
+  const protectedPattern = /(`[^`]*`|https?:\/\/\S+|\b[\w.+-]+@[\w.-]+\b|@\d{5,15}|\+?\d{6,15}|(?:^|\s)([.!/][a-z][a-z0-9_-]*)(?=[\s.,!?;:]|$))/gi;
+  let output = '';
+  let lastIndex = 0;
+  for (const match of text.matchAll(protectedPattern)) {
+    const start = match.index;
+    const protectedValue = match[0];
+    const commandPrefix = match[1] || '';
+    const commandStart = commandPrefix ? protectedValue.lastIndexOf(commandPrefix) : -1;
+    const normalPart = commandStart >= 0 ? protectedValue.slice(0, commandStart) : '';
+    output += [...text.slice(lastIndex, start) + normalPart]
+      .map(character => mapStyledCharacter(character, style)).join('');
+    output += commandStart >= 0 ? commandPrefix : protectedValue;
+    lastIndex = start + protectedValue.length;
+  }
+  output += [...text.slice(lastIndex)].map(character => mapStyledCharacter(character, style)).join('');
+  return output;
+}
+
+function formatStaticContent(content, language, style) {
   if (!content || typeof content !== 'object') return content;
-  const fields = ['text', 'caption'].filter(field => (
-    typeof content[field] === 'string' && content[field].trim()
-  ));
-  if (!fields.length) return content;
-
-  const translate = resolveTranslateFunction(translateFn);
-  if (typeof translate !== 'function') return content;
-
   const translated = { ...content };
-  await Promise.all(fields.map(async field => {
-    if (activeTranslations >= MAX_CONCURRENT_TRANSLATIONS) return;
-    activeTranslations += 1;
-    const pending = Promise.resolve()
-      .then(() => translate(content[field], {
-        to: targetLanguage,
-        autoCorrect: true
-      }))
-      .finally(() => {
-        activeTranslations = Math.max(0, activeTranslations - 1);
-      });
-    const result = await withTimeout(pending, timeoutMs, null);
-    if (typeof result?.text === 'string' && result.text.trim()) translated[field] = result.text;
-  }));
+  // Style/localize textual bot replies only. Media captions can contain user or
+  // API-provided text, so leave them byte-for-byte unchanged.
+  if (typeof translated.text === 'string' && translated.text) {
+    translated.text = styleStaticText(translateStaticText(translated.text, language), style);
+  }
   return translated;
 }
 
-/**
- * Injecte la traduction automatique sans mettre la réponse en dépendance de
- * MongoDB ou de Google Translate. Langue inconnue = envoi immédiat du texte
- * d'origine; une traduction lente/indisponible retombe aussi sur l'original.
- */
 function setupTranslationWrapper(socket, number, options = {}) {
   if (!socket || typeof socket.sendMessage !== 'function' || socket[TRANSLATION_WRAPPER_MARK]) return;
-
   const originalSendMessage = socket.sendMessage.bind(socket);
   const sessionId = normaliseSessionId(number || socket.user?.id?.split(':')[0]);
   const lookupTimeoutMs = Number.isFinite(options.languageLookupTimeoutMs)
     ? Math.max(0, options.languageLookupTimeoutMs)
     : languageLookupTimeoutMs;
-  const translationTimeoutMs = Number.isFinite(options.translationTimeoutMs)
-    ? Math.max(0, options.translationTimeoutMs)
-    : DEFAULT_TRANSLATION_TIMEOUT_MS;
-  const translateFn = options.translate;
-
   if (sessionId) void primeSessionLanguage(sessionId, lookupTimeoutMs);
 
   socket.sendMessage = async (jid, content, sendOptions = {}) => {
-    if (!sessionId) return originalSendMessage(jid, content, sendOptions);
-
-    let targetLanguage = getCachedLanguage(sessionId);
-    if (!targetLanguage) {
-      void primeSessionLanguage(sessionId, lookupTimeoutMs);
-      targetLanguage = DEFAULT_LANGUAGE;
+    const { [SKIP_FORMATTING_OPTION]: skipFormatting, ...safeOptions } = sendOptions || {};
+    if (skipFormatting) return originalSendMessage(jid, content, safeOptions);
+    let language = DEFAULT_LANGUAGE;
+    if (sessionId) {
+      language = getCachedLanguage(sessionId) || DEFAULT_LANGUAGE;
+      if (!getCachedLanguage(sessionId)) void primeSessionLanguage(sessionId, lookupTimeoutMs);
     }
-    if (targetLanguage === DEFAULT_LANGUAGE) {
-      return originalSendMessage(jid, content, sendOptions);
-    }
-
-    const translatedContent = await translateContent(
-      content,
-      targetLanguage,
-      translateFn,
-      translationTimeoutMs
-    );
-    return originalSendMessage(jid, translatedContent, sendOptions);
+    const hasTextReply = typeof content?.text === 'string' && Boolean(content.text);
+    const style = FONT_STYLES[hasTextReply ? styleSequence++ % FONT_STYLES.length : 0];
+    return originalSendMessage(jid, formatStaticContent(content, language, style), safeOptions);
   };
-
   Object.defineProperty(socket, TRANSLATION_WRAPPER_MARK, { value: true, enumerable: false });
 }
 
 function configureTranslationStorage({ initMongo, getDb, languageLookupTimeoutMs: timeoutMs } = {}) {
   initMongoProvider = typeof initMongo === 'function' ? initMongo : null;
   getDbProvider = typeof getDb === 'function' ? getDb : null;
-  if (Number.isFinite(timeoutMs)) {
-    languageLookupTimeoutMs = Math.max(0, timeoutMs);
-  }
+  if (Number.isFinite(timeoutMs)) languageLookupTimeoutMs = Math.max(0, timeoutMs);
 }
 
 module.exports = {
   COLLECTION_NAME,
   DEFAULT_LANGUAGE,
+  SUPPORTED_LANGUAGES,
+  SKIP_FORMATTING_OPTION,
   DEFAULT_LANGUAGE_CACHE_TTL_MS,
   DEFAULT_LANGUAGE_LOOKUP_TIMEOUT_MS,
-  DEFAULT_TRANSLATION_TIMEOUT_MS,
-  MAX_CONCURRENT_TRANSLATIONS,
   configureTranslationStorage,
   saveSessionLanguage,
   getSessionLanguage,
@@ -262,8 +278,15 @@ module.exports = {
     clearCache() {
       languageCache.clear();
       languageLoads.clear();
+      localeCache.clear();
+      styleSequence = 0;
     },
     cacheLanguage: rememberLanguage,
-    getCachedLanguage
+    getCachedLanguage,
+    translateStaticText,
+    styleStaticText,
+    formatStaticContent,
+    assertLanguage,
+    loadLocale
   }
 };

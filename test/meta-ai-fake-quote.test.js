@@ -36,7 +36,7 @@ test('control reactions and actual event messages are not wrapped as fake quotes
   assert.deepEqual(socket.sent[1].options, {});
 });
 
-test('menu posts a native event, its artwork, and the full menu text with the event quoted', async () => {
+test('menu sends one message with its full text, artwork preview, and decorative event quote', async () => {
   const socket = fakeSocket();
   await menu._test.sendMenuPresentation({
     socket,
@@ -46,14 +46,13 @@ test('menu posts a native event, its artwork, and the full menu text with the ev
     mentions: ['123@s.whatsapp.net'],
     botName: 'Kaido'
   });
-  assert.equal(socket.sent.length, 3);
-  assert.equal(socket.sent[0].content.event.name, 'Kaido • Menu');
-  assert.ok(socket.sent[1].content.image.length > 0);
-  assert.match(socket.sent[1].content.caption, /MENU DES COMMANDES/);
-  assert.equal(socket.sent[1].options.quoted.message.eventMessage.name, 'Kaido • Menu');
-  assert.equal(socket.sent[2].content.text, 'Texte du menu complet');
-  assert.deepEqual(socket.sent[2].content.mentions, ['123@s.whatsapp.net']);
-  assert.equal(socket.sent[2].options.quoted.message.eventMessage.name, 'Kaido • Menu');
+  assert.equal(socket.sent.length, 1);
+  assert.equal(socket.sent[0].content.text, 'Texte du menu complet');
+  assert.ok(socket.sent[0].content.contextInfo.externalAdReply.thumbnail.length > 0);
+  assert.ok(socket.sent[0].content.contextInfo.externalAdReply.thumbnail.length < 50_000);
+  assert.equal(socket.sent[0].content.contextInfo.externalAdReply.title, 'Kaido — Menu');
+  assert.deepEqual(socket.sent[0].content.mentions, ['123@s.whatsapp.net']);
+  assert.equal(socket.sent[0].options.quoted.message.eventMessage.name, 'Kaido • Menu');
 });
 
 test('menu event quote builder creates a synthetic native event for fallback quoting', () => {

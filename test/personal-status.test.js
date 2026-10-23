@@ -138,7 +138,6 @@ test('normalise les destinataires PN/LID, retire les suffixes device et dédupli
   const list = await audience.getStatusJidList(socket, []);
   assert.deepEqual(list.sort(), [
     '123456789012345@lid',
-    '50900000000@s.whatsapp.net',
     '50911111111@s.whatsapp.net',
     '50933333333@s.whatsapp.net'
   ].sort());
@@ -162,14 +161,13 @@ test('public personnalisé prioritaire; fallback aux membres de groupe si aucun 
   const fallback = await audience.getStatusJidList(socket, []);
   assert.equal(groupFetches, 1);
   assert.deepEqual(fallback.sort(), [
-    '50900000000@s.whatsapp.net',
     '50911111111@s.whatsapp.net',
     '50922222222@s.whatsapp.net'
   ].sort());
 
   const custom = await audience.getStatusJidList(socket, ['50999999999']);
   assert.equal(groupFetches, 1, 'une audience personnalisée ne doit pas élargir au groupe');
-  assert.deepEqual(custom.sort(), ['50900000000@s.whatsapp.net', '50999999999@s.whatsapp.net'].sort());
+  assert.deepEqual(custom, ['50999999999@s.whatsapp.net']);
 });
 
 test('met en cache brièvement l’audience par socket et protège le cache des mutations appelantes', async () => {
@@ -191,7 +189,6 @@ test('met en cache brièvement l’audience par socket et protège le cache des 
 
   assert.equal(groupFetches, 1, 'l’audience par défaut ne doit pas relire les groupes à chaque statut');
   assert.deepEqual(second.sort(), [
-    '50900000000@s.whatsapp.net',
     '50911111111@s.whatsapp.net'
   ].sort());
   assert.equal(audience.DEFAULT_AUDIENCE_CACHE_TTL_MS, 60_000);
@@ -233,7 +230,6 @@ test('publie un statut texte avec statusJidList, option de fond et journal de su
   assert.equal(sent.some(event => event.jid === 'status@broadcast'), false, 'la publication doit passer par le relay NYXCORE, pas par un second chemin sendMessage');
   assert.equal(statusSend.message.extendedTextMessage.text, 'Bonjour');
   assert.deepEqual(statusSend.options.statusJidList.sort(), [
-    '50900000000@s.whatsapp.net',
     '50922222222@s.whatsapp.net'
   ].sort());
   assert.ok(statusSend.message.extendedTextMessage.backgroundArgb !== undefined);
@@ -282,10 +278,10 @@ test('un compte migré publie uniquement vers des LID et conserve le routage pou
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
   assert.deepEqual(
     [...statusSend.options.statusJidList].sort(),
-    ['self-lid@lid', 'contact-222@lid', 'contact-333@lid'].sort()
+    ['contact-222@lid', 'contact-333@lid'].sort()
   );
   assert.deepEqual(statusSend.options.additionalAttributes, { addressing_mode: 'lid' });
-  assert.equal(statusSend.options.useUserDevicesCache, undefined);
+  assert.equal(statusSend.options.useUserDevicesCache, false);
   assert.equal(statusLog.getLatest('50900000000').addressingMode, 'lid');
   assert.match(sent.at(-1).content.text, /visible par 2 destinataire/);
 
@@ -293,7 +289,7 @@ test('un compte migré publie uniquement vers des LID et conserve le routage pou
   const revoke = sent.find(event => event.jid === 'status@broadcast' && event.content.delete);
   assert.deepEqual(
     [...revoke.options.statusJidList].sort(),
-    ['self-lid@lid', 'contact-222@lid', 'contact-333@lid'].sort()
+    ['contact-222@lid', 'contact-333@lid'].sort()
   );
   assert.deepEqual(revoke.options.additionalAttributes, { addressing_mode: 'lid' });
   assert.equal(revoke.options.useUserDevicesCache, undefined);

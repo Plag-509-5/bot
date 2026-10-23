@@ -1,6 +1,7 @@
 'use strict';
 
 const { respond, formatAiError } = require('../../services/ai-chatbot');
+const { getSessionLanguage, SKIP_FORMATTING_OPTION } = require('../../features/translation');
 
 module.exports = {
   name: 'ai',
@@ -16,6 +17,7 @@ module.exports = {
       }, { quoted: msg });
     }
 
+    const language = await getSessionLanguage(sessionNumber);
     let presenceStarted = false;
     try {
       const result = await respond({
@@ -23,6 +25,7 @@ module.exports = {
         chatJid: from,
         senderName: String(from || '').endsWith('@g.us') ? msg?.pushName : '',
         text: query,
+        language,
         onStart: async () => {
           presenceStarted = true;
           if (typeof socket.sendPresenceUpdate === 'function') {
@@ -33,7 +36,7 @@ module.exports = {
       if (result.cancelled) return;
       await socket.sendMessage(from, {
         text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
-      }, { quoted: msg });
+      }, { quoted: msg, [SKIP_FORMATTING_OPTION]: true });
     } catch (error) {
       console.warn('[AI] Requête indisponible :', error?.code || error?.name || 'erreur');
       await socket.sendMessage(from, {
