@@ -20,7 +20,7 @@ test('.breact est public, répond par deux statuts sobres et ne suit pas les can
   const start = source.indexOf("case 'breact': {");
   const end = source.indexOf("case 'getpp': {", start);
   const block = source.slice(start, end);
-  assert.match(block, /reactAcrossNewsletterSocketsForEmojis\(/);
+  assert.match(block, /reactAcrossNewsletterSockets\(/);
   assert.match(block, /Tâche débutée/);
   assert.match(block, /formatBReactSummary\(succeeded, failed\)/);
   assert.doesNotMatch(block, /if\s*\(!isPrivileged\)|Accès refusé|ensureFollow|newsletterFollow|delay\(1000\)|\{\s*react:\s*\{/);

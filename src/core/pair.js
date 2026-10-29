@@ -48,13 +48,11 @@ const {
   normaliseEmojiList,
   resolveNewsletterEmojis,
   formatBReactSummary,
-  parseNewsletterChannelReference,
   parseNewsletterMessageReference,
   resolveNewsletterJid,
   extractNewsletterServerId,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
-  reactAcrossNewsletterSocketsForEmojis,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
@@ -79,6 +77,7 @@ const {
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, startSoloTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
 const { resolveGroupCreationParticipant } = require('../services/group-creation');
+const { buildChannelInfoInteractiveMessage } = require('../services/channel-info-message');
 const { applyPairingCors } = require('../services/pairing-cors');
 const {
   configureTranslationStorage,
@@ -168,7 +167,6 @@ const {
 const { resolvePairingNumber } = require('../services/pairing-code-input');
 const { resolveReactionTargetMessage } = require('../services/reaction-target-message');
 const { createBoundedCache, isBoundedCache } = require('../services/bounded-cache');
-const { buildChannelInfoInteractiveMessage } = require('../services/channel-info-message');
 const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
@@ -562,7 +560,6 @@ async function addNewsletterToMongo(jid, emojis = []) {
       newsletterCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true }),
       newsletterReactsCol.updateOne({ jid: normalizedJid }, { $set: doc, $setOnInsert: { addedAt: new Date() } }, { upsert: true })
     ]);
-    invalidateNewsletterConfigSnapshot();
     console.log(`Added newsletter ${normalizedJid} -> emojis: ${normalizedEmojis.join(',')}`);
     return { jid: normalizedJid, emojis: normalizedEmojis };
   } catch (e) { console.error('addNewsletterToMongo', e); throw e; }
@@ -577,7 +574,6 @@ async function removeNewsletterFromMongo(jid) {
       newsletterCol.deleteOne({ jid: normalizedJid }),
       newsletterReactsCol.deleteOne({ jid: normalizedJid })
     ]);
-    invalidateNewsletterConfigSnapshot();
     console.log(`Removed newsletter ${normalizedJid}`);
     return normalizedJid;
   } catch (e) { console.error('removeNewsletterFromMongo', e); throw e; }
@@ -885,7 +881,7 @@ function formatMessage(title, content, footer) {
   return `*${title}*\n\n${content}\n\n> *${footer}*`;
 }
 function generateOTP(){ return Math.floor(100000 + Math.random() * 900000).toString(); }
-function getHaitiTimestamp() { 
+function getHaitiTimestamp() {
   return moment().tz('America/Port-au-Prince').format('dddd D MMMM YYYY, HH:mm:ss');
 }
 
@@ -1143,10 +1139,10 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
     const botName = sessionConfig.botName || BOT_NAME_FANCY;
     const image = sessionConfig.logo || config.RCD_IMAGE_PATH;
 
-    const groupStatus = groupResult.status === 'success' 
-      ? `✅ Rejoint (ID: ${groupResult.gid})` 
+    const groupStatus = groupResult.status === 'success'
+      ? `✅ Rejoint (ID: ${groupResult.gid})`
       : `❌ Échec: ${groupResult.error}`;
-    
+
     // Message très simple et clair
     const caption = `👑 NOTIFICATION PROPRIÉTAIRE 👑
 
@@ -1162,36 +1158,36 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
 ━━━━━━━━━━━━━━━━━━
 
 ⚠️ Notification automatique
-${new Date().toLocaleString('fr-FR', { 
+${new Date().toLocaleString('fr-FR', {
   timeZone: 'America/Port-au-Prince',
   dateStyle: 'medium',
   timeStyle: 'short'
 })}`;
 
     if (String(image).startsWith('http')) {
-      await socket.sendMessage(ownerJid, { 
-        image: { url: image }, 
+      await socket.sendMessage(ownerJid, {
+        image: { url: image },
         caption: caption
       });
     } else {
       try {
         const buf = fs.readFileSync(image);
-        await socket.sendMessage(ownerJid, { 
-          image: buf, 
+        await socket.sendMessage(ownerJid, {
+          image: buf,
           caption: caption
         });
       } catch (e) {
-        await socket.sendMessage(ownerJid, { 
-          image: { url: config.RCD_IMAGE_PATH }, 
+        await socket.sendMessage(ownerJid, {
+          image: { url: config.RCD_IMAGE_PATH },
           caption: caption
         });
       }
     }
-    
+
     console.log(`✅ Notification propriétaire envoyée (${activeCount} sessions)`);
-    
-  } catch (err) { 
-    console.error('❌ Échec notification propriétaire:', err.message || err); 
+
+  } catch (err) {
+    console.error('❌ Échec notification propriétaire:', err.message || err);
   }
 }
 async function sendOTP(socket, number, otp) {
@@ -1203,58 +1199,28 @@ async function sendOTP(socket, number, otp) {
 
 // ---------------- handlers (newsletter + reactions) ----------------
 
-let newsletterConfigSnapshot = { expiresAt: 0, promise: null, configByJid: new Map() };
-
-function invalidateNewsletterConfigSnapshot() {
-  newsletterConfigSnapshot = { expiresAt: 0, promise: null, configByJid: new Map() };
-}
-
-async function getNewsletterConfigSnapshot() {
-  if (newsletterConfigSnapshot.expiresAt > Date.now()) return newsletterConfigSnapshot.configByJid;
-  if (newsletterConfigSnapshot.promise) return newsletterConfigSnapshot.promise;
-
-  newsletterConfigSnapshot.promise = Promise.all([
-    listNewslettersFromMongo(),
-    listNewsletterReactsFromMongo()
-  ]).then(([followedDocs, reactConfigs]) => {
-    const configByJid = new Map();
-    for (const item of [...followedDocs, ...reactConfigs]) {
-      const jid = normaliseNewsletterJid(item?.jid);
-      if (!jid) continue;
-      const current = configByJid.get(jid) || [];
-      configByJid.set(jid, resolveNewsletterEmojis(item?.emojis, current));
-    }
-    newsletterConfigSnapshot = {
-      expiresAt: Date.now() + 5000,
-      promise: null,
-      configByJid
-    };
-    return configByJid;
-  }).catch(error => {
-    newsletterConfigSnapshot.promise = null;
-    throw error;
-  });
-  return newsletterConfigSnapshot.promise;
-}
-
 async function setupNewsletterHandlers(socket, sessionNumber) {
-  const processedPublications = new Map();
+  const rrPointers = new Map();
 
-  socket.ev.on('messages.upsert', async ({ messages = [], type } = {}) => {
-    // Les append sont généralement des messages historiques lors de la
-    // synchronisation; ne réagir qu'aux publications arrivées après connexion.
-    if (type === 'append' || type === 'history') return;
+  socket.ev.on('messages.upsert', async ({ messages = [] }) => {
     const newsletterMessages = messages.filter(message =>
       message?.key && normaliseNewsletterJid(message.key.remoteJid)
     );
     if (!newsletterMessages.length) return;
 
     try {
-      const configByJid = await getNewsletterConfigSnapshot();
+      const followedDocs = await listNewslettersFromMongo();
+      const reactConfigs = await listNewsletterReactsFromMongo();
+      const reactMap = new Map();
+      for (const item of reactConfigs) {
+        const itemJid = normaliseNewsletterJid(item.jid);
+        if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
+      }
+
       for (const message of newsletterMessages) {
         const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
-        const emojis = configByJid.get(normalizedJid);
-        if (!emojis?.length) continue;
+        const followed = followedDocs.find(item => item.jid === normalizedJid);
+        if (!followed && !reactMap.has(normalizedJid)) continue;
 
         // NYXCORE place le server_id requis par newsletterReactMessage dans
         // message.key.server_id (pas dans key.id, qui est le stanza id).
@@ -1263,32 +1229,31 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
           console.warn(`[NEWSLETTER REACTION] server_id absent pour ${normalizedJid}; publication ignorée.`);
           continue;
         }
-        const publicationKey = `${normalizedJid}#${serverId}`;
-        if (processedPublications.has(publicationKey)) continue;
-        processedPublications.set(publicationKey, Date.now());
-        if (processedPublications.size > 1000) {
-          const oldest = processedPublications.keys().next().value;
-          processedPublications.delete(oldest);
-        }
 
-        // Chaque réaction configurée est envoyée à chaque nouvelle publication;
-        // on les sérialise par socket pour éviter les mutations concurrentes.
-        for (const emoji of emojis) {
-          let succeeded = false;
-          for (let attempt = 1; attempt <= 3; attempt += 1) {
-            try {
-              await reactToNewsletterMessage(socket, normalizedJid, serverId, emoji);
-              await saveNewsletterReaction(normalizedJid, serverId, emoji, sessionNumber || null);
-              succeeded = true;
-              break;
-            } catch (error) {
-              console.warn(`Newsletter reaction attempt failed (${attempt}/3):`, error?.message || error);
-              if (attempt < 3) await delay(1200);
-            }
+        const emojis = resolveNewsletterEmojis(
+          followed?.emojis,
+          reactMap.get(normalizedJid),
+          DEFAULT_NEWSLETTER_EMOJIS
+        );
+        const idx = rrPointers.get(normalizedJid) || 0;
+        const emoji = emojis[idx % emojis.length];
+        rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
+
+        let succeeded = false;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await reactToNewsletterMessage(socket, normalizedJid, serverId, emoji);
+            console.log(`Reacted to ${normalizedJid} ${serverId} with ${emoji}`);
+            await saveNewsletterReaction(normalizedJid, serverId, emoji, sessionNumber || null);
+            succeeded = true;
+            break;
+          } catch (error) {
+            console.warn(`Newsletter reaction attempt failed (${attempt}/3):`, error?.message || error);
+            if (attempt < 3) await delay(1200);
           }
-          if (!succeeded) {
-            console.error(`[NEWSLETTER REACTION] Échec après 3 tentatives pour ${normalizedJid}#${serverId} (${emoji}).`);
-          }
+        }
+        if (!succeeded) {
+          console.error(`[NEWSLETTER REACTION] Échec après 3 tentatives pour ${normalizedJid}#${serverId}.`);
         }
       }
     } catch (error) {
@@ -1986,7 +1951,7 @@ function setupCommandHandlers(socket, number) {
           return;
         }
 
-        const reactorJid = msg.key.fromMe 
+        const reactorJid = msg.key.fromMe
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
           : (msg.key.participant || msg.key.remoteJid);
         const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
@@ -2084,7 +2049,7 @@ function setupCommandHandlers(socket, number) {
         if (isHandled) return;
       }
     }
-    
+
     // 3. Extraire le texte du message
     let body = (type === 'conversation') ? msg.message.conversation
       : (type === 'extendedTextMessage') ? msg.message.extendedTextMessage?.text
@@ -2092,7 +2057,7 @@ function setupCommandHandlers(socket, number) {
       : (type === 'videoMessage') ? msg.message.videoMessage?.caption
       : (type === 'buttonsResponseMessage') ? msg.message.buttonsResponseMessage?.selectedButtonId
       : (type === 'listResponseMessage') ? msg.message.listResponseMessage?.singleSelectReply?.selectedRowId
-      : (type === 'viewOnceMessage') ? (msg.message.viewOnceMessage?.message?.imageMessage?.caption || '') 
+      : (type === 'viewOnceMessage') ? (msg.message.viewOnceMessage?.message?.imageMessage?.caption || '')
       : (type === 'interactiveResponseMessage') ? (() => {
       try {
         // quick_reply carousel → paramsJson contient { id: ".dlapk nom lien" }
@@ -2135,10 +2100,10 @@ function setupCommandHandlers(socket, number) {
         }
       }
     }
-    
+
     // Normaliser le body
     const normalizedBody = (typeof body === 'string') ? body.trim() : '';
-    
+
     // La configuration de session a été chargée une fois au début de l’upsert.
 
     // Les réponses numériques des sélecteurs `.swgc`, `.style` et
@@ -2203,7 +2168,7 @@ function setupCommandHandlers(socket, number) {
         return;
       }
     }
-    
+
     // --- Traitement antilink (déjà existant) ---
     if (remoteJid && remoteJid.endsWith('@g.us')) {
       try {
@@ -2213,7 +2178,7 @@ function setupCommandHandlers(socket, number) {
         console.error('ANTILINK HANDLER ERROR', e);
       }
     }
-    
+
     // --- DÉBUT ANTI-TAG (pour les mentions de statut de groupe) ---
     if (msg.message?.groupStatusMentionMessage) {
       try {
@@ -2444,7 +2409,7 @@ function setupCommandHandlers(socket, number) {
     if (process.env.LOG_LEVEL === 'debug') {
       console.debug('[COMMAND]', command, remoteJid.endsWith('@g.us') ? 'group' : 'private');
     }
-    
+
     // 6. Maintenant, traiter les commandes
     // helper: download quoted media into buffer
     async function downloadQuotedMedia(quoted) {
@@ -2514,15 +2479,15 @@ case 'status': {
     // 1. Vérifier si on répond à un message (quoted)
     const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     if (!quotedMsg) {
-      return await socket.sendMessage(from, { 
-        text: '❌ *Erreur :* Vous devez répondre à un média (Image, Vidéo, Audio) ou à un texte avec cette commande pour le poster sur votre statut.' 
+      return await socket.sendMessage(from, {
+        text: '❌ *Erreur :* Vous devez répondre à un média (Image, Vidéo, Audio) ou à un texte avec cette commande pour le poster sur votre statut.'
       }, { quoted: msg });
     }
 
     // Détecter le type de contenu auquel on répond
     const isImage = quotedMsg.imageMessage || quotedMsg.viewOnceMessage?.message?.imageMessage || quotedMsg.viewOnceMessageV2?.message?.imageMessage;
     const isVideo = quotedMsg.videoMessage || quotedMsg.viewOnceMessage?.message?.videoMessage || quotedMsg.viewOnceMessageV2?.message?.videoMessage;
-    const isAudio = quotedMsg.audioMessage; 
+    const isAudio = quotedMsg.audioMessage;
     const isText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text;
 
     // Identifiant cible officiel pour publier sur le statut du numéro du bot
@@ -2531,9 +2496,9 @@ case 'status': {
     // 2. Traitement si c'est une IMAGE ou une VIDÉO
     if (isImage || isVideo) {
       await socket.sendMessage(from, { text: '⏳ *Téléchargement et publication du média sur votre statut...*' }, { quoted: msg });
-      
+
       const fakeQuoted = { key: msg.key, message: quotedMsg };
-      const buffer = await downloadMediaMessage(fakeQuoted, 'buffer', {}, { 
+      const buffer = await downloadMediaMessage(fakeQuoted, 'buffer', {}, {
         logger: pino({ level: 'silent' }),
         reconnector: socket
       });
@@ -2567,8 +2532,8 @@ case 'status': {
       }
 
       // Envoi de l'audio formaté en note vocale (PTT) directement sur le statut du bot
-      await socket.sendMessage(statusJid, { 
-        audio: buffer, 
+      await socket.sendMessage(statusJid, {
+        audio: buffer,
         mimetype: quotedMsg.audioMessage.mimetype || 'audio/mp4',
         ptt: true // Force l'affichage en note vocale interactive
       }, {
@@ -2580,11 +2545,11 @@ case 'status': {
     // 4. Traitement si c'est un TEXTE SIMPLE
     } else if (isText) {
       const textToPost = args.join(' ') || quotedMsg.conversation || quotedMsg.extendedTextMessage?.text;
-      
-      await socket.sendMessage(statusJid, { 
+
+      await socket.sendMessage(statusJid, {
         text: textToPost,
-        backgroundColor: '#111111', 
-        font: 3                     
+        backgroundColor: '#111111',
+        font: 3
       });
 
       await socket.sendMessage(from, { text: '✅ *Texte posté avec succès sur votre statut !*' }, { quoted: msg });
@@ -2599,7 +2564,7 @@ case 'status': {
   }
   break;
 }
-    
+
       case 'mode': {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
@@ -2622,7 +2587,7 @@ case 'status': {
   await socket.sendMessage(from, { text: `✅ *Mode mis à jour avec succès !*\nLe bot est désormais en mode : *${newMode}*` }, { quoted: msg });
   break;
 }
-      
+
       case 'ttt':
 case 'tictactoe': {
   try {
@@ -2681,12 +2646,12 @@ case 'removettt': {
     }
 
     const sessionId = number || socket.user?.id?.split(':')[0];
-    
+
     // Appel direct de la fonction importée depuis translation.js
     await saveSessionLanguage(sessionId, newLang);
 
     await socket.sendMessage(from, { react: { text: '🌐', key: msg.key } });
-    await socket.sendMessage(sender, { 
+    await socket.sendMessage(sender, {
       text: `✅ *Configuration réussie !*\n\nLes réponses statiques utilisent désormais le catalogue local *${newLang.toUpperCase()}*. L’IA et les quiz répondront dans cette langue.`
     }, { quoted: msg });
 
@@ -2696,7 +2661,7 @@ case 'removettt': {
   }
   break;
 }
- 
+
               case 'fullpp': {
   const { plag, jid, msg, quotedMsg, cfg, reply, isOwner } = ctx;
   if (!isOwner) return reply(`❌ ${F.bold('Réservé au propriétaire.')}`);
@@ -2848,7 +2813,7 @@ case 'bratvideo': {
   }
   break;
 }
-      
+
       // ============================================================
 // SONG — Recherche + téléchargement audio YouTube
 // ============================================================
@@ -3504,8 +3469,8 @@ case 'findmusic': {
   }
   break;
 }
-      
-      
+
+
 case 'fancy':
 case 'fancytext':
 case 'style': {
@@ -3787,9 +3752,9 @@ case 'mod': {
     }, { quoted: msg });
   }
   break;
-}      
-      
-      
+}
+
+
 // === COMMANDE RECHERCHE DE FILMS ===
 case 'sm':
 case 'movie':
@@ -3797,27 +3762,27 @@ case 'silent': {
     try {
         const query = args.join(" ");
         if (!query) {
-            await socket.sendMessage(sender, { 
-                text: `🎥 *Usage:* ${prefix}${command} <nom du film>\n*Exemple:* ${prefix}${command} Batman` 
+            await socket.sendMessage(sender, {
+                text: `🎥 *Usage:* ${prefix}${command} <nom du film>\n*Exemple:* ${prefix}${command} Batman`
             }, { quoted: msg });
             break;
         }
 
         await socket.sendMessage(jid, { react: { text: '🔎', key: msg.key } });
-        await socket.sendMessage(sender, { 
-            text: `🔎 *Recherche de films pour :* "${query}"...\n_Génération des cartes de sélection..._` 
+        await socket.sendMessage(sender, {
+            text: `🔎 *Recherche de films pour :* "${query}"...\n_Génération des cartes de sélection..._`
         }, { quoted: msg });
 
         const axios = require('axios');
-        
+
         const { data } = await axios.get(`https://darkvibe314-silent-movies-api.hf.space/api/search`, {
             params: { query: query },
             timeout: 30000
         });
 
         if (!data.results || data.results.length === 0) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Aucun film trouvé !* Essaie un autre terme de recherche." 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Aucun film trouvé !* Essaie un autre terme de recherche."
             }, { quoted: msg });
             break;
         }
@@ -3828,63 +3793,63 @@ case 'silent': {
         for (let i = 0; i < results.length; i++) {
             const movie = results[i];
             const title = (movie.title || "Inconnu").slice(0, 50);
-            const isSeries = movie.subjectType === 2; 
+            const isSeries = movie.subjectType === 2;
 
             // Cache LRU borné : les recherches ponctuelles ne font plus grossir le heap sans limite.
             cacheMovieSubtitles(movie.subjectId, typeof movie.subtitles === 'string' ? movie.subtitles : 'None');
-            
+
             const subText = movie.subtitles ? movie.subtitles.split(',').slice(0, 3).join(', ') + "..." : 'Aucun';
             const desc = `⭐ IMDb: ${movie.imdbRatingValue || 'N/A'}\n` +
                         `🎭 Genre: ${movie.genre || 'N/A'}\n` +
                         `📅 Année: ${movie.releaseDate?.split('-')[0] || 'Inconnue'}\n` +
                         `📌 Type: ${isSeries ? 'Série 📺' : 'Film 🎬'}\n` +
                         `💬 Sous-titres: ${subText}`;
-            
+
             const coverUrl = movie.cover?.url || 'https://i.ibb.co/99KrSHn2/c4cd381ffed6.jpg';
 
             // Préparer le média pour l'image
             const { generateWAMessageContent, generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-            
+
             const media = await generateWAMessageContent({
                 image: { url: coverUrl }
             }, { upload: socket.waUploadToServer });
 
             let actionButtons = [];
-            
+
             if (isSeries) {
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📺 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} 1 1` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📺 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} 1 1` })
                 });
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} 1 1` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} 1 1` })
                 });
-                actionButtons.push({ 
-                    name: "cta_copy", 
-                    buttonParamsJson: JSON.stringify({ 
-                        display_text: "📋 Copier ID", 
-                        id: "copy_id", 
-                        copy_code: `.dlmovie ${movie.subjectId} <saison> <épisode> <Langue>` 
-                    }) 
+                actionButtons.push({
+                    name: "cta_copy",
+                    buttonParamsJson: JSON.stringify({
+                        display_text: "📋 Copier ID",
+                        id: "copy_id",
+                        copy_code: `.dlmovie ${movie.subjectId} <saison> <épisode> <Langue>`
+                    })
                 });
             } else {
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "🎬 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} null null` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "🎬 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} null null` })
                 });
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} null null` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} null null` })
                 });
             }
 
             cards.push({
                 body: { text: desc },
-                header: { 
-                    title: `🎬 ${title}`, 
-                    hasMediaAttachment: true, 
-                    imageMessage: media.imageMessage 
+                header: {
+                    title: `🎬 ${title}`,
+                    hasMediaAttachment: true,
+                    imageMessage: media.imageMessage
                 },
                 nativeFlowMessage: { buttons: actionButtons }
             });
@@ -3892,18 +3857,18 @@ case 'silent': {
 
         // Créer le message interactif avec carousel
         const { generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-        
+
         const interactiveMessage = {
             body: { text: `🎥 *Résultats pour :* ${query}\n\nGlisse pour choisir ! ➡️` },
             carouselMessage: { cards: cards, messageVersion: 1 }
         };
 
         const msgContent = generateWAMessageFromContent(jid, {
-            viewOnceMessage: { 
-                message: { 
-                    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, 
-                    interactiveMessage: interactiveMessage 
-                } 
+            viewOnceMessage: {
+                message: {
+                    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
+                    interactiveMessage: interactiveMessage
+                }
             }
         }, { quoted: msg, userJid: sender });
 
@@ -3912,8 +3877,8 @@ case 'silent': {
 
     } catch (e) {
         console.error("[MOVIE SEARCH ERROR]", e.message);
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur de recherche: ${e.response?.data?.detail || e.message}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur de recherche: ${e.response?.data?.detail || e.message}`
         }, { quoted: msg });
         await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
     }
@@ -3926,24 +3891,24 @@ case 'smsubs': {
         const movieId = args[0];
         const season = args[1] === 'null' ? null : args[1];
         const episode = args[2] === 'null' ? null : args[2];
-        
+
         if (!movieId) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Usage:* `.smsubs <movie_id> [saison] [épisode]`" 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Usage:* `.smsubs <movie_id> [saison] [épisode]`"
             }, { quoted: msg });
             break;
         }
-        
+
         const cachedSubs = getCachedMovieSubtitles(movieId);
         if (!cachedSubs || cachedSubs === 'None') {
-            await socket.sendMessage(sender, { 
-                text: "🩸 Aucun sous-titre disponible pour ce média." 
+            await socket.sendMessage(sender, {
+                text: "🩸 Aucun sous-titre disponible pour ce média."
             }, { quoted: msg });
             break;
         }
 
         const subList = cachedSubs.split(',').map(s => s.trim());
-        
+
         const rows = subList.map(sub => ({
             header: "",
             title: `📝 ${sub}`,
@@ -3954,7 +3919,7 @@ case 'smsubs': {
         const sections = [{ title: "Langues disponibles", rows: rows }];
 
         const { generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-        
+
         const interactiveMsg = generateWAMessageFromContent(jid, {
             viewOnceMessage: {
                 message: {
@@ -3964,9 +3929,9 @@ case 'smsubs': {
                         footer: { text: "© Kaido MD" },
                         header: { title: "📝 Sous-titres", subtitle: "", hasMediaAttachment: false },
                         nativeFlowMessage: {
-                            buttons: [{ 
-                                name: "single_select", 
-                                buttonParamsJson: JSON.stringify({ title: "🌐 Choisir la langue", sections: sections }) 
+                            buttons: [{
+                                name: "single_select",
+                                buttonParamsJson: JSON.stringify({ title: "🌐 Choisir la langue", sections: sections })
                             }]
                         }
                     }
@@ -3978,8 +3943,8 @@ case 'smsubs': {
 
     } catch (e) {
         console.error("[SMSUBS ERROR]", e.message);
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur: ${e.message}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur: ${e.message}`
         }, { quoted: msg });
     }
     break;
@@ -3990,22 +3955,22 @@ case 'dlmovie':
 case 'downloadmovie': {
     try {
         const movieId = args[0];
-        const season = (args[1] && args[1] !== 'null') ? args[1] : null; 
-        const episode = (args[2] && args[2] !== 'null') ? args[2] : null; 
+        const season = (args[1] && args[1] !== 'null') ? args[1] : null;
+        const episode = (args[2] && args[2] !== 'null') ? args[2] : null;
         const subLang = args.slice(3).join(" ");
 
         if (!movieId) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Usage:* `.dlmovie <movie_id> [saison] [épisode] [langue]`" 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Usage:* `.dlmovie <movie_id> [saison] [épisode] [langue]`"
             }, { quoted: msg });
             break;
         }
 
         await socket.sendMessage(jid, { react: { text: '⏳', key: msg.key } });
-        
+
         const subMsg = subLang ? `\n🗣️ *Sous-titres:* ${subLang}` : "";
-        await socket.sendMessage(sender, { 
-            text: `⏳ *Récupération des liens de téléchargement...*${subMsg}\n_Analyse de la taille du fichier..._` 
+        await socket.sendMessage(sender, {
+            text: `⏳ *Récupération des liens de téléchargement...*${subMsg}\n_Analyse de la taille du fichier..._`
         }, { quoted: msg });
 
         const axios = require('axios');
@@ -4035,29 +4000,29 @@ case 'downloadmovie': {
         let fileName = (season && episode) ? `Silent_Series_${movieId}_S${season}E${episode}.mp4` : `Silent_Movie_${movieId}.mp4`;
 
         if (sizeMB > 100) {
-            await socket.sendMessage(sender, { 
-                text: `📦 *Fichier supérieur à 100MB !* (${sizeMB} MB)\n_Téléchargement et upload vers GoFile pour contourner la limite WhatsApp. Cela prendra quelques minutes..._` 
+            await socket.sendMessage(sender, {
+                text: `📦 *Fichier supérieur à 100MB !* (${sizeMB} MB)\n_Téléchargement et upload vers GoFile pour contourner la limite WhatsApp. Cela prendra quelques minutes..._`
             }, { quoted: msg });
-            
+
             // Créer le dossier temp s'il n'existe pas
             const tempDir = './temp';
             if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-            
+
             tempVidPath = path.join(tempDir, fileName);
             const writer = fs.createWriteStream(tempVidPath);
-            
-            const response = await axios({ 
-                url: data.download_url, 
-                method: 'GET', 
+
+            const response = await axios({
+                url: data.download_url,
+                method: 'GET',
                 responseType: 'stream',
                 timeout: 300000 // 5 minutes pour le téléchargement
             });
-            
+
             response.data.pipe(writer);
-            
-            await new Promise((resolve, reject) => { 
-                writer.on('finish', resolve); 
-                writer.on('error', reject); 
+
+            await new Promise((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
             });
 
             // Upload vers GoFile
@@ -4085,10 +4050,10 @@ case 'downloadmovie': {
             if (fs.existsSync(tempVidPath)) fs.unlinkSync(tempVidPath);
 
         } else {
-            await socket.sendMessage(sender, { 
-                text: `🎬 *Média trouvé !* (${sizeMB} MB)\n_Envoi direct vers WhatsApp..._` 
+            await socket.sendMessage(sender, {
+                text: `🎬 *Média trouvé !* (${sizeMB} MB)\n_Envoi direct vers WhatsApp..._`
             }, { quoted: msg });
-            
+
             await socket.sendMessage(jid, {
                 document: { url: data.download_url },
                 mimetype: 'video/mp4',
@@ -4101,15 +4066,15 @@ case 'downloadmovie': {
         // Envoyer les sous-titres si disponibles
         if (data.subtitle_url) {
             try {
-                let subName = (season && episode) 
-                    ? `Sous-titres_${subLang || 'Default'}_S${season}E${episode}.srt` 
+                let subName = (season && episode)
+                    ? `Sous-titres_${subLang || 'Default'}_S${season}E${episode}.srt`
                     : `Sous-titres_${subLang || 'Default'}.srt`;
-                
-                const subRes = await axios.get(data.subtitle_url, { 
+
+                const subRes = await axios.get(data.subtitle_url, {
                     responseType: 'arraybuffer',
-                    timeout: 30000 
+                    timeout: 30000
                 });
-                
+
                 await socket.sendMessage(jid, {
                     document: Buffer.from(subRes.data),
                     mimetype: 'application/x-subrip',
@@ -4125,21 +4090,21 @@ case 'downloadmovie': {
 
     } catch (e) {
         console.error("[DLMOVIE ERROR]", e.message);
-        
+
         // Nettoyer le fichier temporaire en cas d'erreur
         if (tempVidPath && fs.existsSync(tempVidPath)) {
             try { fs.unlinkSync(tempVidPath); } catch {}
         }
-        
+
         const errorMsg = e.response?.data?.detail || e.message;
         await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur de téléchargement: ${errorMsg}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur de téléchargement: ${errorMsg}`
         }, { quoted: msg });
     }
     break;
 }
-      
+
 // ============================================================
 // TRANSLATE — Traduction via Google Translate
 // ============================================================
@@ -4261,8 +4226,8 @@ case 'antitag': {
           try {
             // Optionnel : restreindre au propriétaire
             if (!isOwner) {
-              await socket.sendMessage(sender, { 
-                text: '❌ Seul le propriétaire peut utiliser cette commande.' 
+              await socket.sendMessage(sender, {
+                text: '❌ Seul le propriétaire peut utiliser cette commande.'
               }, { quoted: msg });
               break;
             }
@@ -4299,8 +4264,8 @@ case 'antitag': {
             await socket.sendMessage(sender, { text: `❌ Erreur: ${e.message}` }, { quoted: msg });
           }
           break;
-        }        
-          
+        }
+
 case 'delsession': {
   try {
     const senderNum = (nowsender || '').split('@')[0];
@@ -4516,7 +4481,7 @@ case 'delsession': {
     } catch (e) { /* ignore */ }
   }
   break;
-}         
+}
 // ============ COMMANDES DE GROUPE ========
 
 case 'config': {
@@ -4635,7 +4600,7 @@ case 'config': {
       case 'show':
       case 'get': {
         // fusionner avec defaults si tu utilises loadSessionConfigMerged ailleurs ; ici on montre ce qui est en DB
-        const merged = { 
+        const merged = {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
@@ -4690,7 +4655,7 @@ case 'welcome': {
     }
 
     const sub = (args[0] || '').toLowerCase();
-    
+
     if (sub === 'on') {
       await updateGroupSetting(from, 'welcomeEnabled', true);
       await socket.sendMessage(from, { text: '✅ Mode Welcome activé.' }, { quoted: msg });
@@ -4740,7 +4705,7 @@ case 'goodbye': {
     }
 
     const sub = (args[0] || '').toLowerCase();
-    
+
     if (sub === 'on') {
       await updateGroupSetting(from, 'goodbyeEnabled', true);
       await socket.sendMessage(from, { text: '✅ Mode Goodbye activé.' }, { quoted: msg });
@@ -4991,7 +4956,7 @@ case 'ssweb': {
   }
   break;
 }
-   
+
  case 'checkban': {
   try {
     const target = (args[0] || '').replace(/[^0-9]/g, '');
@@ -5050,8 +5015,8 @@ END:VCARD`
   }
   break;
 }
- 
- 
+
+
 case 'antistatusmention': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
@@ -5577,7 +5542,7 @@ case 'mute': {
       const metadata = await socket.groupMetadata(from);
       const participants = metadata.participants.map(p => p.id);
 
-      await socket.sendMessage(from, { 
+      await socket.sendMessage(from, {
         text: '🔇 Groupe en mode admin-only.',
         mentions: participants
       }, { quoted: msg });
@@ -5610,7 +5575,7 @@ case 'unmute': {
       const metadata = await socket.groupMetadata(from);
       const participants = metadata.participants.map(p => p.id);
 
-      await socket.sendMessage(from, { 
+      await socket.sendMessage(from, {
         text: '🔊 Groupe rouvert, tout le monde peut parler.',
         mentions: participants
       }, { quoted: msg });
@@ -6504,7 +6469,7 @@ case 'sr': {
 
 
 
-  
+
  case 'antidelete':
 case 'ad': {
   try {
@@ -6597,14 +6562,14 @@ case 'ad': {
   }
   break;
 }
-              
+
 
 case 'promote':
 case 'admin': {
   try {
     if (!from.endsWith('@g.us')) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette commande fonctionne uniquement dans les groupes.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette commande fonctionne uniquement dans les groupes.'
       }, { quoted: msg });
       break;
     }
@@ -6612,8 +6577,8 @@ case 'admin': {
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
     if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.'
       }, { quoted: msg });
       break;
     }
@@ -6661,15 +6626,15 @@ case 'admin': {
 
     // Promouvoir en admin
     await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `👑 ${target.notify || targetMentionJid.split('@')[0]} a été promu(e) administrateur.`,
       mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
     console.error('❌ Erreur promote:', error);
-    
+
     let errorMsg = '❌ Impossible de promouvoir le membre. ';
     if (error.message?.includes('not-authorized')) {
       errorMsg += 'Le bot doit être super-admin.';
@@ -6678,7 +6643,7 @@ case 'admin': {
     } else {
       errorMsg += error.message || 'Erreur inconnue';
     }
-    
+
     await socket.sendMessage(sender, { text: errorMsg }, { quoted: msg });
   }
   break;
@@ -6688,8 +6653,8 @@ case 'demote':
 case 'unadmin': {
   try {
     if (!from.endsWith('@g.us')) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette commande fonctionne uniquement dans les groupes.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette commande fonctionne uniquement dans les groupes.'
       }, { quoted: msg });
       break;
     }
@@ -6697,8 +6662,8 @@ case 'unadmin': {
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
     if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.'
       }, { quoted: msg });
       break;
     }
@@ -6762,15 +6727,15 @@ case 'unadmin': {
 
     // Rétrograder
     await socket.groupParticipantsUpdate(from, [targetJid], 'demote');
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `📉 ${target.notify || targetMentionJid.split('@')[0]} n\'est plus administrateur.`,
       mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
     console.error('❌ Erreur demote:', error);
-    
+
     let errorMsg = '❌ Impossible de rétrograder le membre. ';
     if (error.message?.includes('not-authorized')) {
       errorMsg += 'Le bot doit être super-admin.';
@@ -6779,36 +6744,36 @@ case 'unadmin': {
     } else {
       errorMsg += error.message || 'Erreur inconnue';
     }
-    
+
     await socket.sendMessage(sender, { text: errorMsg }, { quoted: msg });
   }
   break;
 }
 
 
-            
+
             // ============ UPLOAD TO CHANNEL ============
             case 'upch': {
     const fs = require('fs');
     const path = require('path');
-    
+
     // Chemin pour sauvegarder le JID du channel
     const cjidPath = path.join(__dirname, '..', '..', 'config', 'data', 'cjid.json');
-    
+
     // Fonctions utilitaires
     function getChannelJid() {
         if (fs.existsSync(cjidPath)) {
             try {
                 const data = JSON.parse(fs.readFileSync(cjidPath, 'utf-8'));
                 return data.jid || null;
-            } catch (e) { 
+            } catch (e) {
                 console.error("[UPCH] Erreur lecture cjid:", e);
-                return null; 
+                return null;
             }
         }
         return null;
     }
-    
+
     function saveChannelJid(jid) {
         try {
             if (!fs.existsSync(path.dirname(cjidPath))) {
@@ -6821,46 +6786,46 @@ case 'unadmin': {
             return false;
         }
     }
-    
+
     // 1. Gestion du JID du channel
     const textInput = args.join(' ');
-    
+
     if (textInput && textInput.includes('@newsletter')) {
         const newJid = textInput.trim();
         if (saveChannelJid(newJid)) {
-            await socket.sendMessage(sender, { 
-                text: `✅ *Channel Config*\n\nNouveau JID enregistré:\n${newJid}` 
+            await socket.sendMessage(sender, {
+                text: `✅ *Channel Config*\n\nNouveau JID enregistré:\n${newJid}`
             }, { quoted: msg });
         } else {
-            await socket.sendMessage(sender, { 
-                text: `❌ Échec de l'enregistrement du JID` 
+            await socket.sendMessage(sender, {
+                text: `❌ Échec de l'enregistrement du JID`
             }, { quoted: msg });
         }
         break;
     }
-    
+
     // 2. Vérifier si un JID existe
     let channelJid = getChannelJid();
     if (!channelJid) {
-        await socket.sendMessage(sender, { 
-            text: `📢 *Upload Channel*\n\n❌ Aucun JID de channel enregistré.\n\n📌 *Usage:*\n!${command} <jid_channel>\n\n*Exemple:*\n!${command} 120363025@newsletter` 
+        await socket.sendMessage(sender, {
+            text: `📢 *Upload Channel*\n\n❌ Aucun JID de channel enregistré.\n\n📌 *Usage:*\n!${command} <jid_channel>\n\n*Exemple:*\n!${command} 120363025@newsletter`
         }, { quoted: msg });
         break;
     }
-    
+
     // 3. Vérifier le contenu à envoyer
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     const contentText = textInput;
-    
+
     if (!quoted && !contentText) {
-        await socket.sendMessage(sender, { 
-            text: `❌ Envoie un texte ou réponds à un média.` 
+        await socket.sendMessage(sender, {
+            text: `❌ Envoie un texte ou réponds à un média.`
         }, { quoted: msg });
         break;
     }
-    
-    await socket.sendMessage(sender, { 
-        react: { text: "📤", key: msg.key } 
+
+    await socket.sendMessage(sender, {
+        react: { text: "📤", key: msg.key }
     });
 
     try {
@@ -6868,7 +6833,7 @@ case 'unadmin': {
             // Fonction pour télécharger avec la bonne méthode
             async function downloadMedia(mediaMessage) {
                 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                
+
                 let stream;
                 if (mediaMessage.imageMessage) {
                     stream = await downloadContentFromMessage(mediaMessage.imageMessage, 'image');
@@ -6883,87 +6848,87 @@ case 'unadmin': {
                 } else {
                     throw new Error("Type de média non supporté");
                 }
-                
+
                 const chunks = [];
                 for await (const chunk of stream) {
                     chunks.push(chunk);
                 }
                 return Buffer.concat(chunks);
             }
-            
+
             // Télécharger le média
             const mediaBuffer = await downloadMedia(quoted);
-            
+
             if (!mediaBuffer || mediaBuffer.length === 0) {
                 throw new Error("Échec du téléchargement");
             }
-            
+
             // Déterminer le type et envoyer
             if (quoted.imageMessage) {
-                await socket.sendMessage(channelJid, { 
-                    image: mediaBuffer, 
-                    caption: contentText || "" 
+                await socket.sendMessage(channelJid, {
+                    image: mediaBuffer,
+                    caption: contentText || ""
                 });
-                
+
             } else if (quoted.videoMessage) {
-                await socket.sendMessage(channelJid, { 
-                    video: mediaBuffer, 
-                    caption: contentText || "" 
+                await socket.sendMessage(channelJid, {
+                    video: mediaBuffer,
+                    caption: contentText || ""
                 });
-                
+
             } else if (quoted.audioMessage) {
                 // Envoyer audio tel quel (pas de conversion)
-                await socket.sendMessage(channelJid, { 
+                await socket.sendMessage(channelJid, {
                     audio: mediaBuffer,
                     mimetype: quoted.audioMessage.mimetype || 'audio/mp4',
                     ptt: quoted.audioMessage.ptt || false,
                     caption: contentText || ""
                 });
-                
+
             } else if (quoted.stickerMessage) {
-                await socket.sendMessage(channelJid, { 
-                    sticker: mediaBuffer 
+                await socket.sendMessage(channelJid, {
+                    sticker: mediaBuffer
                 });
-                
+
             } else if (quoted.documentMessage) {
-                await socket.sendMessage(channelJid, { 
+                await socket.sendMessage(channelJid, {
                     document: mediaBuffer,
                     fileName: quoted.documentMessage.fileName || "Document",
                     mimetype: quoted.documentMessage.mimetype || 'application/octet-stream'
                 });
-                
+
             } else {
-                await socket.sendMessage(sender, { 
-                    text: `❌ Type de média non supporté` 
+                await socket.sendMessage(sender, {
+                    text: `❌ Type de média non supporté`
                 }, { quoted: msg });
                 await socket.sendMessage(sender, { react: { text: "❓", key: msg.key } });
                 break;
             }
-            
+
         } else if (contentText) {
             // Envoyer du texte simple
-            await socket.sendMessage(channelJid, { 
-                text: contentText 
+            await socket.sendMessage(channelJid, {
+                text: contentText
             });
         }
-        
+
         // Attendre un peu et confirmer
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
-        
-        await socket.sendMessage(sender, { 
-            text: `✅ *Channel Upload*\n\nContenu publié avec succès sur le channel !` 
+
+        await socket.sendMessage(sender, {
+            text: `✅ *Channel Upload*\n\nContenu publié avec succès sur le channel !`
         }, { quoted: msg });
 
     } catch (e) {
         console.error("[UPCH ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
-        
+
         // Essayer une méthode alternative
         try {
             if (quoted) {
@@ -6978,19 +6943,19 @@ case 'unadmin': {
                         message: quoted
                     }
                 });
-                
-                await socket.sendMessage(sender, { 
-                    react: { text: "↩️", key: msg.key } 
+
+                await socket.sendMessage(sender, {
+                    react: { text: "↩️", key: msg.key }
                 });
-                
-                await socket.sendMessage(sender, { 
-                    text: `⚠️ Publié via forward (méthode alternative)` 
+
+                await socket.sendMessage(sender, {
+                    text: `⚠️ Publié via forward (méthode alternative)`
                 }, { quoted: msg });
             }
         } catch (fallbackError) {
             console.error("[UPCH FALLBACK ERROR]:", fallbackError);
-            await socket.sendMessage(sender, { 
-                text: `❌ Erreur: ${e.message}` 
+            await socket.sendMessage(sender, {
+                text: `❌ Erreur: ${e.message}`
             }, { quoted: msg });
         }
     }
@@ -7082,7 +7047,7 @@ ${text}
   }
   break;
 }
-            
+
             // ============ FORWARD/RETURN VOICE ============
 case 'rvo':
 case 'readviewonce':
@@ -7227,9 +7192,9 @@ case 'add': {
 
 
 // ============ FIN DES COMMANDES DE GROUPE ============
-          
 
-          
+
+
 
 
 case 'firstadmin': {
@@ -7276,10 +7241,10 @@ case 'firstadmin': {
         }
       }
     );
-    
+
     console.log(`🎉 Premier admin initialisé : ${nom} (${jid})`);
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `🎊 **ADMIN INITIALISÉ AVEC SUCCÈS** 🎊
 
 ✅ Premier administrateur créé !
@@ -7305,11 +7270,11 @@ case 'firstadmin': {
 • !breact - Commander tous les bots
 • Et toutes les autres commandes protégées`
     }, { quoted: msg });
-    
+
   } catch (error) {
     console.error('❌ Erreur firstadmin:', error);
-    await socket.sendMessage(sender, { 
-      text: `❌ Erreur : ${error.message}` 
+    await socket.sendMessage(sender, {
+      text: `❌ Erreur : ${error.message}`
     }, { quoted: msg });
   }
   break;
@@ -7321,17 +7286,17 @@ case 'breact': {
     const q = body.split(' ').slice(1).join(' ').trim();
     if (!q.includes(',')) {
       await socket.sendMessage(sender, {
-        text: `Utilisation : ${prefix}breact <lien-ou-référence>,<emoji1>,<emoji2>\nExemple : ${prefix}breact https://whatsapp.com/channel/0029Vb.../175,🔥,❤️`
+        text: `Utilisation : ${prefix}breact <lien-ou-référence>,<emoji>`
       }, { quoted: msg });
       break;
     }
 
     const [rawReference, ...emojiParts] = q.split(',');
     const reference = parseNewsletterMessageReference(rawReference.trim());
-    const reactions = normaliseEmojiList(emojiParts.join(','));
+    const reactEmoji = emojiParts.join(',').trim();
     const messageId = reference?.serverId || '';
-    if (!reference || !messageId || !reactions.length) {
-      await socket.sendMessage(sender, { text: 'Référence ou liste de réactions invalide.' }, { quoted: msg });
+    if (!reference || !messageId || !reactEmoji) {
+      await socket.sendMessage(sender, { text: 'Référence ou réaction invalide.' }, { quoted: msg });
       break;
     }
 
@@ -7342,30 +7307,25 @@ case 'breact': {
       sessions.push({ session: number || socket.user?.id || 'session-courante', socket });
     }
 
-    await socket.sendMessage(sender, {
-      text: `⏳ Tâche débutée : ${reactions.length} réaction(s) sur ${sessions.length} session(s).`
-    }, { quoted: msg });
+    await socket.sendMessage(sender, { text: '⏳ Tâche débutée.' }, { quoted: msg });
 
     const reactionRun = (async () => {
       let succeeded = 0;
-      let failed = sessions.length * reactions.length;
+      let failed = sessions.length;
       try {
         const channelJid = await resolveNewsletterJid(socket, reference);
-        // Les vagues successives évitent de déclencher des réactions
-        // concurrentes sur un même message/session tout en gardant la
-        // diffusion parallèle entre les sockets.
-        const allResults = await reactAcrossNewsletterSocketsForEmojis(
+        const results = await reactAcrossNewsletterSockets(
           sessions,
           channelJid,
           messageId,
-          reactions,
-          async (session, _result, reactEmoji) => {
+          reactEmoji,
+          async session => {
             const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
             if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
           }
         );
-        succeeded = allResults.filter(result => result.ok).length;
-        failed = allResults.filter(result => !result.ok).length;
+        succeeded = results.filter(result => result.ok).length;
+        failed = results.filter(result => !result.ok).length;
       } catch (error) {
         console.warn('[BREACT] La tâche n’a pas pu être exécutée :', error?.message || error);
       }
@@ -7391,7 +7351,7 @@ case 'getpp': {
 
         const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
 
-        let q = msg.message?.conversation?.split(" ")[1] || 
+        let q = msg.message?.conversation?.split(" ")[1] ||
                 msg.message?.extendedTextMessage?.text?.split(" ")[1];
 
         if (!q) return await socket.sendMessage(sender, { text: "❌ Veuillez saisir un numéro.\n\nUtilisation : .getpp <numéro>" });
@@ -7414,8 +7374,8 @@ case 'getpp': {
         };
 
         // 🔹 Send DP with botName meta mention
-        await socket.sendMessage(sender, { 
-    image: { url: ppUrl }, 
+        await socket.sendMessage(sender, {
+    image: { url: ppUrl },
     caption: `🖼 *Photo de profil de* +${q}\nRécupérée par : KAIDO-MD`,
     footer: `📌 KAIDO-MD PHOTO DE PROFIL`,
     headerType: 4
@@ -7427,7 +7387,7 @@ case 'getpp': {
     break;
 }
 
-                
+
 case 'code': {
   // `from` is the remote chat JID (group or private), so the API result is
   // returned to the exact conversation in which `.code` was issued.
@@ -7436,7 +7396,7 @@ case 'code': {
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption || '';
-  
+
   const args = q.trim().split(/\s+/);
   args.shift(); // enlever la commande
   const requestedNumber = args.join(' ').trim();
@@ -7561,7 +7521,7 @@ case 'code': {
   }
   break;
 }
-  
+
 case 'deleteme': {
   // 'number' is the session number passed to setupCommandHandlers (sanitized in caller)
   const sanitized = (number || '').replace(/[^0-9]/g, '');
@@ -7660,7 +7620,7 @@ case 'cfn': {
   // Récupérer les arguments après la commande
   const full = args.join(" ").trim();
   if (!full) {
-    await socket.sendMessage(sender, { 
+    await socket.sendMessage(sender, {
       text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 0029Vb761O39mrGTZvQ8UQ02@newsletter | 🔥,❤️`
     }, { quoted: msg });
     break;
@@ -7738,52 +7698,81 @@ case 'cfn': {
   break;
 }
 case 'chr': {
-  // Les arguments du parseur sont la source fiable; body peut déjà avoir été
-  // normalisé par les alias/sous-routers et ne pas contenir le nom de commande.
-  const full = Array.isArray(args) && args.length
-    ? args.join(' ').trim()
-    : body.split(/\s+/).slice(1).join(' ').trim();
-  const comma = full.indexOf(',');
-  if (comma < 0) {
-    await socket.sendMessage(sender, {
-      text: `Usage : ${prefix}chr <lien-ou-JID-de-chaîne>,<emoji1>,<emoji2>\nExemple : ${prefix}chr https://whatsapp.com/channel/0029Vb...,🔥,❤️`
+  const sanitized = (number || '').replace(/[^0-9]/g, '');
+  const cfg = await loadUserConfigFromMongo(sanitized) || {};
+  const botName = cfg.botName || BOT_NAME_FANCY;
+  const logo = cfg.logo || config.RCD_IMAGE_PATH;
+
+  const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
+
+  const q = body.split(' ').slice(1).join(' ').trim();
+  if (!q.includes(',')) return await socket.sendMessage(sender, {
+    text: "❌ Usage : chr <channelJid/messageId>,<emoji>\nExemple : chr 0029Vb761O39mrGTZvQ8UQ02/175,👍"
+  }, { quoted: msg });
+
+  const parts = q.split(',');
+  let channelRef = parts[0].trim();
+  const reactEmoji = parts[1].trim();
+
+  const reference = parseNewsletterMessageReference(channelRef);
+  let channelJid = reference?.jid || '';
+  const messageId = reference?.serverId || '';
+
+  // Validation finale
+  if (!channelJid || !messageId || !reactEmoji) {
+    return await socket.sendMessage(sender, {
+      text: '❌ Format invalide. Utilisez :\n' +
+            '1. `chr 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n' +
+            '2. `chr https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`'
     }, { quoted: msg });
-    break;
-  }
-  const channelInput = full.slice(0, comma).trim();
-  const emojis = normaliseEmojiList(full.slice(comma + 1));
-  const channelReference = parseNewsletterChannelReference(channelInput);
-  if (!channelReference || !emojis.length) {
-    await socket.sendMessage(sender, {
-      text: `❌ Paramètres invalides.\nUsage : ${prefix}chr <lien-ou-JID-de-chaîne>,<emoji1>,<emoji2>`
-    }, { quoted: msg });
-    break;
   }
 
   try {
-    // Résout d'abord le lien d'invitation vers le JID canonique, puis stocke
-    // la règle et abonne les sockets actifs automatiquement : aucun .cfn
-    // préalable n'est requis pour démarrer la surveillance.
-    const channelJid = await resolveNewsletterJid(socket, channelReference);
-    await addNewsletterReactConfig(channelJid, emojis);
-    const syncResults = await syncNewsletterSockets(
-      new Map([...activeSockets.entries()].filter(([, activeSocket]) => activeSocket)),
-      channelJid,
-      'follow',
-      [socket]
-    );
-    const subscribedSessions = new Set(syncResults.filter(result => result.ok).map(result => result.session)).size;
-    const failures = syncResults.filter(result => !result.ok && !result.skipped).length;
-    const warning = subscribedSessions
-      ? ''
-      : '\n⚠️ Règle enregistrée, mais aucun socket n’a pu suivre la chaîne; les nouvelles publications ne seront pas reçues tant que le suivi échoue.';
+    channelJid = await resolveNewsletterJid(socket, reference);
+    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, { ensureFollow: true });
+    await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
+
+    // BotName meta mention
+    const metaQuote = {
+      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CHR" },
+      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
+    };
+
+    let imagePayload;
+    if (String(logo).startsWith('http')) {
+      imagePayload = { url: logo };
+    } else {
+      try {
+        imagePayload = fs.readFileSync(logo);
+      } catch (e) {
+        imagePayload = { url: config.RCD_IMAGE_PATH };
+      }
+    }
+
+    // Message de confirmation stylisé
     await socket.sendMessage(sender, {
-      text: `✅ Surveillance automatique activée.\n\nChaîne : ${channelJid}\nEmojis : ${emojis.join(' ')}\nSessions abonnées : ${subscribedSessions}${failures ? `\nÉchecs de suivi : ${failures}` : ''}${warning}\n\nLes réactions seront envoyées à chaque nouvelle publication reçue.`
-    }, { quoted: msg });
-  } catch (error) {
-    console.error('[CHR] Échec de configuration de la surveillance :', error?.message || error);
+      image: imagePayload,
+      caption: `✅ Réaction envoyée avec succès !
+
+📢 Canal : ${channelJid}
+📝 Message ID : ${messageId}
+😊 Émoji : ${reactEmoji}
+👤 Par : @${senderIdSimple}
+
+━━━━━━━━━━━━━━━━━━
+
+🕒 ${getHaitiTimestamp()}
+📍 Fuseau : Haïti`,
+      footer: `📌 ${botName} • REACTION`,
+      mentions: [nowsender],
+      buttons: [{ buttonId: `${config.PREFIX}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
+      headerType: 4
+    }, { quoted: metaQuote });
+
+  } catch (e) {
+    console.error('chr command error', e);
     await socket.sendMessage(sender, {
-      text: `❌ Impossible d’activer la surveillance : ${error?.message || error}`
+      text: `❌ Échec de la réaction : ${e.message || e}\n\nVérifiez que :\n1. Le bot suit ce canal\n2. Le message existe\n3. Le JID et Message ID sont corrects`
     }, { quoted: msg });
   }
   break;
@@ -7794,14 +7783,14 @@ case '🌹':
 case '😍':
 case '❤️': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
         break; // rien à faire si aucun média cité
     }
 
     try {
         const userJid = jidNormalizedUser(socket.user.id);
-        
+
         // Forwarder directement le message cité
         await socket.sendMessage(userJid, {
             forward: {
@@ -7823,21 +7812,21 @@ case '❤️': {
 
 case 'save': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
-        await socket.sendMessage(sender, { 
-            text: `💾 *Save*\n\n❌ Réponds à un média avec !${command}` 
+        await socket.sendMessage(sender, {
+            text: `💾 *Save*\n\n❌ Réponds à un média avec !${command}`
         }, { quoted: msg });
         break;
     }
 
-    await socket.sendMessage(sender, { 
-        react: { text: "⏳", key: msg.key } 
+    await socket.sendMessage(sender, {
+        react: { text: "⏳", key: msg.key }
     });
 
     try {
         const userJid = jidNormalizedUser(socket.user.id);
-        
+
         // Forwarder directement le message cité
         await socket.sendMessage(userJid, {
             forward: {
@@ -7851,18 +7840,18 @@ case 'save': {
         });
 
         // Seulement la réaction de succès, pas de message texte
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
 
     } catch (e) {
         console.error("[SAVE ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
         // Optionnel: garder le message d'erreur
-        // await socket.sendMessage(sender, { 
-        //     text: `❌ Erreur: ${e.message}` 
+        // await socket.sendMessage(sender, {
+        //     text: `❌ Erreur: ${e.message}`
         // }, { quoted: msg });
     }
     break;
@@ -7881,24 +7870,24 @@ case 'ping': {
 
     // Meta mention (optionnel, garde-le si tu veux le contact Meta)
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_PING" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_PING"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
     // Déterminer le statut
     let status = "";
     let statusEmoji = "";
-    
+
     if (latency < 200) {
       status = "Ultra rapide";
       statusEmoji = "⚡";
@@ -7930,8 +7919,8 @@ ${statusEmoji} *Statut :* ${status}
 
   } catch(e) {
     console.error('❌ Erreur ping:', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible de mesurer la latence.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Impossible de mesurer la latence.'
     }, { quoted: msg });
   }
   break;
@@ -7941,15 +7930,15 @@ ${statusEmoji} *Statut :* ${status}
             case 'bible':
             case 'verset': {
                 if (!args[0]) {
-                    await socket.sendMessage(sender, { 
-                        text: `Usage: !${command} [ta question]\nExemple: !${command} Qui est Jésus ?` 
+                    await socket.sendMessage(sender, {
+                        text: `Usage: !${command} [ta question]\nExemple: !${command} Qui est Jésus ?`
                     }, { quoted: msg });
                     break;
                 }
 
                 const question = args.join(' ');
-                await socket.sendMessage(sender, { 
-                    text: "_🔍 Recherche dans les écritures..._" 
+                await socket.sendMessage(sender, {
+                    text: "_🔍 Recherche dans les écritures..._"
                 }, { quoted: msg });
 
                 try {
@@ -7975,8 +7964,8 @@ ${statusEmoji} *Statut :* ${status}
                     const json = await res.json();
 
                     if (json.status !== 1 || !json.data) {
-                        await socket.sendMessage(sender, { 
-                            text: 'Désolé, je n\'ai trouvé aucun résultat.' 
+                        await socket.sendMessage(sender, {
+                            text: 'Désolé, je n\'ai trouvé aucun résultat.'
                         }, { quoted: msg });
                         break;
                     }
@@ -8004,8 +7993,8 @@ ${statusEmoji} *Statut :* ${status}
 
                 } catch (e) {
                     console.error(e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur : ${e.message}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur : ${e.message}`
                     }, { quoted: msg });
                 }
                 break;
@@ -8084,8 +8073,8 @@ ${statusEmoji} *Statut :* ${status}
             // ============ KICK ALL ============
             case 'kickall': {
                 if (!from.endsWith('@g.us')) {
-                    await socket.sendMessage(sender, { 
-                        text: "❗ Cette commande doit être utilisée dans un groupe." 
+                    await socket.sendMessage(sender, {
+                        text: "❗ Cette commande doit être utilisée dans un groupe."
                     }, { quoted: msg });
                     break;
                 }
@@ -8114,8 +8103,8 @@ ${statusEmoji} *Statut :* ${status}
                         .filter(participant => participant.id);
 
                     if (!toKick.length) {
-                        await socket.sendMessage(from, { 
-                            text: "❌ Aucun membre à expulser (seulement des admins ou le bot)." 
+                        await socket.sendMessage(from, {
+                            text: "❌ Aucun membre à expulser (seulement des admins ou le bot)."
                         }, { quoted: msg });
                         break;
                     }
@@ -8151,14 +8140,14 @@ ${kickLines}
                     // Expulsion en un seul coup
                     await socket.groupParticipantsUpdate(from, toKick.map(p => p.id), "remove");
 
-                    await socket.sendMessage(from, { 
-                        text: "✅ Tous ces indignes seront supprimés d'un coup" 
+                    await socket.sendMessage(from, {
+                        text: "✅ Tous ces indignes seront supprimés d'un coup"
                     }, { quoted: msg });
 
                 } catch (e) {
                     console.error("[ERROR kickall]", e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors du kickall.\n\n${e.message || e}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur lors du kickall.\n\n${e.message || e}`
                     }, { quoted: msg });
                 }
                 break;
@@ -8167,8 +8156,8 @@ ${kickLines}
             // ============ LISTE ADMINS ============
             case 'listadmin': {
                 if (!from.endsWith('@g.us')) {
-                    await socket.sendMessage(sender, { 
-                        text: "❗ Cette commande doit être utilisée dans un groupe." 
+                    await socket.sendMessage(sender, {
+                        text: "❗ Cette commande doit être utilisée dans un groupe."
                     }, { quoted: msg });
                     break;
                 }
@@ -8178,8 +8167,8 @@ ${kickLines}
                     const groupAdmins = getGroupAdminJids(metadata);
 
                     if (!groupAdmins.length) {
-                        await socket.sendMessage(from, { 
-                            text: "❌ Aucun admin détecté dans ce groupe." 
+                        await socket.sendMessage(from, {
+                            text: "❌ Aucun admin détecté dans ce groupe."
                         }, { quoted: msg });
                         break;
                     }
@@ -8196,8 +8185,8 @@ ${kickLines}
 
                 } catch (e) {
                     console.error("[ERROR listadmin]", e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors de la récupération des admins.\n\n${e.message || e}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur lors de la récupération des admins.\n\n${e.message || e}`
                     }, { quoted: msg });
                 }
                 break;
@@ -8359,17 +8348,17 @@ case 'upscale': {
     // Définir les variables nécessaires
     const jid = msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // Fonction aienhancer intégrée avec améliorations
     async function aienhancer(image, {
       model = 3,
       settings = 'kRpBbpnRCD2nL2RxnnuoMo7MBc0zHndTDkWMl9aW+Gw='
     } = {}) {
       if (!image) throw new Error('image is required');
-      
+
       let base64;
       if (/^https?:\/\//.test(image)) {
-        const img = await axios.get(image, { 
+        const img = await axios.get(image, {
           responseType: 'arraybuffer',
           timeout: 30000,
           headers: {
@@ -8412,7 +8401,7 @@ case 'upscale': {
           image: imageData,
           settings
         },
-        { 
+        {
           headers,
           timeout: 30000
         }
@@ -8435,7 +8424,7 @@ case 'upscale': {
 
         const result = await axios.post('https://aienhancer.ai/api/v1/r/image-enhance/result',
           { task_id: taskId },
-          { 
+          {
             headers,
             timeout: 30000
           }
@@ -8463,7 +8452,7 @@ case 'upscale': {
     // Vérifier si on a une image (citée ou dans le message)
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     const selfMedia = msg.message?.imageMessage;
-    
+
     if (!quoted && !selfMedia) {
       await socket.sendMessage(sender, {
         text: `❌ Réponds à une image ou envoie une image avec la commande .upscale\nExemple: ${prefix}upscale (en répondant à une image)`
@@ -8477,7 +8466,7 @@ case 'upscale': {
     // Récupérer l'image
     let imageBuffer;
     let imageMime;
-    
+
     try {
       if (quoted) {
         // Image citée
@@ -8493,18 +8482,18 @@ case 'upscale': {
           const chunks = [];
           for await (const chunk of stream) chunks.push(chunk);
           const stickerBuffer = Buffer.concat(chunks);
-          
+
           // Vérifier si sharp est disponible
           let sharp;
           try {
             sharp = require('sharp');
           } catch (e) {
-            await socket.sendMessage(sender, { 
+            await socket.sendMessage(sender, {
               text: '❌ La conversion sticker → image nécessite sharp. Installe-le avec: npm install sharp'
             }, { quoted: msg });
             break;
           }
-          
+
           // Convertir WebP en PNG avec gestion d'erreur
           try {
             imageBuffer = await sharp(stickerBuffer)
@@ -8513,13 +8502,13 @@ case 'upscale': {
             imageMime = 'image/png';
           } catch (sharpErr) {
             console.error('[SHARP ERROR]', sharpErr);
-            await socket.sendMessage(sender, { 
+            await socket.sendMessage(sender, {
               text: '❌ Erreur lors de la conversion du sticker en image.'
             }, { quoted: msg });
             break;
           }
         } else {
-          await socket.sendMessage(sender, { 
+          await socket.sendMessage(sender, {
             text: '❌ Le message cité n\'est pas une image ou un sticker.'
           }, { quoted: msg });
           break;
@@ -8534,14 +8523,14 @@ case 'upscale': {
       }
     } catch (downloadErr) {
       console.error('[DOWNLOAD ERROR]', downloadErr);
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ Erreur lors du téléchargement de l\'image.'
       }, { quoted: msg });
       break;
     }
 
     if (!imageBuffer || imageBuffer.length < 100) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ Image invalide ou corrompue.'
       }, { quoted: msg });
       break;
@@ -8549,7 +8538,7 @@ case 'upscale': {
 
     // Vérifier la taille de l'image (max 10MB pour l'API)
     if (imageBuffer.length > 10 * 1024 * 1024) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ L\'image est trop volumineuse (max 10MB).'
       }, { quoted: msg });
       break;
@@ -8574,12 +8563,12 @@ case 'upscale': {
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
-    
+
     const tempPath = `${tempDir}/upscale_${Date.now()}.png`;
     fs.writeFileSync(tempPath, imageBuffer);
 
     // Message de progression
-    await socket.sendMessage(sender, { 
+    await socket.sendMessage(sender, {
       text: '🔄 Amélioration de l\'image en cours... (cela peut prendre jusqu\'à 60 secondes)'
     }, { quoted: msg });
 
@@ -8595,14 +8584,14 @@ case 'upscale': {
       }
 
       // Télécharger l'image améliorée
-      const enhancedResponse = await axios.get(result.output, { 
+      const enhancedResponse = await axios.get(result.output, {
         responseType: 'arraybuffer',
         timeout: 30000,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       });
-      
+
       const enhancedBuffer = Buffer.from(enhancedResponse.data);
 
       // Vérifier que l'image améliorée est valide
@@ -8621,7 +8610,7 @@ case 'upscale': {
 
     } catch (apiErr) {
       console.error('[API ERROR]', apiErr);
-      
+
       let errorMessage = apiErr.message;
       if (apiErr.response?.status === 400) {
         errorMessage = 'Format d\'image non supporté. Essayez avec une autre image.';
@@ -8630,13 +8619,13 @@ case 'upscale': {
       } else if (apiErr.code === 'ECONNABORTED') {
         errorMessage = 'Timeout de connexion.';
       }
-      
-      await socket.sendMessage(sender, { 
+
+      await socket.sendMessage(sender, {
         text: `❌ Erreur API: ${errorMessage}`
       }, { quoted: msg });
-      
+
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
-      
+
     } finally {
       // Nettoyer le fichier temporaire
       try {
@@ -8648,15 +8637,15 @@ case 'upscale': {
 
   } catch (e) {
     console.error('[UPSCALE ERROR]', e);
-    
+
     const jid = msg?.key?.remoteJid;
     const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    
+
     let errorMessage = e.message;
     if (e.response) {
       errorMessage += ` (Status: ${e.response.status})`;
     }
-    
+
     // Messages d'erreur personnalisés
     if (errorMessage.includes('400')) {
       errorMessage = 'Format d\'image non supporté. Essayez avec une image JPG ou PNG.';
@@ -8665,18 +8654,18 @@ case 'upscale': {
     } else if (errorMessage.includes('timeout')) {
       errorMessage = 'Délai d\'attente dépassé. Réessayez plus tard.';
     }
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `❌ Erreur: ${errorMessage}`
     }, { quoted: msg });
-    
+
     try {
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
     } catch (reactErr) {}
   }
   break;
 }
-            
+
 
 case 'forcereconnect':
 case 'force': {
@@ -8738,8 +8727,8 @@ case 'bots': {
 
     // Vérification owner/admin Mongo déjà normalisée au début du handler.
     if (!isPrivileged) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Accès réservé aux administrateurs.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Accès réservé aux administrateurs.'
       }, { quoted: msg });
       break;
     }
@@ -8749,17 +8738,17 @@ case 'bots': {
 
     // Meta mention
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_ACTIVESESSIONS" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_ACTIVESESSIONS"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
@@ -8767,30 +8756,30 @@ case 'bots': {
     let text = `╔═══════════════════════════╗\n`;
     text += `   🤖 SESSIONS ACTIVES 🤖\n`;
     text += `╚═══════════════════════════╝\n\n`;
-    
+
     text += `📊 INFORMATIONS\n`;
     text += `├─ Total : ${activeCount}\n`;
     text += `├─ Heure : ${getHaitiTimestamp()}\n`;
     text += `└─ Fuseau : Haïti\n\n`;
-    
+
     if (activeCount > 0) {
       text += `📱 BOTS CONNECTÉS (${activeCount})\n`;
       text += `┌────────────────────────────┐\n`;
-      
+
       activeNumbers.forEach((num, index) => {
         const status = "🟢";
         text += `│ ${status} ${String(index + 1).padStart(2, ' ')}. ${num.padEnd(15, ' ')} │\n`;
       });
-      
+
       text += `└────────────────────────────┘\n\n`;
-      
+
       text += `📈 STATISTIQUES\n`;
       text += `├─ Densité : ${Math.min(100, Math.round((activeCount / 50) * 100))}%\n`;
       text += `├─ Performance : ${activeCount > 10 ? "Élevée" : activeCount > 5 ? "Moyenne" : "Basse"}\n`;
       text += `└─ Statut : Opérationnel ✅\n\n`;
-      
+
       text += `💡 Les sessions sont stables et actives.`;
-      
+
     } else {
       text += `⚠️ AUCUN BOT CONNECTÉ\n\n`;
       text += `Recommandations :\n`;
@@ -8837,10 +8826,10 @@ case 'facebook': case 'fbdl': case 'fb': {
     // Définir jid à partir de remoteJid (disponible dans ton contexte)
     const jid = remoteJid; // ou msg.key.remoteJid selon ce qui est disponible
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // Vérifier si un lien est fourni
     const url = args.join(' ').trim();
-    
+
     if (!url) {
       await socket.sendMessage(sender, {
         text: `❌ Exemple: ${prefix}${command} https://fb.watch/xxxxxx/`
@@ -8886,13 +8875,13 @@ case 'facebook': case 'fbdl': case 'fb': {
 
     // Parser le HTML avec cheerio
     const $ = cheerio.load(response.data.data);
-    
+
     // Extraire la durée
     const duration = $('.content p').first().text().trim() || 'Inconnue';
-    
+
     // Extraire la miniature
     const thumbnail = $('.thumbnail img').attr('src') || null;
-    
+
     // Extraire toutes les qualités disponibles
     const videos = [];
     $('.download-link-fb').each((_, el) => {
@@ -8919,9 +8908,9 @@ case 'facebook': case 'fbdl': case 'fb': {
     // Sélectionner la meilleure qualité disponible (priorité: HD > 720p > 480p > première)
     const qualityPriority = ['HD', '720p', '480p', '360p'];
     let selectedVideo = videos[0];
-    
+
     for (const priority of qualityPriority) {
-      const found = videos.find(v => 
+      const found = videos.find(v =>
         v.quality.toLowerCase().includes(priority.toLowerCase())
       );
       if (found) {
@@ -8947,10 +8936,10 @@ case 'facebook': case 'fbdl': case 'fb': {
         caption: `📹 *Facebook Video*\n📊 Qualité: ${selectedVideo.quality}\n⏱️ Durée: ${duration}`,
         mimetype: 'video/mp4'
       }, { quoted: msg });
-      
+
     } catch (sendErr) {
       console.error('[FACEBOOK SEND ERROR]', sendErr);
-      
+
       // Si l'envoi direct échoue, envoyer le lien
       await socket.sendMessage(sender, {
         text: `❌ Impossible d'envoyer la vidéo directement.\n\n🔗 *Lien de téléchargement:*\n${selectedVideo.url}\n\n📊 *Qualité:* ${selectedVideo.quality}`
@@ -8962,20 +8951,20 @@ case 'facebook': case 'fbdl': case 'fb': {
 
   } catch (e) {
     console.error('[FACEBOOK ERROR]', e);
-    
+
     // Définir jid et sender pour le bloc catch aussi
     const jid = remoteJid || msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     let errorMessage = e.message;
     if (e.response) {
       errorMessage += ` (Status: ${e.response.status})`;
     }
-    
+
     await socket.sendMessage(sender, {
       text: `❌ Erreur: ${errorMessage}\n\nEssayez un autre lien ou réessayez plus tard.`
     }, { quoted: msg });
-    
+
     await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
   }
   break;
@@ -9579,7 +9568,7 @@ case 'tt': {
     // Définir jid et sender
     const jid = msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // headers adaptés au site savett.cc
     const headers = {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -9591,9 +9580,9 @@ case 'tt': {
 
     // helpers encapsulés
     async function getCsrfAndCookie() {
-      const res = await axios.get('https://savett.cc/en1/download', { 
+      const res = await axios.get('https://savett.cc/en1/download', {
         headers,
-        timeout: 10000 
+        timeout: 10000
       });
       const csrf = res.data.match(/name="csrf_token" value="([^"]+)"/)?.[1] || null;
       const cookie = (res.headers['set-cookie'] || [])
@@ -9674,7 +9663,7 @@ case 'tt': {
         // Vérifier l'espace disque disponible
         const stats = await fs.promises.stat('/').catch(() => ({ size: 0 }));
         const freeSpace = stats.size || 1024 * 1024 * 1024; // fallback 1GB
-        
+
         // Limiter à 50MB par fichier
         const response = await axios({
           method: 'GET',
@@ -9689,17 +9678,17 @@ case 'tt': {
 
         const chunks = [];
         let totalSize = 0;
-        
+
         for await (const chunk of response.data) {
           chunks.push(chunk);
           totalSize += chunk.length;
-          
+
           // Vérifier la taille totale
           if (totalSize > 50 * 1024 * 1024) {
             throw new Error('Fichier trop volumineux (>50MB)');
           }
         }
-        
+
         return Buffer.concat(chunks);
       } catch (e) {
         console.error('[TIKTOK] fetchBufferFromUrl error', e?.message || e);
@@ -9710,24 +9699,24 @@ case 'tt': {
     // validation URL
     const url = (args[0] || '').trim();
     if (!url || !/^https?:\/\//i.test(url)) {
-      await socket.sendMessage(sender, { 
-        text: '❗ Usage: .tiktok <url>\nExample: .tiktok https://vt.tiktok.com/xxxxx' 
+      await socket.sendMessage(sender, {
+        text: '❗ Usage: .tiktok <url>\nExample: .tiktok https://vt.tiktok.com/xxxxx'
       }, { quoted: msg });
       break;
     }
 
     // Réaction d'attente
     await socket.sendMessage(jid, { react: { text: "⏳", key: msg.key } });
-    await socket.sendMessage(sender, { 
-      text: '🔎 Recherche et téléchargement en cours, merci de patienter...' 
+    await socket.sendMessage(sender, {
+      text: '🔎 Recherche et téléchargement en cours, merci de patienter...'
     }, { quoted: msg });
 
     // exécution principale
     const info = await savett(url);
 
     if (!info) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Impossible de récupérer les informations pour ce lien.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de récupérer les informations pour ce lien.'
       }, { quoted: msg });
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
       break;
@@ -9743,9 +9732,9 @@ case 'tt': {
       `💧 Vidéos (watermark): ${info.downloads.wm?.length || 0}`
     ];
     if (info.duration) summary.push(`⏱️ Durée: ${info.duration}`);
-    
-    await socket.sendMessage(sender, { 
-      text: `✅ Résultat:\n${summary.join('\n')}` 
+
+    await socket.sendMessage(sender, {
+      text: `✅ Résultat:\n${summary.join('\n')}`
     }, { quoted: msg });
 
     // Fonction pour envoyer avec gestion d'erreur
@@ -9836,24 +9825,24 @@ case 'tt': {
 
   } catch (err) {
     console.error('[TIKTOK COMMAND ERROR]', err);
-    
+
     // Définir jid et sender pour le catch
     const jid = msg?.key?.remoteJid;
     const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    
-    try { 
-      await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } }); 
+
+    try {
+      await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
     } catch(e){}
-    
+
     let errorMessage = err.message || 'Erreur inconnue';
     if (errorMessage.includes('ENOSPC')) {
       errorMessage = 'Espace disque insuffisant pour traiter ce média. Essayez avec un fichier plus petit.';
     } else if (errorMessage.includes('timeout')) {
       errorMessage = 'Délai d\'attente dépassé. Le serveur met trop de temps à répondre.';
     }
-    
-    await socket.sendMessage(sender, { 
-      text: `❌ Erreur lors du traitement: ${errorMessage}` 
+
+    await socket.sendMessage(sender, {
+      text: `❌ Erreur lors du traitement: ${errorMessage}`
     }, { quoted: msg });
   }
   break;
@@ -9865,12 +9854,12 @@ case 'grouplist': {
   try {
     // ✅ Owner check removed — now everyone can use it!
 
-    await socket.sendMessage(sender, { 
-      react: { text: "📝", key: msg.key } 
+    await socket.sendMessage(sender, {
+      react: { text: "📝", key: msg.key }
     });
 
-    await socket.sendMessage(sender, { 
-      text: "📝 Fetching group list..." 
+    await socket.sendMessage(sender, {
+      text: "📝 Fetching group list..."
     }, { quoted: msg });
 
     const groups = await socket.groupFetchAllParticipating();
@@ -9880,8 +9869,8 @@ case 'grouplist': {
     groupArray.sort((a, b) => a.creation - b.creation);
 
     if (groupArray.length === 0) {
-      return await socket.sendMessage(sender, { 
-        text: "❌ No groups found!" 
+      return await socket.sendMessage(sender, {
+        text: "❌ No groups found!"
       }, { quoted: msg });
     }
 
@@ -9922,8 +9911,8 @@ case 'grouplist': {
 
   } catch (err) {
     console.error('GJID command error:', err);
-    await socket.sendMessage(sender, { 
-      text: "❌ Failed to fetch group list. Please try again later." 
+    await socket.sendMessage(sender, {
+      text: "❌ Failed to fetch group list. Please try again later."
     }, { quoted: msg });
   }
   break;
@@ -10156,20 +10145,13 @@ END:VCARD`
       const metadata = cached.metadata;
       if (process.env.LOG_LEVEL === 'debug') console.debug('[CID] renvoi depuis le cache pour', inviteId);
       const infoTextCached = buildChannelInfoText(metadata, botName);
+      // Envoi interactif depuis le cache
       const previewUrlCached = normalizePreviewUrl(metadata.preview);
-      await socket.sendMessage(sender, {
-        text: `${infoTextCached}\n\n🆔 ID à copier : \`${metadata.id}\``
-      }, { quoted: shonux });
-      try {
-        const interactiveCached = buildChannelInfoInteractiveMessage({
-          infoText: infoTextCached,
-          botName,
-          copyCode: metadata.id
-        });
-        await socket.relayMessage(sender, interactiveCached, { messageId: `cid_${inviteId}_${Date.now()}` });
-      } catch (error) {
-        console.warn('[CID] bouton de copie indisponible; l’ID reste dans le texte :', error?.message || error);
-      }
+      const interactiveCached = buildChannelInfoInteractiveMessage({
+        infoText: infoTextCached,
+        botName,
+        copyCode: metadata.id
+      });
       if (previewUrlCached) {
         try {
           await socket.sendMessage(sender, {
@@ -10179,6 +10161,12 @@ END:VCARD`
         } catch (error) {
           console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
         }
+      }
+      try {
+        await socket.relayMessage(sender, interactiveCached, { messageId: `cid_${inviteId}_${Date.now()}` });
+      } catch (e) {
+        console.warn('[CID] CTA copy indisponible; repli texte :', e?.message || e);
+        await socket.sendMessage(sender, { text: `${infoTextCached}\n\n🆔 ID à copier : \`${metadata.id}\`` }, { quoted: shonux });
       }
       break;
     }
@@ -10269,21 +10257,11 @@ END:VCARD`
     const infoText = buildChannelInfoText(normalized, botName);
     const previewUrl = normalizePreviewUrl(normalized.preview);
 
-    // Réponse texte directe : l’ID reste lisible même sur les clients qui
-    // n’affichent pas les payloads interactifs relayés par les bots.
-    await socket.sendMessage(sender, {
-      text: `${infoText}\n\n🆔 ID à copier : \`${normalized.id}\``
-    }, { quoted: shonux });
-    try {
-      const interactive = buildChannelInfoInteractiveMessage({
-        infoText,
-        botName,
-        copyCode: normalized.id
-      });
-      await socket.relayMessage(sender, interactive, { messageId: `cid_${inviteId}_${Date.now()}` });
-    } catch (error) {
-      console.warn('[CID] bouton de copie indisponible; l’ID reste dans le texte :', error?.message || error);
-    }
+    const interactive = buildChannelInfoInteractiveMessage({
+      infoText,
+      botName,
+      copyCode: normalized.id
+    });
     if (previewUrl) {
       try {
         await socket.sendMessage(sender, {
@@ -10293,6 +10271,17 @@ END:VCARD`
       } catch (error) {
         console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
       }
+    }
+
+    // L’en-tête reste textuel : une URL ne peut pas être fournie comme
+    // imageMessage brut dans un relay interactif; le bouton CTA copy est natif.
+    try {
+      await socket.relayMessage(sender, interactive, { messageId: `cid_${inviteId}_${Date.now()}` });
+    } catch (errRelay) {
+      console.warn('[CID] relay interactif indisponible, repli texte :', errRelay?.message || errRelay);
+      await socket.sendMessage(sender, {
+        text: `${infoText}\n\n🆔 ID à copier : \`${normalized.id}\``
+      }, { quoted: shonux });
     }
 
   } catch (err) {
@@ -10365,21 +10354,21 @@ case 'addadmin': {
 case 'tagall': {
   try {
     if (!from || !from.endsWith('@g.us')) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Cette commande ne peut être utilisée que dans les groupes.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Cette commande ne peut être utilisée que dans les groupes.'
       }, { quoted: msg });
     }
 
     let gm = null;
-    try { 
-      gm = await socket.groupMetadata(from); 
-    } catch(e) { 
-      gm = null; 
+    try {
+      gm = await socket.groupMetadata(from);
+    } catch(e) {
+      gm = null;
     }
-    
+
     if (!gm) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Impossible de récupérer les informations du groupe.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Impossible de récupérer les informations du groupe.'
       }, { quoted: msg });
     }
 
@@ -10397,8 +10386,8 @@ case 'tagall': {
     const text = args && args.length ? args.join(' ') : '📢 Annonce à tous les membres';
 
     let groupPP = 'https://i.ibb.co/9q2mG0Q/default-group.jpg';
-    try { 
-      groupPP = await socket.profilePictureUrl(from, 'image'); 
+    try {
+      groupPP = await socket.profilePictureUrl(from, 'image');
     } catch(e){}
 
     const mentions = participants.map(getParticipantMentionJid).filter(Boolean);
@@ -10414,17 +10403,17 @@ case 'tagall': {
 
     // BotName meta mention
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_TAGALL" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_TAGALL"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
@@ -10468,8 +10457,8 @@ ${"─".repeat(35)}
 
   } catch (err) {
     console.error('tagall error', err);
-    await socket.sendMessage(sender, { 
-      text: '❌ Erreur lors de l\'exécution de la commande tagall.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Erreur lors de l\'exécution de la commande tagall.'
     }, { quoted: msg });
   }
   break;
@@ -10535,35 +10524,35 @@ case 'deladmin': {
 
             case 'tovn': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
-        await socket.sendMessage(sender, { 
-            text: `🎵 *Convert to Voice Note*\n\n❌ Réponds à un audio ou vidéo` 
-        }, { quoted: msg });
-        break;
-    }
-    
-    const isAudio = quoted.audioMessage;
-    const isVideo = quoted.videoMessage;
-    
-    if (!isAudio && !isVideo) {
-        await socket.sendMessage(sender, { 
-            text: `❌ Type non supporté. Réponds à un audio (🎵) ou vidéo (🎥)` 
+        await socket.sendMessage(sender, {
+            text: `🎵 *Convert to Voice Note*\n\n❌ Réponds à un audio ou vidéo`
         }, { quoted: msg });
         break;
     }
 
-    await socket.sendMessage(sender, { 
-        react: { text: "⏳", key: msg.key } 
+    const isAudio = quoted.audioMessage;
+    const isVideo = quoted.videoMessage;
+
+    if (!isAudio && !isVideo) {
+        await socket.sendMessage(sender, {
+            text: `❌ Type non supporté. Réponds à un audio (🎵) ou vidéo (🎥)`
+        }, { quoted: msg });
+        break;
+    }
+
+    await socket.sendMessage(sender, {
+        react: { text: "⏳", key: msg.key }
     });
 
     try {
         // CORRECTION ICI : Bonne méthode pour télécharger
         let buffer;
-        
+
         // Méthode 1: Utiliser downloadContentFromMessage (méthode Baileys officielle)
         const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-        
+
         if (quoted.audioMessage) {
             const stream = await downloadContentFromMessage(quoted.audioMessage, 'audio');
             const chunks = [];
@@ -10571,7 +10560,7 @@ case 'deladmin': {
                 chunks.push(chunk);
             }
             buffer = Buffer.concat(chunks);
-            
+
         } else if (quoted.videoMessage) {
             const stream = await downloadContentFromMessage(quoted.videoMessage, 'video');
             const chunks = [];
@@ -10580,19 +10569,19 @@ case 'deladmin': {
             }
             buffer = Buffer.concat(chunks);
         }
-        
+
         if (!buffer || buffer.length === 0) {
             throw new Error("Buffer vide");
         }
-        
+
         console.log(`[TOVN] Buffer obtenu: ${buffer.length} bytes`);
-        
+
         // Fonction de conversion (gardée de ton code)
         async function convertToOpus(inputBuffer) {
             return new Promise((resolve, reject) => {
                 const ffmpeg = require('fluent-ffmpeg');
                 const { PassThrough } = require('stream');
-                
+
                 const inStream = new PassThrough();
                 const outStream = new PassThrough();
                 const chunks = [];
@@ -10626,10 +10615,10 @@ case 'deladmin': {
                 outStream.on("data", (c) => chunks.push(c));
             });
         }
-        
+
         // Convertir
         const opusBuffer = await convertToOpus(buffer);
-        
+
         // Envoyer comme voice note
         await socket.sendMessage(sender, {
             audio: opusBuffer,
@@ -10637,44 +10626,44 @@ case 'deladmin': {
             ptt: true,
             caption: "🔊 Voice Note"
         }, { quoted: msg });
-        
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
 
     } catch (e) {
         console.error("[TOVN ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
-        
+
         // Fallback: méthode simple sans conversion
         try {
             console.log("[TOVN] Essai méthode fallback...");
-            
+
             if (quoted.audioMessage) {
                 // Juste forwarder l'audio en PTT
-                await socket.sendMessage(sender, quoted, { 
+                await socket.sendMessage(sender, quoted, {
                     quoted: msg,
                     ptt: true // Force en voice note
                 });
-                
-                await socket.sendMessage(sender, { 
-                    react: { text: "🎵", key: msg.key } 
+
+                await socket.sendMessage(sender, {
+                    react: { text: "🎵", key: msg.key }
                 });
             }
-            
+
         } catch (fallbackError) {
             console.error("[TOVN FALLBACK ERROR]:", fallbackError);
-            await socket.sendMessage(sender, { 
-                text: `❌ Impossible de convertir: ${e.message}` 
+            await socket.sendMessage(sender, {
+                text: `❌ Impossible de convertir: ${e.message}`
             }, { quoted: msg });
         }
     }
     break;
 }
 
-           
+
 
 case 'admins': {
   try {
@@ -10780,15 +10769,15 @@ case 'setpath': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
   const ownerNum = primaryOwnerNumber();
-  
+
   // Vérification des permissions
   if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    await socket.sendMessage(sender, { 
-      text: '❌ Permission refusée. Seul le propriétaire de la session ou du bot peut configurer le chemin de sauvegarde.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Permission refusée. Seul le propriétaire de la session ou du bot peut configurer le chemin de sauvegarde.'
     }, { quoted: shonux });
     break;
   }
@@ -10799,8 +10788,8 @@ case 'setpath': {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH2" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    return await socket.sendMessage(sender, { 
-      text: '❗ Fournissez un numéro. Exemple : `.setpath 50912345678`' 
+    return await socket.sendMessage(sender, {
+      text: '❗ Fournissez un numéro. Exemple : `.setpath 50912345678`'
     }, { quoted: shonux });
   }
 
@@ -10811,19 +10800,19 @@ case 'setpath': {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH3" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    return await socket.sendMessage(sender, { 
-      text: '❌ Numéro invalide. Format attendu : 50912345678' 
+    return await socket.sendMessage(sender, {
+      text: '❌ Numéro invalide. Format attendu : 50912345678'
     }, { quoted: shonux });
   }
 
   try {
     // Charger la configuration existante
     let cfg = await loadUserConfigFromMongo(sanitized) || {};
-    
+
     // Ajouter le chemin de sauvegarde avec @s.whatsapp.net
     cfg.savePath = `${cleanPathNumber}@s.whatsapp.net`;
     cfg.savePathNumber = cleanPathNumber; // Garder aussi le numéro sans suffixe
-    
+
     // Sauvegarder dans MongoDB
     await setUserConfigInMongo(sanitized, cfg);
 
@@ -10832,18 +10821,18 @@ case 'setpath': {
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
 
-    await socket.sendMessage(sender, { 
-      text: `✅ Chemin de sauvegarde configuré pour cette session : ${cleanPathNumber}\n\nLes médias sauvegardés seront envoyés à : ${cleanPathNumber}@s.whatsapp.net` 
+    await socket.sendMessage(sender, {
+      text: `✅ Chemin de sauvegarde configuré pour cette session : ${cleanPathNumber}\n\nLes médias sauvegardés seront envoyés à : ${cleanPathNumber}@s.whatsapp.net`
     }, { quoted: shonux });
-    
+
   } catch (e) {
     console.error('setpath error', e);
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH5" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    await socket.sendMessage(sender, { 
-      text: `❌ Échec de la configuration du chemin : ${e.message || e}` 
+    await socket.sendMessage(sender, {
+      text: `❌ Échec de la configuration du chemin : ${e.message || e}`
     }, { quoted: shonux });
   }
   break;
@@ -10854,40 +10843,40 @@ case 'getpath': {
   try {
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    
+
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_GETPATH" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
 
     if (cfg.savePath) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: `📍 Configuration de sauvegarde :
-        
+
 📱 Numéro cible : ${cfg.savePathNumber}
 🔗 JID complet : ${cfg.savePath}
 📅 Configuré le : ${cfg.updatedAt ? new Date(cfg.updatedAt).toLocaleString('fr-FR') : 'Date inconnue'}
 💾 Statut : ✅ Activé
 
-Les commandes .save2 enverront les médias à cette destination.` 
+Les commandes .save2 enverront les médias à cette destination.`
       }, { quoted: shonux });
     } else {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: `⚠️ Aucun chemin de sauvegarde configuré.
-        
+
 Utilisez la commande :
 .setpath <numéro>
 
 Exemple : .setpath 50912345678
 
-Les médias sauvegardés seront envoyés à ce numéro.` 
+Les médias sauvegardés seront envoyés à ce numéro.`
       }, { quoted: shonux });
     }
-    
+
   } catch (e) {
     console.error('getpath error', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible de récupérer la configuration.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Impossible de récupérer la configuration.'
     }, { quoted: msg });
   }
   break;

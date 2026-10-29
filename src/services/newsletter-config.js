@@ -11,23 +11,6 @@ function normaliseNewsletterJid(value) {
   return match ? `${match[1]}@newsletter` : '';
 }
 
-function parseNewsletterChannelReference(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return null;
-  const urlMatch = raw.match(/^(?:https?:\/\/)?(?:www\.)?whatsapp\.com\/channel\/([^/?#\s]+)(?:[/?#].*)?$/i);
-  if (/^(?:https?:\/\/|www\.|whatsapp\.com\/)/i.test(raw) && !urlMatch) return null;
-  if (urlMatch) {
-    const channelKey = urlMatch[1].trim();
-    return /^[a-z0-9._-]{6,128}$/i.test(channelKey) ? { channelKey } : null;
-  }
-  // Certains partagent le lien de publication sans domaine, par ex.
-  // 0029Vb.../175. Pour surveiller, on garde uniquement le code du canal.
-  const barePublication = raw.match(/^([a-z0-9._-]{6,128})\/[a-z0-9._-]{1,128}(?:[?#].*)?$/i);
-  if (barePublication) return { channelKey: barePublication[1] };
-  const jid = normaliseNewsletterJid(raw);
-  return jid ? { jid, channelKey: jid.slice(0, -'@newsletter'.length) } : null;
-}
-
 function parseNewsletterMessageReference(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
@@ -144,23 +127,6 @@ async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, o
   }));
 }
 
-async function reactAcrossNewsletterSocketsForEmojis(sessions, jid, serverId, reactions, onSuccess, options = {}) {
-  const emojis = normaliseEmojiList(reactions);
-  const results = [];
-  for (const emoji of emojis) {
-    const batch = await reactAcrossNewsletterSockets(
-      sessions,
-      jid,
-      serverId,
-      emoji,
-      typeof onSuccess === 'function' ? (session, result) => onSuccess(session, result, emoji) : undefined,
-      options
-    );
-    results.push(...batch);
-  }
-  return results;
-}
-
 function normaliseEmojiList(value, limit = 20) {
   const input = Array.isArray(value) ? value : [value];
   const emojis = [];
@@ -204,18 +170,21 @@ async function syncNewsletterSockets(sockets, jid, action = 'follow', extraSocke
     ...extraSockets
   ].filter(Boolean));
 
-  return Promise.all([...uniqueSockets].map(async socket => {
+  const results = [];
+  for (const socket of uniqueSockets) {
     const session = String(socket?.user?.id || 'session-inconnue').split(':')[0];
     if (typeof socket?.[method] !== 'function') {
-      return { session, ok: false, skipped: true, error: `${method} indisponible` };
+      results.push({ session, ok: false, skipped: true, error: `${method} indisponible` });
+      continue;
     }
     try {
       await socket[method](normalizedJid);
-      return { session, ok: true };
+      results.push({ session, ok: true });
     } catch (error) {
-      return { session, ok: false, error: error?.message || String(error) };
+      results.push({ session, ok: false, error: error?.message || String(error) });
     }
-  }));
+  }
+  return results;
 }
 
 module.exports = {
@@ -224,13 +193,11 @@ module.exports = {
   normaliseEmojiList,
   resolveNewsletterEmojis,
   formatBReactSummary,
-  parseNewsletterChannelReference,
   parseNewsletterMessageReference,
   resolveNewsletterJid,
   extractNewsletterServerId,
   ensureNewsletterFollow,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
-  reactAcrossNewsletterSocketsForEmojis,
   syncNewsletterSockets
 };

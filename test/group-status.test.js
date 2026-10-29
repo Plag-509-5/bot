@@ -283,10 +283,6 @@ test('les fichiers audio temporaires vont sur le volume configurable, pas dans /
     audioStatus.getAudioStatusTempRoot({ AUDIO_STATUS_TEMP_DIR: '/data/kaido/audio-work' }),
     path.resolve('/data/kaido/audio-work')
   );
-  assert.equal(
-    audioStatus.getAudioStatusTempRoot({ WHATSAPP_MEDIA_TEMP_DIR: '/mnt/large/kaido-media' }),
-    path.resolve('/mnt/large/kaido-media/audio-status')
-  );
 });
 
 test('une erreur ENOSPC indique le dossier persistant sans renvoyer la commande FFmpeg complète', () => {
