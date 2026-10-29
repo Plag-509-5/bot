@@ -6,6 +6,7 @@ const path = require('path');
 const LOCAL_STORE_FILE = path.join(__dirname, '..', '..', 'config', 'data', 'reaction_commands.json');
 // Map<sessionId::emojiKey, { emoji, emojiKey, command, creator, sessionId, createdAt }>
 const reactionCmds = new Map();
+const reactionCountsBySession = new Map();
 let mongoCol = null;
 
 function normalizeSessionId(value) {
@@ -22,11 +23,25 @@ function scopedKey(sessionId, emoji) {
   return `${normalizeSessionId(sessionId)}::${normalizeEmoji(emoji)}`;
 }
 
+function adjustSessionReactionCount(sessionId, difference) {
+  const normalizedSession = normalizeSessionId(sessionId);
+  const next = Math.max(0, (reactionCountsBySession.get(normalizedSession) || 0) + difference);
+  if (next) reactionCountsBySession.set(normalizedSession, next);
+  else reactionCountsBySession.delete(normalizedSession);
+}
+
+function clearReactionCache() {
+  reactionCmds.clear();
+  reactionCountsBySession.clear();
+}
+
 function cacheReaction(doc) {
   if (!doc?.emoji || !doc?.command) return;
   const sessionId = normalizeSessionId(doc.sessionId);
   const emojiKey = normalizeEmoji(doc.emojiKey || doc.emoji);
-  reactionCmds.set(scopedKey(sessionId, emojiKey), { ...doc, sessionId, emojiKey });
+  const key = scopedKey(sessionId, emojiKey);
+  if (!reactionCmds.has(key)) adjustSessionReactionCount(sessionId, 1);
+  reactionCmds.set(key, { ...doc, sessionId, emojiKey });
 }
 
 function isEmoji(value) {
@@ -91,7 +106,7 @@ async function setReactionCommand(emoji, command, creator = '', sessionId = 'glo
     sessionId: normalizedSession,
     createdAt: Date.now()
   };
-  reactionCmds.set(scopedKey(normalizedSession, emojiKey), doc);
+  cacheReaction(doc);
   await persistReactionCmds();
 
   if (mongoCol) {
@@ -133,6 +148,7 @@ async function deleteReactionCommand(emojiOrCommand, sessionId = 'global') {
 
   const target = reactionCmds.get(targetKey);
   reactionCmds.delete(targetKey);
+  adjustSessionReactionCount(normalizedSession, -1);
   await persistReactionCmds();
   if (mongoCol) {
     try {
@@ -142,6 +158,10 @@ async function deleteReactionCommand(emojiOrCommand, sessionId = 'global') {
     }
   }
   return true;
+}
+
+function hasReactionCommands(sessionId = 'global') {
+  return (reactionCountsBySession.get(normalizeSessionId(sessionId)) || 0) > 0;
 }
 
 function getAllReactionCommands(sessionId = 'global') {
@@ -160,6 +180,7 @@ module.exports = {
   setReactionCommand,
   findReactionCommand,
   deleteReactionCommand,
+  hasReactionCommands,
   getAllReactionCommands,
-  _test: { cacheReaction, reactionCmds }
+  _test: { cacheReaction, clearReactionCache, reactionCmds }
 };

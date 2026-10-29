@@ -1,0 +1,27 @@
+{
+  "languageName": "English",
+  "responses": {
+    "Configuration réussie !": "Configuration saved!",
+    "Aucun quiz n’est en cours dans ce salon.": "There is no quiz running in this chat.",
+    "Aucun quiz en cours. Lance-en un avec .quiz.": "No quiz is running. Start one with .quiz.",
+    "La question actuelle est toujours ouverte. Attends le verdict avant de continuer.": "The current question is still open. Wait for the result before continuing.",
+    "Aucun score pour le moment.": "No scores yet.",
+    "Réponse directe : écris ta réponse dans le groupe.": "Open answer: type your answer in the group.",
+    "Vote dans le sondage ci-dessous. Le vote se ferme dans 30 secondes.": "Vote in the poll below. Voting closes in 30 seconds.",
+    "Statut publié, visible par": "Status posted, visible to",
+    "Publication annulée :": "Posting cancelled:",
+    "Impossible de générer la question :": "Could not generate the question:",
+    "Impossible de générer le quiz :": "Could not generate the quiz:",
+    "Les API IA sont temporairement limitées. Réessaie dans quelques instants.": "AI services are temporarily rate-limited. Please try again shortly.",
+    "Pose une question après la commande.": "Ask a question after the command.",
+    "Téléchargement YouTube impossible :": "YouTube download failed:",
+    "Aucun résultat trouvé sur YouTube.": "No YouTube results were found.",
+    "Sessions actives :": "Active sessions:",
+    "Aucun bot actuellement connecté.": "No bots are currently connected.",
+    "Aucun abonnement préalable n'est nécessaire.": "No prior channel subscription is required.",
+    "Les réponses statiques utilisent désormais le catalogue local": "Static replies now use the local catalog",
+    "L’IA et les quiz répondront dans cette langue.": "AI and quizzes will reply in this language.",
+    "Langue manquante ou non prise en charge.": "Language missing or not supported.",
+    "Catalogues locaux disponibles :": "Available local catalogs:"
+  }
+}

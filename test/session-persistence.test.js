@@ -69,10 +69,12 @@ test('Baileys officiel pour les sessions et NYXCORE pour le plugin de statut', a
     assert.equal(packageJson.dependencies[forbidden], undefined, `fork interdit : ${forbidden}`);
   }
   assert.doesNotMatch(packageJson.dependencies['@whiskeysockets/baileys'], /^npm:/);
-  // libsignal doit toujours être remplacé par le commit officiel de Baileys.
+  // La version publiée sur npm est issue du même commit upstream, sans
+  // téléchargement codeload pendant chaque déploiement.
+  assert.equal(packageJson.overrides?.libsignal, '6.0.0');
   assert.equal(
-    packageJson.overrides?.libsignal,
-    'github:whiskeysockets/libsignal-node#bcea72df9ec34d9d9140ab30619cf479c7c144c7'
+    require('../package-lock.json').packages['node_modules/libsignal'].resolved,
+    'https://registry.npmjs.org/libsignal/-/libsignal-6.0.0.tgz'
   );
 });
 
@@ -87,8 +89,11 @@ test('les creds et clés sont sauvegardés par les APIs MongoDB dédiées', () =
   assert.doesNotMatch(state, /node:fs|fs-extra|node:os|SESSIONS_DIR/);
 });
 
-test('une seule reconnexion est programmée par fermeture', () => {
-  assert.equal(occurrences(source, 'reconnectScheduler.schedule('), 1);
+test('le lifecycle et le watchdog partagent le même ordonnanceur de reconnexion', () => {
+  // Une programmation vient du lifecycle Baileys, l’autre du watchdog si le
+  // close n’a pas été signalé. L’ordonnanceur partagé déduplique le numéro.
+  assert.equal(occurrences(source, 'reconnectScheduler.schedule('), 2);
+  assert.match(source, /createSessionHealthWatcher\(/);
   assert.doesNotMatch(code, /Reconnexion automatique dans 5 secondes/);
 });
 
@@ -100,10 +105,11 @@ test('un socket résiduel est fermé avant d’en ouvrir un nouveau', () => {
   assert.ok(leftoverAt < makeSocketAt);
 });
 
-test('chaque envoi passe par le garde-fou de connexion', () => {
+test('chaque envoi passe par le garde-fou puis par la présence temporaire de réponse', () => {
+  const translationAt = source.indexOf('setupTranslationWrapper(socket, sanitizedNumber)');
   const safeAt = source.indexOf('installSafeSend(socket)');
-  const themeAt = source.indexOf('setupCommandThemeWrapper(socket)');
-  assert.ok(safeAt > 0 && themeAt > safeAt);
+  const presenceAt = source.indexOf('setupReplyPresenceWrapper(socket)');
+  assert.ok(translationAt > 0 && safeAt > translationAt && presenceAt > safeAt);
 });
 
 test('la suppression de session retire MongoDB via un point d’entrée unique', () => {

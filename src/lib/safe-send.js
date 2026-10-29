@@ -41,8 +41,14 @@ function socketReadiness(socket) {
     return { ready: false, reason: 'socket-absent' };
   }
   const ws = socket.ws;
-  if (ws && typeof ws.readyState === 'number' && ws.readyState !== WEBSOCKET_OPEN) {
+  // Baileys 7/NYXCORE exposes its WebSocketClient state as `isOpen`, not the
+  // browser-style `readyState`. Prefer that authoritative getter when present.
+  if (ws && typeof ws.isOpen === 'boolean') {
+    if (!ws.isOpen) return { ready: false, reason: 'websocket-fermee' };
+  } else if (ws && typeof ws.readyState === 'number' && ws.readyState !== WEBSOCKET_OPEN) {
     return { ready: false, reason: `websocket-fermee-${ws.readyState}` };
+  } else if (typeof ws?.socket?.readyState === 'number' && ws.socket.readyState !== WEBSOCKET_OPEN) {
+    return { ready: false, reason: `websocket-fermee-${ws.socket.readyState}` };
   }
   const creds = socket.authState && socket.authState.creds;
   if (creds && creds.registered === false) {
@@ -130,8 +136,8 @@ async function safeSend(sendFn, socket, jid, content, options = {}) {
 
 /**
  * Enveloppe `socket.sendMessage` pour que tous les appels du bot passent par
- * la vérification de connexion. À installer AVANT tout autre wrapper
- * (notamment celui du thème) pour rester au plus près de l'envoi réel.
+ * la vérification de connexion. À installer en dernier (après traduction/thème)
+ * afin de rejeter un socket fermé avant tout travail préparatoire au message.
  */
 function installSafeSend(socket, options = {}) {
   if (!socket || typeof socket.sendMessage !== 'function') return socket;

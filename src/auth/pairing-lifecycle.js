@@ -362,7 +362,13 @@ class PairingReadyError extends Error {
   }
 }
 
-/** Attend le stanza `pair-device` (exposé par Baileys comme update.qr). */
+/**
+ * Attend que le handshake réseau Baileys soit prêt pour un stanza chiffré.
+ * `requestPairingCode()` envoie `link_code_companion_reg` et ne dépend pas de
+ * `connection.update.qr` (qui appartient au parcours QR). Sur la version Baileys
+ * utilisée ici, `socket.ws` émet `frame` pour chaque stanza déjà déchiffré :
+ * c'est le signal de disponibilité. `update.qr` reste un fallback compatible.
+ */
 function waitForPairingReady(socket, options = {}) {
   const {
     timeoutMs = 45_000,
@@ -376,6 +382,10 @@ function waitForPairingReady(socket, options = {}) {
 
   if (socket?.authState?.creds?.registered) return Promise.resolve();
 
+  const transport = socket.ws;
+  const canObserveFrames = typeof transport?.on === 'function'
+    && (typeof transport?.off === 'function' || typeof transport?.removeListener === 'function');
+
   return new Promise((resolve, reject) => {
     let settled = false;
     let timer;
@@ -383,6 +393,10 @@ function waitForPairingReady(socket, options = {}) {
     const cleanup = () => {
       if (timer !== undefined) clearTimeoutFn(timer);
       socket.ev.off('connection.update', onUpdate);
+      if (canObserveFrames) {
+        if (typeof transport.off === 'function') transport.off('frame', onFrame);
+        else transport.removeListener('frame', onFrame);
+      }
     };
     const finish = (callback, value) => {
       if (settled) return;
@@ -390,8 +404,13 @@ function waitForPairingReady(socket, options = {}) {
       cleanup();
       callback(value);
     };
+    const onFrame = (frame) => {
+      // Pendant le Noise handshake, Baileys émet un Uint8Array. Un stanza WA
+      // déchiffré est au contraire un BinaryNode avec `tag`.
+      if (frame && typeof frame.tag === 'string') finish(resolve);
+    };
     const onUpdate = (update = {}) => {
-      if (update.qr) {
+      if (update.qr || update.connection === 'open') {
         finish(resolve);
         return;
       }
@@ -408,11 +427,12 @@ function waitForPairingReady(socket, options = {}) {
     };
 
     socket.ev.on('connection.update', onUpdate);
+    if (canObserveFrames) transport.on('frame', onFrame);
     timer = setTimeoutFn(() => {
       finish(
         reject,
         new PairingReadyError(
-          `WhatsApp n’a pas préparé l’appairage dans les ${timeoutMs} ms`,
+          `WhatsApp n’a pas terminé le handshake du socket dans les ${timeoutMs} ms`,
           { code: 'PAIRING_READY_TIMEOUT', statusCode: STATUS.TIMED_OUT }
         )
       );

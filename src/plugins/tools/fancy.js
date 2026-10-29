@@ -24,7 +24,7 @@ function convertFancy(text, styleMap) {
 
 module.exports = {
   name: 'fancy',
-  alias: ['style', 'fancytext', 'police'],
+  alias: ['fancytext', 'police'],
   category: 'tools',
   description: 'Génère du texte stylisé avec différentes polices',
   usage: '.fancy <votre texte>',

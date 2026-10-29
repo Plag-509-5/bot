@@ -44,6 +44,11 @@ function modeAllowsChat(modeValue, chatId) {
   return isGroupChat(chatId) || isPrivateChat(chatId);
 }
 
+function shouldCacheIncomingMessage({ antideleteMode, hasReactionCommands = false, chatId } = {}) {
+  return modeAllowsChat(antideleteMode, chatId)
+    || (hasReactionCommands && modeAllowsChat('all', chatId));
+}
+
 function unwrapMessage(message) {
   let current = message || {};
   let isViewOnce = false;
@@ -325,6 +330,7 @@ module.exports = {
   isPrivateChat,
   normaliseAntideleteMode,
   modeAllowsChat,
+  shouldCacheIncomingMessage,
   unwrapMessage,
   getMediaDescriptor,
   getTextContent,

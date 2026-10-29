@@ -1,50 +1,51 @@
-const axios = require('axios');
+'use strict';
 
-async function askAI(query) {
-  // Option 1 : Free public AI endpoint
-  try {
-    const res = await axios.get(`https://api.giftedtech.web.id/api/ai/gpt?apikey=gifted&q=${encodeURIComponent(query)}`, { timeout: 15000 });
-    if (res.data && res.data.result) return res.data.result;
-  } catch (e) {}
-
-  // Option 2 : Free backup AI endpoint
-  try {
-    const res = await axios.get(`https://api.nexoracle.com/ai/chatgpt?prompt=${encodeURIComponent(query)}&apikey=free_key`, { timeout: 15000 });
-    if (res.data && res.data.result) return res.data.result;
-  } catch (e) {}
-
-  // Option 3 : Pollinations AI
-  try {
-    const res = await axios.get(`https://text.pollinations.ai/${encodeURIComponent(query)}`, { timeout: 15000 });
-    if (res.data && typeof res.data === 'string') return res.data;
-  } catch (e) {}
-
-  throw new Error('Les serveurs IA sont temporairement indisponibles.');
-}
+const { respond, formatAiError } = require('../../services/ai-chatbot');
+const { getSessionLanguage, SKIP_FORMATTING_OPTION } = require('../../features/translation');
 
 module.exports = {
   name: 'ai',
-  alias: ['gpt', 'chat', 'botia', 'ia', 'ask'],
+  alias: ['chatgpt', 'gpt'],
   category: 'ai',
-  description: 'Posez n\'importe quelle question à l\'Intelligence Artificielle',
+  description: 'Discute avec Kaido à l’aide des API IA configurées; mémoire partagée entre fournisseurs',
   usage: '.ai <votre question>',
-  async execute({ socket, msg, from, args, prefix }) {
-    const query = args.join(' ');
+  async execute({ socket, msg, from, args, prefix, sessionNumber }) {
+    const query = args.join(' ').trim();
     if (!query) {
-      return await socket.sendMessage(from, {
-        text: `🧠 *Usage :* \`${prefix}ai Quelle est la capitale d'Haïti ?\` ou \`${prefix}gpt Écris-moi une fonction en JavaScript\``
+      return socket.sendMessage(from, {
+        text: `🐉 Pose une question après la commande.\nExemple : ${prefix}ai explique-moi la gravité.`
       }, { quoted: msg });
     }
 
-    await socket.sendMessage(from, { text: '🧠 *Réflexion en cours...*' }, { quoted: msg });
-
+    const language = await getSessionLanguage(sessionNumber);
+    let presenceStarted = false;
     try {
-      const answer = await askAI(query);
-      const text = `🤖 *KAIDO AI ASSISTANT* 🧠\n\n${answer}\n\n> 𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐛𝐲 𝐊𝐚𝐢𝐝𝐨-𝐌𝐃`;
-      await socket.sendMessage(from, { text }, { quoted: msg });
-    } catch (err) {
-      console.error('[AI ERROR]', err);
-      await socket.sendMessage(from, { text: `❌ Erreur IA : ${err.message}` }, { quoted: msg });
+      const result = await respond({
+        sessionNumber,
+        chatJid: from,
+        senderName: String(from || '').endsWith('@g.us') ? msg?.pushName : '',
+        text: query,
+        language,
+        onStart: async () => {
+          presenceStarted = true;
+          if (typeof socket.sendPresenceUpdate === 'function') {
+            await socket.sendPresenceUpdate('composing', from).catch(() => {});
+          }
+        }
+      });
+      if (result.cancelled) return;
+      await socket.sendMessage(from, {
+        text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
+      }, { quoted: msg, [SKIP_FORMATTING_OPTION]: true });
+    } catch (error) {
+      console.warn('[AI] Requête indisponible :', error?.code || error?.name || 'erreur');
+      await socket.sendMessage(from, {
+        text: formatAiError(error)
+      }, { quoted: msg });
+    } finally {
+      if (presenceStarted && typeof socket.sendPresenceUpdate === 'function') {
+        await socket.sendPresenceUpdate('paused', from).catch(() => {});
+      }
     }
   }
 };

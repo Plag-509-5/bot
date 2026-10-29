@@ -1,0 +1,27 @@
+{
+  "languageName": "Español",
+  "responses": {
+    "Configuration réussie !": "¡Configuración guardada!",
+    "Aucun quiz n’est en cours dans ce salon.": "No hay ningún cuestionario activo en este chat.",
+    "Aucun quiz en cours. Lance-en un avec .quiz.": "No hay ningún cuestionario activo. Inicia uno con .quiz.",
+    "La question actuelle est toujours ouverte. Attends le verdict avant de continuer.": "La pregunta actual sigue abierta. Espera el resultado antes de continuar.",
+    "Aucun score pour le moment.": "Todavía no hay puntuaciones.",
+    "Réponse directe : écris ta réponse dans le groupe.": "Respuesta abierta: escribe tu respuesta en el grupo.",
+    "Vote dans le sondage ci-dessous. Le vote se ferme dans 30 secondes.": "Vota en la encuesta. La votación se cierra en 30 segundos.",
+    "Statut publié, visible par": "Estado publicado, visible para",
+    "Publication annulée :": "Publicación cancelada:",
+    "Impossible de générer la question :": "No se pudo generar la pregunta:",
+    "Impossible de générer le quiz :": "No se pudo generar el cuestionario:",
+    "Les API IA sont temporairement limitées. Réessaie dans quelques instants.": "Los servicios de IA están limitados temporalmente. Inténtalo de nuevo pronto.",
+    "Pose une question après la commande.": "Escribe una pregunta después del comando.",
+    "Téléchargement YouTube impossible :": "No se pudo descargar de YouTube:",
+    "Aucun résultat trouvé sur YouTube.": "No se encontraron resultados en YouTube.",
+    "Sessions actives :": "Sesiones activas:",
+    "Aucun bot actuellement connecté.": "No hay bots conectados en este momento.",
+    "Aucun abonnement préalable n'est nécessaire.": "No se requiere suscribirse al canal previamente.",
+    "Les réponses statiques utilisent désormais le catalogue local": "Las respuestas estáticas ahora usan el catálogo local",
+    "L’IA et les quiz répondront dans cette langue.": "La IA y los cuestionarios responderán en este idioma.",
+    "Langue manquante ou non prise en charge.": "Falta el idioma o no es compatible.",
+    "Catalogues locaux disponibles :": "Catálogos locales disponibles:"
+  }
+}

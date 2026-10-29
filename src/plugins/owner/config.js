@@ -78,14 +78,15 @@ module.exports = {
     if (['alwaysonline', 'autoonline', 'online'].includes(sub)) {
       const value = String(args[1] || '').toLowerCase();
       if (!['on', 'off'].includes(value)) {
-        return send(socket, from, msg, `Usage : ${prefix}config alwaysonline on|off`);
+        return send(socket, from, msg, `Usage : ${prefix}config alwaysonline off`);
       }
-      next.AUTO_ONLINE = value === 'on';
+      // Le bot est hors ligne au repos et temporairement disponible lors d’une réponse.
+      next.AUTO_ONLINE = false;
       await persist();
-      await applyAlwaysOnlineSetting(socket, next.AUTO_ONLINE, from);
-      return send(socket, from, msg, next.AUTO_ONLINE
-        ? '✅ Always online activé : le compte du bot restera disponible.'
-        : '✅ Always online désactivé : présence hors ligne et lecture des messages ordinaires uniquement lorsqu’une commande reconnue arrive.');
+      await applyAlwaysOnlineSetting(socket, false, from);
+      return send(socket, from, msg, value === 'off'
+        ? '✅ Kaido restera hors ligne lorsqu’il ne répond pas.'
+        : 'ℹ️ La présence permanente est désactivée; Kaido ne sera visible que pendant ses réponses.');
     }
 
     const booleanOptions = {
@@ -115,20 +116,21 @@ module.exports = {
       const currentPrefix = Object.prototype.hasOwnProperty.call(next, 'PREFIX') ? next.PREFIX : '.';
       return send(socket, from, msg, [
         '🔧 *Configuration de la session*',
-        `• ALWAYS_ONLINE : ${configEnabled(next.AUTO_ONLINE, false) ? 'ON' : 'OFF'}`,
+        '• AUTO_ONLINE : OFF (présence visible seulement pendant les réponses)',
         `• AUTO_VIEW_STATUS : ${configEnabled(next.AUTO_VIEW_STATUS, true) ? 'ON' : 'OFF'}`,
         `• AUTO_LIKE_STATUS : ${configEnabled(next.AUTO_LIKE_STATUS, true) ? 'ON' : 'OFF'}`,
         `• AUTO_RECORDING : ${configEnabled(next.AUTO_RECORDING, false) ? 'ON' : 'OFF'}`,
         `• PREFIX : ${formatPrefix(currentPrefix)}`,
         `• MODE : ${next.MODE || 'public'}`,
-        `• THEME : ${next.THEME || 'onigashima'}`,
+
+        `• CHATBOT : ${configEnabled(next.CHATBOT_ENABLED, false) ? 'ON' : 'OFF'}`,
         `• SUDO_USERS : ${Array.isArray(next.SUDO_USERS) ? next.SUDO_USERS.length : 0}`
       ].join('\n'));
     }
 
     return send(socket, from, msg, [
       '⚙️ *Commandes de configuration*',
-      `• ${prefix}config alwaysonline on|off`,
+      `• ${prefix}config alwaysonline off`,
       `• ${prefix}config setprefix <préfixe|off>`,
       `• ${prefix}config autoview on|off`,
       `• ${prefix}config autolike on|off`,

@@ -1,3 +1,22 @@
+const {
+  findGroupParticipant,
+  getAdminParticipants,
+  getParticipantId,
+  getParticipantMentionJid,
+  isBotAdmin,
+  isBotIdentity,
+  isGroupAdmin,
+  isGroupSuperAdmin
+} = require('../../services/group-admins');
+
+function getContextInfo(msg) {
+  return msg?.message?.extendedTextMessage?.contextInfo
+    || msg?.message?.stickerMessage?.contextInfo
+    || msg?.message?.imageMessage?.contextInfo
+    || msg?.message?.videoMessage?.contextInfo
+    || {};
+}
+
 module.exports = {
   name: 'kick',
   alias: ['expulser', 'promote', 'demote', 'mute', 'unmute', 'grouplink', 'linkgc', 'admins'],
@@ -7,20 +26,29 @@ module.exports = {
   isGroup: true,
   isAdmin: true,
   isBotAdmin: true,
-  async execute({ socket, msg, from, args, command, quotedSender, quotedMsg }) {
-    const quoted = quotedSender 
-      || msg.message?.extendedTextMessage?.contextInfo?.participant
-      || msg.message?.stickerMessage?.contextInfo?.participant
-      || msg.message?.imageMessage?.contextInfo?.participant
-      || msg.quoted?.sender;
+  async execute({ socket, msg, from, args = [], command, quotedSender }) {
+    let groupMeta;
+    try {
+      groupMeta = await socket.groupMetadata(from);
+    } catch (error) {
+      await socket.sendMessage(from, {
+        text: '⚠️ Impossible de vérifier les administrateurs du groupe. Réessayez dans un instant.'
+      }, { quoted: msg });
+      return;
+    }
 
-    const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]
-      || msg.message?.stickerMessage?.contextInfo?.mentionedJid?.[0];
-
-    const targetUser = quoted || mentioned;
-
-    const groupMeta = await socket.groupMetadata(from).catch(() => null);
-    if (!groupMeta) return;
+    if (!Array.isArray(groupMeta?.participants)) {
+      await socket.sendMessage(from, {
+        text: '⚠️ Impossible de vérifier les administrateurs du groupe. Réessayez dans un instant.'
+      }, { quoted: msg });
+      return;
+    }
+    if (!isBotAdmin(groupMeta, socket)) {
+      await socket.sendMessage(from, {
+        text: '⚠️ Le bot doit être administrateur du groupe pour effectuer cette action.'
+      }, { quoted: msg });
+      return;
+    }
 
     if (command === 'mute' || command === 'fermer') {
       await socket.groupSettingUpdate(from, 'announcement');
@@ -38,37 +66,74 @@ module.exports = {
     }
 
     if (command === 'admins') {
-      const admins = groupMeta.participants.filter(p => p.admin).map(p => p.id);
+      const admins = getAdminParticipants(groupMeta).map(getParticipantMentionJid).filter(Boolean);
       let text = `👑 *ADMINISTRATEURS DU GROUPE (${admins.length}) :*\n\n`;
-      admins.forEach((a, i) => text += `${i + 1}. @${a.split('@')[0]}\n`);
+      admins.forEach((jid, index) => {
+        text += `${index + 1}. @${jid.split('@')[0]}\n`;
+      });
       return await socket.sendMessage(from, { text, mentions: admins }, { quoted: msg });
     }
 
-    // Action requiring a target user
-    if (!targetUser) {
+    const contextInfo = getContextInfo(msg);
+    const toArray = value => Array.isArray(value) ? value : value ? [value] : [];
+    const mentioned = toArray(contextInfo.mentionedJid);
+    const mentionedAlt = toArray(contextInfo.mentionedJidAlt);
+    const targetIdentifiers = [
+      quotedSender,
+      contextInfo.participant,
+      contextInfo.participantAlt,
+      ...mentioned,
+      ...mentionedAlt,
+      msg?.quoted?.sender
+    ].filter(Boolean);
+
+    if (!targetIdentifiers.length) {
       return await socket.sendMessage(from, {
         text: `❌ *Veuillez mentionner un utilisateur ou répondre à son message.* (Ex: .${command} @user)`
       }, { quoted: msg });
     }
 
-    const botNum = socket.user?.id ? socket.user.id.split(':')[0].split('@')[0] : '';
-    const botJid = botNum ? `${botNum}@s.whatsapp.net` : null;
-
-    if (targetUser === botJid) {
-      return await socket.sendMessage(from, { text: '❌ *Je ne peux pas exécuter cette action sur moi-même.*' }, { quoted: msg });
+    const targetParticipant = findGroupParticipant(groupMeta, targetIdentifiers);
+    if (!targetParticipant) {
+      return await socket.sendMessage(from, {
+        text: '❌ *Cette personne ne fait pas partie de ce groupe.*'
+      }, { quoted: msg });
     }
 
-    const userNum = targetUser.split('@')[0];
+    const targetJid = getParticipantId(targetParticipant);
+    const targetMentionJid = getParticipantMentionJid(targetParticipant) || targetJid;
+    if (!targetJid || isBotIdentity(socket, targetParticipant)) {
+      return await socket.sendMessage(from, {
+        text: '❌ *Je ne peux pas exécuter cette action sur le compte du bot.*'
+      }, { quoted: msg });
+    }
+
+    const userNum = targetMentionJid.split('@')[0];
 
     if (command === 'kick' || command === 'expulser') {
-      await socket.groupParticipantsUpdate(from, [targetUser], 'remove');
-      await socket.sendMessage(from, { text: `👋 @${userNum} a été retiré du groupe.`, mentions: [targetUser] }, { quoted: msg });
+      if (isGroupAdmin(groupMeta, targetParticipant)) {
+        return await socket.sendMessage(from, { text: '❌ Impossible de retirer un administrateur avec cette commande.' }, { quoted: msg });
+      }
+      await socket.groupParticipantsUpdate(from, [targetJid], 'remove');
+      await socket.sendMessage(from, { text: `👋 @${userNum} a été retiré du groupe.`, mentions: [targetMentionJid] }, { quoted: msg });
     } else if (command === 'promote') {
-      await socket.groupParticipantsUpdate(from, [targetUser], 'promote');
-      await socket.sendMessage(from, { text: `👑 @${userNum} est désormais administrateur du groupe.`, mentions: [targetUser] }, { quoted: msg });
+      if (isGroupAdmin(groupMeta, targetParticipant)) {
+        return await socket.sendMessage(from, { text: '❌ Cette personne est déjà administratrice.' }, { quoted: msg });
+      }
+      if (!isGroupSuperAdmin(groupMeta, socket)) {
+        return await socket.sendMessage(from, { text: '❌ Le bot doit être super-administrateur pour promouvoir un membre.' }, { quoted: msg });
+      }
+      await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
+      await socket.sendMessage(from, { text: `👑 @${userNum} est désormais administrateur du groupe.`, mentions: [targetMentionJid] }, { quoted: msg });
     } else if (command === 'demote') {
-      await socket.groupParticipantsUpdate(from, [targetUser], 'demote');
-      await socket.sendMessage(from, { text: `📉 @${userNum} n'est plus administrateur.`, mentions: [targetUser] }, { quoted: msg });
+      if (!isGroupAdmin(groupMeta, targetParticipant)) {
+        return await socket.sendMessage(from, { text: '❌ Cette personne n\'est pas administratrice.' }, { quoted: msg });
+      }
+      if (!isGroupSuperAdmin(groupMeta, socket)) {
+        return await socket.sendMessage(from, { text: '❌ Le bot doit être super-administrateur pour rétrograder un membre.' }, { quoted: msg });
+      }
+      await socket.groupParticipantsUpdate(from, [targetJid], 'demote');
+      await socket.sendMessage(from, { text: `📉 @${userNum} n'est plus administrateur.`, mentions: [targetMentionJid] }, { quoted: msg });
     }
   }
 };
