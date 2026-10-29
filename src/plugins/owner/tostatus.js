@@ -684,8 +684,7 @@ async function executeToStatus(context, dependencies = {}) {
     const messageOptions = {
       statusJidList,
       sourceStatusJidList: configuredStatusJidList,
-      broadcast: true,
-      useUserDevicesCache: false
+      broadcast: true
     };
     if (content.text) {
       messageOptions.backgroundColor = '#000000';
@@ -703,7 +702,7 @@ async function executeToStatus(context, dependencies = {}) {
       .slice(0, 30);
     const actualStatusJidList = Array.isArray(sent.statusJidList) ? sent.statusJidList : statusJidList;
     const actualAddressingMode = sent.statusAddressingMode || addressingMode;
-    const actualRecipientCount = actualStatusJidList.length;
+    const actualRecipientCount = actualStatusJidList.filter(jid => jid !== ownJid).length;
     statusLog.add(sessionIdOrSocket(sessionNumber, socket), {
       key: {
         remoteJid: STATUS_JID,
@@ -718,7 +717,7 @@ async function executeToStatus(context, dependencies = {}) {
 
     await reactToCommand(socket, from, msg, '✅');
     return sendReply(socket, from, msg,
-      `✅ Statut ${label} publié, visible par ${actualRecipientCount} destinataire(s).\n` +
+      `✅ Statut ${label} publié, visible par ${actualRecipientCount} destinataire(s) et le compte du bot.\n` +
       `Pour le retirer : ${prefix}delstatus`);
   } catch (error) {
     let errorMessage = error?.message || String(error);

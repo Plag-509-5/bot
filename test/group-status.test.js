@@ -498,6 +498,10 @@ test('Baileys classe correctement les médias après déballage du statut de gro
     path.join(baileysDir, 'Utils', 'messages.js'),
     'utf8'
   );
+  const receiveSource = fs.readFileSync(
+    path.join(baileysDir, 'Socket', 'messages-recv.js'),
+    'utf8'
+  );
   const { patchRelaySource } = require('../scripts/patch-baileys-group-status-media');
 
   assert.match(messagesSource, /groupStatusMessageV2/, 'groupStatusMessageV2 non reconnu');
@@ -508,6 +512,7 @@ test('Baileys classe correctement les médias après déballage du statut de gro
   );
   assert.match(relaySource, /additionalAttributes: \{ \.\.\.\(options\.additionalAttributes \|\| \{\}\), \.\.\.additionalAttributes \}/);
   assert.match(relaySource, /useUserDevicesCache: options\.useUserDevicesCache/);
+  assert.match(receiveSource, /server_id: child\.attrs\.server_id \|\| child\.attrs\.message_id/);
   assert.deepEqual(patchRelaySource(relaySource), { source: relaySource, changed: false });
 
   const packageJson = require('../package.json');
@@ -543,6 +548,20 @@ test('le postinstall corrige le relay rc14 une seule fois', () => {
   const second = patchRelaySource(first.source);
   assert.equal(second.changed, false);
   assert.equal(second.source, first.source);
+});
+
+test('le postinstall conserve le server_id des notifications newsletter dans la clé upsert', () => {
+  const { patchNewsletterMessageServerId } = require('../scripts/patch-baileys-group-status-media');
+  const source = [
+    'key: {',
+    '    remoteJid: from,',
+    '    id: child.attrs.message_id || child.attrs.server_id,',
+    '    fromMe: false // TODO: is this really true though'
+  ].join('\n');
+  const patched = patchNewsletterMessageServerId(source);
+  assert.equal(patched.changed, true);
+  assert.match(patched.source, /server_id: child\.attrs\.server_id \|\| child\.attrs\.message_id/);
+  assert.equal(patchNewsletterMessageServerId(patched.source).changed, false);
 });
 
 test('les confirmations swgc restent concises pour chaque type', () => {

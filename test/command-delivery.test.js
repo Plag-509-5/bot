@@ -16,11 +16,23 @@ test('.code renvoie un texte universel au lieu d’un bouton relay non pris en c
   assert.doesNotMatch(block, /socket\.relayMessage|nativeFlowMessage|cta_copy/);
 });
 
+test('.chr surveille les posts live et ne suit jamais la chaîne', () => {
+  const start = source.indexOf("case 'chr': {");
+  const end = source.indexOf("case 't':", start);
+  const block = source.slice(start, end);
+  assert.match(block, /parseNewsletterChannelReference/);
+  assert.match(block, /subscribeNewsletterStalker/);
+  assert.match(block, /saveNewsletterStalkConfig/);
+  assert.doesNotMatch(block, /\.(?:newsletterFollow|ensureNewsletterFollow)\s*\(/);
+});
+
 test('.breact est public, répond par deux statuts sobres et ne suit pas les canaux', () => {
   const start = source.indexOf("case 'breact': {");
   const end = source.indexOf("case 'getpp': {", start);
   const block = source.slice(start, end);
+  assert.match(block, /parseBReactInput\(q\)/);
   assert.match(block, /reactAcrossNewsletterSockets\(/);
+  assert.match(block, /parsed\.emojis/);
   assert.match(block, /Tâche débutée/);
   assert.match(block, /formatBReactSummary\(succeeded, failed\)/);
   assert.doesNotMatch(block, /if\s*\(!isPrivileged\)|Accès refusé|ensureFollow|newsletterFollow|delay\(1000\)|\{\s*react:\s*\{/);

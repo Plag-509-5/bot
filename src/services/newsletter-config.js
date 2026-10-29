@@ -36,8 +36,51 @@ function parseNewsletterMessageReference(value) {
   return { jid, serverId, channelKey: channel };
 }
 
+function parseNewsletterChannelReference(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const urlMatch = raw.match(/^(?:https?:\/\/)?(?:www\.)?whatsapp\.com\/channel\/([^/?#\s]+)\/?(?:[?#].*)?$/i);
+  if (/^(?:https?:\/\/|www\.|whatsapp\.com\/)/i.test(raw) && !urlMatch) return null;
+  const channelKey = urlMatch ? urlMatch[1] : raw;
+  const jid = normaliseNewsletterJid(channelKey);
+  if (!jid) return null;
+  return { jid, channelKey: channelKey.replace(/@newsletter$/i, '') };
+}
+
+function parseReactionEmojiList(value, limit = 20) {
+  const raw = Array.isArray(value) ? value.join(',') : String(value || '');
+  const emojis = raw.split(',').map(item => item.trim()).filter(Boolean);
+  if (!emojis.length || emojis.length > limit) return [];
+  const emojiPattern = /(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}|\p{Regional_Indicator}|[#*0-9]\uFE0F?\u20E3)/u;
+  return emojis.every(emoji => emojiPattern.test(emoji)) ? emojis : [];
+}
+
+function parseBReactInput(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  let separator = raw.indexOf('|');
+  let reference = '';
+  let emojiInput = '';
+  if (separator >= 0) {
+    reference = raw.slice(0, separator).trim();
+    emojiInput = raw.slice(separator + 1).trim();
+  } else {
+    // Compatibilité avec l’ancienne forme lien,emoji.
+    separator = raw.indexOf(',');
+    if (separator < 0) return null;
+    reference = raw.slice(0, separator).trim();
+    emojiInput = raw.slice(separator + 1).trim();
+  }
+  const emojis = parseReactionEmojiList(emojiInput);
+  const messageReference = parseNewsletterMessageReference(reference);
+  return messageReference && emojis.length ? { ...messageReference, emojis } : null;
+}
+
 async function resolveNewsletterJid(socket, reference) {
-  const channelKey = String(reference?.channelKey || reference?.jid || reference || '').trim();
+  const channelReference = typeof reference === 'string'
+    ? parseNewsletterChannelReference(reference)
+    : null;
+  const channelKey = String(reference?.channelKey || reference?.jid || channelReference?.channelKey || reference || '').trim();
   const normalized = normaliseNewsletterJid(channelKey);
   if (!normalized) throw new Error('Lien ou identifiant de chaîne invalide');
   const identifier = normalized.slice(0, -'@newsletter'.length);
@@ -105,6 +148,8 @@ async function reactToNewsletterMessage(socket, jid, serverId, reaction, options
 }
 
 async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, onSuccess, options = {}) {
+  const emojis = Array.isArray(reaction) ? parseReactionEmojiList(reaction) : [String(reaction || '').trim()];
+  if (!emojis.length) throw new Error('La liste des réactions est vide ou invalide.');
   const unique = new Map();
   for (const entry of Array.isArray(sessions) ? sessions : []) {
     const socket = entry?.socket || entry;
@@ -112,17 +157,18 @@ async function reactAcrossNewsletterSockets(sessions, jid, serverId, reaction, o
     unique.set(socket, String(entry?.session || socket?.user?.id || 'session-inconnue').split('@')[0]);
   }
 
-  return Promise.all([...unique].map(async ([socket, session]) => {
+  return Promise.all([...unique].map(async ([socket, session], index) => {
+    const assignedEmoji = emojis[index % emojis.length];
     try {
-      const result = await reactToNewsletterMessage(socket, jid, serverId, reaction, options);
+      const result = await reactToNewsletterMessage(socket, jid, serverId, assignedEmoji, options);
       let persistenceError = '';
       if (typeof onSuccess === 'function') {
         try { await onSuccess(session, result); }
         catch (error) { persistenceError = String(error?.message || error); }
       }
-      return { session, ok: true, persistenceError };
+      return { session, reaction: assignedEmoji, ok: true, persistenceError };
     } catch (error) {
-      return { session, ok: false, error: String(error?.message || error) };
+      return { session, reaction: assignedEmoji, ok: false, error: String(error?.message || error) };
     }
   }));
 }
@@ -194,6 +240,9 @@ module.exports = {
   resolveNewsletterEmojis,
   formatBReactSummary,
   parseNewsletterMessageReference,
+  parseNewsletterChannelReference,
+  parseReactionEmojiList,
+  parseBReactInput,
   resolveNewsletterJid,
   extractNewsletterServerId,
   ensureNewsletterFollow,

@@ -5,7 +5,7 @@ const { waitForReady } = require('../lib/safe-send');
 const { resolveStatusRelayAudience } = require('../services/status-audience');
 
 const PERSONAL_STATUS_JID = 'status@broadcast';
-const STATUS_ACK_GRACE_MS = 1500;
+const STATUS_ACK_GRACE_MS = 750;
 let nyxHelpersPromise = null;
 
 function createStatusAckMonitor(socket, messageId, graceMs = STATUS_ACK_GRACE_MS) {
@@ -135,7 +135,9 @@ async function personalStatus(socket, content, options = {}) {
         messageId,
         statusJidList: audience,
         useCachedGroupMetadata: false,
-        useUserDevicesCache: false,
+        // Reuse Baileys' per-JID device cache to avoid a fresh USync round-trip
+        // for every status, especially for audiences with hundreds of contacts.
+        useUserDevicesCache: true,
         ...(additionalAttributes ? { additionalAttributes } : {})
       });
       return { sent, ackError: await monitor.wait() };

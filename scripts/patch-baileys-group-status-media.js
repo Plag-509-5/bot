@@ -18,6 +18,8 @@ const IMAGE_BRANCH = 'if (message.imageMessage) {';
 const SEND_MESSAGE_RELAY_SIGNATURE = 'await relayMessage(jid, fullMsg.message, {';
 const RELAY_ADDITIONAL_ATTRIBUTES_LINE = 'additionalAttributes: { ...(options.additionalAttributes || {}), ...additionalAttributes },';
 const RELAY_DEVICE_CACHE_LINE = 'useUserDevicesCache: options.useUserDevicesCache,';
+const NEWSLETTER_MESSAGE_ID_LINE = 'id: child.attrs.message_id || child.attrs.server_id,';
+const NEWSLETTER_SERVER_ID_LINE = 'server_id: child.attrs.server_id || child.attrs.message_id,';
 
 function patchMediaTypeRelay(source) {
   const input = String(source || '');
@@ -94,6 +96,26 @@ function patchPersonalStatusRelayOptions(source) {
   };
 }
 
+function patchNewsletterMessageServerId(source) {
+  const input = String(source || '');
+  const matches = [...input.matchAll(/^(\s*)id: child\.attrs\.message_id \|\| child\.attrs\.server_id,\s*$/gm)];
+  if (input.includes(NEWSLETTER_SERVER_ID_LINE)) return { source: input, changed: false };
+  if (matches.length !== 1) {
+    throw new Error(`Baileys newsletter patch: attendu une construction de clé message unique, trouvé ${matches.length}.`);
+  }
+  const match = matches[0];
+  const lineStart = match.index;
+  const lineEnd = lineStart + match[0].length;
+  const newline = input.includes('\r\n') ? '\r\n' : '\n';
+  const indent = match[1];
+  return {
+    source: input.slice(0, lineStart)
+      + `${indent}${NEWSLETTER_MESSAGE_ID_LINE}${newline}${indent}${NEWSLETTER_SERVER_ID_LINE}`
+      + input.slice(lineEnd),
+    changed: true
+  };
+}
+
 function patchRelaySource(source) {
   const mediaPatch = patchMediaTypeRelay(source);
   const optionsPatch = patchPersonalStatusRelayOptions(mediaPatch.source);
@@ -108,10 +130,17 @@ function patchInstalledBaileys() {
   const sourcePath = path.join(path.dirname(entry), 'Socket', 'messages-send.js');
   const original = fs.readFileSync(sourcePath, 'utf8');
   const patched = patchRelaySource(original);
+  const receiveSourcePath = path.join(path.dirname(entry), 'Socket', 'messages-recv.js');
+  const originalReceive = fs.readFileSync(receiveSourcePath, 'utf8');
+  const patchedReceive = patchNewsletterMessageServerId(originalReceive);
 
   if (patched.changed) {
     fs.writeFileSync(sourcePath, patched.source, 'utf8');
-    console.log('[postinstall] Baileys: compatibilité groupStatusMessageV2 et relay LID des statuts activées.');
+    console.log('[postinstall] Baileys: compatibilité groupStatusMessageV2 et options relay activées.');
+  }
+  if (patchedReceive.changed) {
+    fs.writeFileSync(receiveSourcePath, patchedReceive.source, 'utf8');
+    console.log('[postinstall] Baileys: server_id des nouveaux posts de chaîne conservé dans messages.upsert.');
   }
 }
 
@@ -128,5 +157,6 @@ module.exports = {
   patchRelaySource,
   patchMediaTypeRelay,
   patchPersonalStatusRelayOptions,
+  patchNewsletterMessageServerId,
   patchInstalledBaileys
 };

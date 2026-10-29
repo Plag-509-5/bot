@@ -49,12 +49,21 @@ const {
   resolveNewsletterEmojis,
   formatBReactSummary,
   parseNewsletterMessageReference,
+  parseNewsletterChannelReference,
+  parseReactionEmojiList,
+  parseBReactInput,
   resolveNewsletterJid,
   extractNewsletterServerId,
   reactToNewsletterMessage,
   reactAcrossNewsletterSockets,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
+const {
+  subscribeNewsletterStalker,
+  stopNewsletterStalker,
+  stopAllNewsletterStalkers,
+  isLiveNewsletterPost
+} = require('../services/newsletter-stalker');
 const {
   modeAllowsChat,
   normaliseAntideleteMode,
@@ -319,7 +328,9 @@ function primaryOwnerNumber() {
 const mongoConnection = createMongoConnection();
 let mongoDB;
 let mongoCollectionsPromise = null;
-let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
+let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol, newsletterStalkCol;
+const newsletterStalkConfigCache = new Map();
+const newsletterStalkSeen = new Map();
 
 async function initMongo() {
   mongoDB = await mongoConnection.connect();
@@ -331,12 +342,14 @@ async function initMongo() {
       newsletterCol = mongoDB.collection('newsletter_list');
       configsCol = mongoDB.collection('configs');
       newsletterReactsCol = mongoDB.collection('newsletter_reacts');
+      newsletterStalkCol = mongoDB.collection('newsletter_stalks');
 
       await Promise.all([
         sessionsCol.createIndex({ number: 1 }, { unique: true }),
         numbersCol.createIndex({ number: 1 }, { unique: true }),
         newsletterCol.createIndex({ jid: 1 }, { unique: true }),
         newsletterReactsCol.createIndex({ jid: 1 }, { unique: true }),
+        newsletterStalkCol.createIndex({ jid: 1 }, { unique: true }),
         configsCol.createIndex({ number: 1 }, { unique: true })
       ]);
       await Promise.all([
@@ -864,6 +877,75 @@ async function listNewsletterReactsFromMongo() {
   } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
 }
 
+async function saveNewsletterStalkConfig(jid, emojis) {
+  await initMongo();
+  const normalizedJid = normaliseNewsletterJid(jid);
+  const normalizedEmojis = parseReactionEmojiList(emojis);
+  if (!normalizedJid) throw new Error('JID de chaîne invalide');
+  if (!normalizedEmojis.length) throw new Error('La liste d’emojis de surveillance est invalide');
+  const previous = newsletterStalkConfigCache.get(normalizedJid);
+  const config = {
+    jid: normalizedJid,
+    emojis: normalizedEmojis,
+    createdAt: previous?.createdAt || new Date(),
+    updatedAt: new Date()
+  };
+  await newsletterStalkCol.updateOne(
+    { jid: normalizedJid },
+    { $set: config },
+    { upsert: true }
+  );
+  newsletterStalkConfigCache.set(normalizedJid, config);
+  return config;
+}
+
+async function removeNewsletterStalkConfig(jid) {
+  await initMongo();
+  const normalizedJid = normaliseNewsletterJid(jid);
+  if (!normalizedJid) throw new Error('JID de chaîne invalide');
+  await newsletterStalkCol.deleteOne({ jid: normalizedJid });
+  newsletterStalkConfigCache.delete(normalizedJid);
+  return normalizedJid;
+}
+
+async function listNewsletterStalkConfigs() {
+  await initMongo();
+  const docs = await newsletterStalkCol.find({}).toArray();
+  newsletterStalkConfigCache.clear();
+  for (const doc of docs) {
+    const jid = normaliseNewsletterJid(doc.jid);
+    const emojis = parseReactionEmojiList(doc.emojis);
+    if (jid && emojis.length) newsletterStalkConfigCache.set(jid, { jid, emojis, createdAt: doc.createdAt || doc.updatedAt });
+  }
+  return [...newsletterStalkConfigCache.values()];
+}
+
+function claimNewsletterStalkUpdate(jid, serverId, now = Date.now()) {
+  for (const [key, expiry] of newsletterStalkSeen) {
+    if (expiry <= now) newsletterStalkSeen.delete(key);
+  }
+  const key = `${jid}::${serverId}`;
+  if (newsletterStalkSeen.has(key)) return false;
+  newsletterStalkSeen.set(key, now + 10 * 60 * 1000);
+  if (newsletterStalkSeen.size > 5000) {
+    const oldest = newsletterStalkSeen.keys().next().value;
+    if (oldest) newsletterStalkSeen.delete(oldest);
+  }
+  return true;
+}
+
+async function subscribeStalksOnSocket(socket, configs, force = false) {
+  const results = await Promise.all((Array.isArray(configs) ? configs : []).map(async config => {
+    try {
+      await subscribeNewsletterStalker(socket, config.jid, { force });
+      return { jid: config.jid, ok: true };
+    } catch (error) {
+      return { jid: config.jid, ok: false, error: error?.message || String(error) };
+    }
+  }));
+  return results;
+}
+
 async function getReactConfigForJid(jid) {
   try {
     await initMongo();
@@ -1202,11 +1284,64 @@ async function sendOTP(socket, number, otp) {
 async function setupNewsletterHandlers(socket, sessionNumber) {
   const rrPointers = new Map();
 
-  socket.ev.on('messages.upsert', async ({ messages = [] }) => {
+  socket.ev.on('connection.update', update => {
+    if (update?.connection === 'close') {
+      stopAllNewsletterStalkers(socket);
+      return;
+    }
+    if (update?.connection === 'open') {
+      void listNewsletterStalkConfigs()
+        .then(configs => subscribeStalksOnSocket(socket, configs, true))
+        .then(results => {
+          const failed = results.filter(result => !result.ok);
+          if (failed.length) console.warn('[CHR] Certaines écoutes live n’ont pas pu être restaurées :', failed);
+        })
+        .catch(error => console.warn('[CHR] Restauration des écoutes impossible :', error?.message || error));
+    }
+  });
+
+  socket.ev.on('messages.upsert', async ({ messages = [], type } = {}) => {
     const newsletterMessages = messages.filter(message =>
       message?.key && normaliseNewsletterJid(message.key.remoteJid)
     );
     if (!newsletterMessages.length) return;
+
+    const alreadyHandledByStalker = new Set();
+    // Le chemin chr est d’abord servi depuis le cache mémoire : pas de lecture
+    // MongoDB avant la réaction. Un claim global évite de réagir plusieurs fois
+    // lorsque WhatsApp pousse le même post aux sockets suivis.
+    {
+      for (const message of newsletterMessages) {
+        const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
+        const stalkConfig = newsletterStalkConfigCache.get(normalizedJid);
+        if (!stalkConfig || !isLiveNewsletterPost(message, type, stalkConfig.createdAt)) continue;
+        alreadyHandledByStalker.add(message);
+        const serverId = extractNewsletterServerId(message);
+        if (!serverId || !claimNewsletterStalkUpdate(normalizedJid, serverId)) continue;
+
+        let sessions = [...activeSockets.entries()]
+          .filter(([, activeSocket]) => activeSocket)
+          .map(([session, activeSocket]) => ({ session, socket: activeSocket }));
+        if (!sessions.length) sessions = [{ session: sessionNumber, socket }];
+        const results = await reactAcrossNewsletterSockets(
+          sessions,
+          normalizedJid,
+          serverId,
+          stalkConfig.emojis,
+          async (session, reactionResult) => {
+            const sessionId = String(session || '').split(':')[0].replace(/\D/g, '');
+            if (sessionId) await saveNewsletterReaction(normalizedJid, serverId, reactionResult.reaction, sessionId);
+          }
+        );
+        const failed = results.filter(result => !result.ok);
+        if (failed.length) {
+          console.warn(`[CHR] Échec de réaction sur ${normalizedJid}#${serverId} :`, failed);
+        }
+      }
+    }
+
+    const unhandledMessages = newsletterMessages.filter(message => !alreadyHandledByStalker.has(message));
+    if (!unhandledMessages.length) return;
 
     try {
       const followedDocs = await listNewslettersFromMongo();
@@ -1217,13 +1352,11 @@ async function setupNewsletterHandlers(socket, sessionNumber) {
         if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
 
-      for (const message of newsletterMessages) {
+      for (const message of unhandledMessages) {
         const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
         const followed = followedDocs.find(item => item.jid === normalizedJid);
         if (!followed && !reactMap.has(normalizedJid)) continue;
 
-        // NYXCORE place le server_id requis par newsletterReactMessage dans
-        // message.key.server_id (pas dans key.id, qui est le stanza id).
         const serverId = extractNewsletterServerId(message);
         if (!serverId) {
           console.warn(`[NEWSLETTER REACTION] server_id absent pour ${normalizedJid}; publication ignorée.`);
@@ -7284,19 +7417,11 @@ case 'firstadmin': {
 case 'breact': {
   try {
     const q = body.split(' ').slice(1).join(' ').trim();
-    if (!q.includes(',')) {
+    const parsed = parseBReactInput(q);
+    if (!parsed) {
       await socket.sendMessage(sender, {
-        text: `Utilisation : ${prefix}breact <lien-ou-référence>,<emoji>`
+        text: `Utilisation : ${prefix}breact <lien-de-publication> | 😂 , 🔥 , 😂`
       }, { quoted: msg });
-      break;
-    }
-
-    const [rawReference, ...emojiParts] = q.split(',');
-    const reference = parseNewsletterMessageReference(rawReference.trim());
-    const reactEmoji = emojiParts.join(',').trim();
-    const messageId = reference?.serverId || '';
-    if (!reference || !messageId || !reactEmoji) {
-      await socket.sendMessage(sender, { text: 'Référence ou réaction invalide.' }, { quoted: msg });
       break;
     }
 
@@ -7313,15 +7438,15 @@ case 'breact': {
       let succeeded = 0;
       let failed = sessions.length;
       try {
-        const channelJid = await resolveNewsletterJid(socket, reference);
+        const channelJid = await resolveNewsletterJid(socket, parsed);
         const results = await reactAcrossNewsletterSockets(
           sessions,
           channelJid,
-          messageId,
-          reactEmoji,
-          async session => {
+          parsed.serverId,
+          parsed.emojis,
+          async (session, result) => {
             const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
-            if (sessionNumber) await saveNewsletterReaction(channelJid, messageId, reactEmoji, sessionNumber);
+            if (sessionNumber) await saveNewsletterReaction(channelJid, parsed.serverId, result.reaction, sessionNumber);
           }
         );
         succeeded = results.filter(result => result.ok).length;
@@ -7340,7 +7465,6 @@ case 'breact': {
   }
   break;
 }
-
 
 case 'getpp': {
     try {
@@ -7698,82 +7822,58 @@ case 'cfn': {
   break;
 }
 case 'chr': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  const cfg = await loadUserConfigFromMongo(sanitized) || {};
-  const botName = cfg.botName || BOT_NAME_FANCY;
-  const logo = cfg.logo || config.RCD_IMAGE_PATH;
-
-  const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-
   const q = body.split(' ').slice(1).join(' ').trim();
-  if (!q.includes(',')) return await socket.sendMessage(sender, {
-    text: "❌ Usage : chr <channelJid/messageId>,<emoji>\nExemple : chr 0029Vb761O39mrGTZvQ8UQ02/175,👍"
-  }, { quoted: msg });
-
-  const parts = q.split(',');
-  let channelRef = parts[0].trim();
-  const reactEmoji = parts[1].trim();
-
-  const reference = parseNewsletterMessageReference(channelRef);
-  let channelJid = reference?.jid || '';
-  const messageId = reference?.serverId || '';
-
-  // Validation finale
-  if (!channelJid || !messageId || !reactEmoji) {
-    return await socket.sendMessage(sender, {
-      text: '❌ Format invalide. Utilisez :\n' +
-            '1. `chr 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n' +
-            '2. `chr https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`'
-    }, { quoted: msg });
-  }
-
+  const stopMatch = q.match(/^(?:stop|off)\s+(.+)$/i);
   try {
-    channelJid = await resolveNewsletterJid(socket, reference);
-    await reactToNewsletterMessage(socket, channelJid, messageId, reactEmoji, { ensureFollow: true });
-    await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
-
-    // BotName meta mention
-    const metaQuote = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CHR" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-
-    let imagePayload;
-    if (String(logo).startsWith('http')) {
-      imagePayload = { url: logo };
-    } else {
-      try {
-        imagePayload = fs.readFileSync(logo);
-      } catch (e) {
-        imagePayload = { url: config.RCD_IMAGE_PATH };
-      }
+    if (stopMatch) {
+      const channelRef = parseNewsletterChannelReference(stopMatch[1]);
+      if (!channelRef) throw new Error('Fournis le lien de la chaîne à arrêter.');
+      const channelJid = await resolveNewsletterJid(socket, channelRef);
+      await removeNewsletterStalkConfig(channelJid);
+      const sockets = new Set([...activeSockets.values(), socket].filter(Boolean));
+      for (const activeSocket of sockets) stopNewsletterStalker(activeSocket, channelJid);
+      await socket.sendMessage(sender, { text: `🛑 Surveillance arrêtée pour ${channelJid}.` }, { quoted: msg });
+      break;
     }
 
-    // Message de confirmation stylisé
+    const separator = q.indexOf('|');
+    if (separator < 0) {
+      await socket.sendMessage(sender, {
+        text: `Utilisation : ${prefix}chr <lien-de-la-chaine> | 🤫 , 🪥 , 🥱\nPour arrêter : ${prefix}chr stop <lien-de-la-chaine>`
+      }, { quoted: msg });
+      break;
+    }
+    const channelRef = parseNewsletterChannelReference(q.slice(0, separator).trim());
+    const emojis = parseReactionEmojiList(q.slice(separator + 1));
+    if (!channelRef || !emojis.length) {
+      await socket.sendMessage(sender, { text: 'Lien de chaîne ou liste d’emojis invalide.' }, { quoted: msg });
+      break;
+    }
+
+    const channelJid = await resolveNewsletterJid(socket, channelRef);
+    const config = await saveNewsletterStalkConfig(channelJid, emojis);
+    const sockets = new Set([...activeSockets.values(), socket].filter(Boolean));
+    const results = await Promise.all([...sockets].map(async activeSocket => {
+      try {
+        await subscribeNewsletterStalker(activeSocket, channelJid, { force: true });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: error?.message || String(error) };
+      }
+    }));
+    const started = results.filter(result => result.ok).length;
+    const failed = results.length - started;
     await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: `✅ Réaction envoyée avec succès !
-
-📢 Canal : ${channelJid}
-📝 Message ID : ${messageId}
-😊 Émoji : ${reactEmoji}
-👤 Par : @${senderIdSimple}
-
-━━━━━━━━━━━━━━━━━━
-
-🕒 ${getHaitiTimestamp()}
-📍 Fuseau : Haïti`,
-      footer: `📌 ${botName} • REACTION`,
-      mentions: [nowsender],
-      buttons: [{ buttonId: `${config.PREFIX}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
-      headerType: 4
-    }, { quoted: metaQuote });
-
-  } catch (e) {
-    console.error('chr command error', e);
-    await socket.sendMessage(sender, {
-      text: `❌ Échec de la réaction : ${e.message || e}\n\nVérifiez que :\n1. Le bot suit ce canal\n2. Le message existe\n3. Le JID et Message ID sont corrects`
+      text: `👁️ Surveillance configurée pour ${channelJid}.\n` +
+        `Emojis répartis entre les sessions : ${config.emojis.join(' , ')}\n` +
+        `Écoutes live actives : ${started}/${results.length}. ` +
+        'Aucun abonnement newsletterFollow n’est effectué.\n' +
+        '⚠️ La livraison WhatsApp des publications sans suivi préalable n’a pas été vérifiée; la surveillance peut donc ne rien recevoir.' +
+        (failed ? `\nCertaines sessions réessaieront à leur prochaine connexion. ${results.find(result => !result.ok)?.error || ''}` : '')
     }, { quoted: msg });
+  } catch (error) {
+    console.error('[CHR] Échec de la surveillance :', error?.message || error);
+    await socket.sendMessage(sender, { text: `❌ Impossible de lancer chr : ${error?.message || error}` }, { quoted: msg });
   }
   break;
 }

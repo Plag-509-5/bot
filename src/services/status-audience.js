@@ -142,15 +142,15 @@ async function resolveStatusRelayAudience(socket, statusJidList = [], options = 
       if (!seen.has(jid)) unresolvedJids.push(jid);
       continue;
     }
-    // WhatsApp's `statusJidList` is the audience, not the sender. Including
-    // the publishing account itself can make the server reject the stanza
-    // with smax-invalid (479), especially when its PN and LID are both present.
-    if (target === ownJid) continue;
     if (!seen.has(target)) {
       seen.add(target);
       outgoing.push(target);
     }
   }
+
+  // Explicitly include this account in the same address space as the audience
+  // so the status appears in the bot account's own status feed as well.
+  if (ownJid && !seen.has(ownJid)) outgoing.push(ownJid);
 
   return {
     statusJidList: outgoing,

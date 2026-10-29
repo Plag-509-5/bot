@@ -228,7 +228,8 @@ test('publie un statut texte avec statusJidList, option de fond et journal de su
   assert.equal(sent.some(event => event.jid === 'status@broadcast'), false, 'la publication doit passer par le relay NYXCORE, pas par un second chemin sendMessage');
   assert.equal(statusSend.message.extendedTextMessage.text, 'Bonjour');
   assert.deepEqual(statusSend.options.statusJidList.sort(), [
-    '50922222222@s.whatsapp.net'
+    '50922222222@s.whatsapp.net',
+    '50900000000@s.whatsapp.net'
   ].sort());
   assert.ok(statusSend.message.extendedTextMessage.backgroundArgb !== undefined);
   assert.equal(statusLog.getLatest('50900000000').key.id, statusSend.options.messageId);
@@ -276,10 +277,10 @@ test('un compte migré publie uniquement vers des LID et conserve le routage pou
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
   assert.deepEqual(
     [...statusSend.options.statusJidList].sort(),
-    ['contact-222@lid', 'contact-333@lid'].sort()
+    ['contact-222@lid', 'contact-333@lid', 'self-lid@lid'].sort()
   );
   assert.equal(statusSend.options.additionalAttributes, undefined);
-  assert.equal(statusSend.options.useUserDevicesCache, false);
+  assert.equal(statusSend.options.useUserDevicesCache, undefined, 'le plugin laisse le cache Baileys activé par défaut');
   assert.equal(statusLog.getLatest('50900000000').addressingMode, 'lid');
   assert.match(sent.at(-1).content.text, /visible par 2 destinataire/);
 
@@ -287,7 +288,7 @@ test('un compte migré publie uniquement vers des LID et conserve le routage pou
   const revoke = sent.find(event => event.jid === 'status@broadcast' && event.content.delete);
   assert.deepEqual(
     [...revoke.options.statusJidList].sort(),
-    ['contact-222@lid', 'contact-333@lid'].sort()
+    ['contact-222@lid', 'contact-333@lid', 'self-lid@lid'].sort()
   );
   assert.equal(revoke.options.additionalAttributes, undefined);
   assert.equal(revoke.options.useUserDevicesCache, undefined);
@@ -366,12 +367,20 @@ test('sendMessage suit le chemin officiel et un ACK 479 déclenche un repli PN/L
 
   assert.equal(relayed.length, 2);
   assert.deepEqual(relayed[0].options.statusJidList, ['contact-lid@lid']);
+  assert.equal(relayed[0].options.useUserDevicesCache, true);
   assert.equal(relayed[0].options.additionalAttributes, undefined);
-  assert.deepEqual(relayed[1].options.statusJidList, ['50922222222@s.whatsapp.net']);
+  assert.deepEqual(relayed[1].options.statusJidList, [
+    '50922222222@s.whatsapp.net',
+    '50900000000@s.whatsapp.net'
+  ]);
+  assert.equal(relayed[1].options.useUserDevicesCache, true);
   assert.equal(relayed[1].options.additionalAttributes, undefined);
   assert.notEqual(relayed[0].options.messageId, relayed[1].options.messageId);
   assert.equal(sent.statusAddressingMode, 'pn');
-  assert.deepEqual(sent.statusJidList, ['50922222222@s.whatsapp.net']);
+  assert.deepEqual(sent.statusJidList, [
+    '50922222222@s.whatsapp.net',
+    '50900000000@s.whatsapp.net'
+  ]);
 });
 
 test('ne publie pas un statut adressé uniquement au propre compte du bot', async () => {

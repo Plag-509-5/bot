@@ -10,6 +10,9 @@ const {
   resolveNewsletterEmojis,
   formatBReactSummary,
   parseNewsletterMessageReference,
+  parseNewsletterChannelReference,
+  parseReactionEmojiList,
+  parseBReactInput,
   resolveNewsletterJid,
   extractNewsletterServerId,
   reactToNewsletterMessage,
@@ -36,6 +39,21 @@ test('analyse les références de publication depuis un lien ou un JID de chaîn
   );
   assert.equal(parseNewsletterMessageReference('https://whatsapp.com/channel/invalid'), null);
   assert.equal(parseNewsletterMessageReference('https://example.com/channel/0029Vb761O39mrGTZvQ8UQ02/175'), null);
+});
+
+test('analyse breact lien | emojis, préserve les répétitions et le lien chr sans message id', () => {
+  assert.deepEqual(parseBReactInput('https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175 | 😂 , 🔥 , 😂'), {
+    jid: '0029Vb761O39mrGTZvQ8UQ02@newsletter',
+    serverId: '175',
+    channelKey: '0029Vb761O39mrGTZvQ8UQ02',
+    emojis: ['😂', '🔥', '😂']
+  });
+  assert.deepEqual(parseNewsletterChannelReference('https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02'), {
+    jid: '0029Vb761O39mrGTZvQ8UQ02@newsletter',
+    channelKey: '0029Vb761O39mrGTZvQ8UQ02'
+  });
+  assert.deepEqual(parseReactionEmojiList('🤫 , 🪥 ,🥱'), ['🤫', '🪥', '🥱']);
+  assert.equal(parseBReactInput('https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175 | 😂, bad'), null);
 });
 
 test('lit le server_id officiel depuis la clé NYXCORE et utilise newsletterReactMessage', async () => {
@@ -119,6 +137,20 @@ test('breact réagit sur les sessions uniques sans imposer d’abonnement', asyn
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map(call => call[0]).sort(), ['bot-1', 'bot-2']);
   assert.ok(calls.every(call => call[1] === 'reaction'));
+});
+
+test('breact répartit les emojis de façon cyclique et équilibrée sur les sessions uniques', async () => {
+  const calls = [];
+  const sessions = Array.from({ length: 5 }, (_, index) => ({
+    session: `session-${index}`,
+    socket: {
+      async newsletterReactMessage(_jid, _serverId, emoji) { calls.push([index, emoji]); }
+    }
+  }));
+  const results = await reactAcrossNewsletterSockets(sessions, '120363402094635383', '175', ['😂', '🔥', '😂']);
+  assert.equal(results.filter(result => result.ok).length, 5);
+  assert.deepEqual(calls, [[0, '😂'], [1, '🔥'], [2, '😂'], [3, '😂'], [4, '🔥']]);
+  assert.deepEqual(results.map(result => result.reaction), ['😂', '🔥', '😂', '😂', '🔥']);
 });
 
 test('refuse de réagir sans server_id au lieu d’utiliser le stanza id', async () => {
