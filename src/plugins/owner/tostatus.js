@@ -575,10 +575,12 @@ async function executeToStatus(context, dependencies = {}) {
     const {
       statusJidList,
       ownJid,
+      selfJids = ownJid ? [ownJid] : [],
       addressingMode,
       unresolvedJids = []
     } = relayAudience;
-    const recipientCount = statusJidList.filter(jid => jid !== ownJid).length;
+    const selfJidSet = new Set([ownJid, ...selfJids].filter(Boolean));
+    const recipientCount = statusJidList.filter(jid => !selfJidSet.has(jid)).length;
     if (unresolvedJids.length) {
       const examples = unresolvedJids.slice(0, 5).map(jid => jid.split('@')[0]).join(', ');
       const more = unresolvedJids.length > 5 ? ', …' : '';
@@ -702,7 +704,7 @@ async function executeToStatus(context, dependencies = {}) {
       .slice(0, 30);
     const actualStatusJidList = Array.isArray(sent.statusJidList) ? sent.statusJidList : statusJidList;
     const actualAddressingMode = sent.statusAddressingMode || addressingMode;
-    const actualRecipientCount = actualStatusJidList.filter(jid => jid !== ownJid).length;
+    const actualRecipientCount = actualStatusJidList.filter(jid => !selfJidSet.has(jid)).length;
     statusLog.add(sessionIdOrSocket(sessionNumber, socket), {
       key: {
         remoteJid: STATUS_JID,

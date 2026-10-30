@@ -74,9 +74,10 @@ async function getStatusJidMappings(mapping, sourceJids, direction) {
 
 /**
  * Baileys 7 rc14 resolves status recipients using the sender's addressing
- * mode. On LID-migrated accounts a PN-only statusJidList can therefore omit
- * recipients (the server rejects it with ack 479). Route every recipient into
- * the sender's address space before relay, never send a mixed PN/LID list.
+ * mode. On LID-migrated accounts a PN-only audience can omit recipients (the
+ * server rejects it with ack 479), so route the configured audience into the
+ * sender's address space. The bot's own phone-number JID is appended separately
+ * because the requested self-recipient is specifically the bot number.
  */
 async function resolveStatusRelayAudience(socket, statusJidList = [], options = {}) {
   const ownPn = normalizedUserJid(socket?.authState?.creds?.me?.id || socket?.user?.id);
@@ -89,9 +90,11 @@ async function resolveStatusRelayAudience(socket, statusJidList = [], options = 
     throw new Error('Le socket n’a pas d’identité LID utilisable pour adresser le statut.');
   }
   const ownJid = useLidAddressing ? ownLid : ownPn;
+  const selfJids = [...new Set([ownPn, ownLid].filter(Boolean))];
+  const selfJidSet = new Set(selfJids);
   const candidates = [...new Set((Array.isArray(statusJidList) ? statusJidList : [])
     .map(normalizedUserJid)
-    .filter(Boolean))];
+    .filter(jid => jid && !selfJidSet.has(jid)))];
   const mapping = socket?.signalRepository?.lidMapping;
   const outgoingByInput = new Map();
 
@@ -148,13 +151,15 @@ async function resolveStatusRelayAudience(socket, statusJidList = [], options = 
     }
   }
 
-  // Explicitly include this account in the same address space as the audience
-  // so the status appears in the bot account's own status feed as well.
-  if (ownJid && !seen.has(ownJid)) outgoing.push(ownJid);
+  // Include the bot's phone-number JID explicitly, even when the other
+  // recipients are routed as LIDs. Keep both identities for accurate counting.
+  const selfRecipientJid = ownPn || ownLid;
+  if (selfRecipientJid && !seen.has(selfRecipientJid)) outgoing.push(selfRecipientJid);
 
   return {
     statusJidList: outgoing,
     ownJid,
+    selfJids,
     addressingMode: useLidAddressing ? 'lid' : (requestedMode === 'pn' ? 'pn' : null),
     unresolvedJids
   };

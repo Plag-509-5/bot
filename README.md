@@ -365,7 +365,7 @@ Les admins saisis dans le dashboard sont normalisés en `numéro@s.whatsapp.net`
 
 - `.breact <lien-de-publication> | 😂 , 🔥 , 😂` réagit au post ciblé sans suivre la chaîne; les emojis sont distribués à tour de rôle entre les sessions actives, aussi équitablement que possible. Les répétitions dans la liste sont conservées.
 - `.chr <lien-de-la-chaîne> | 🤫 , 🪥 , 🥱` configure une surveillance persistante des nouveaux posts. Le bot demande au socket Baileys les mises à jour live (`subscribeNewsletterUpdates`), sans exécuter `newsletterFollow`; chaque post reçu est dédupliqué et les réactions sont réparties entre les sessions. La souscription live est renouvelée automatiquement; `.chr stop <lien-de-la-chaîne>` arrête la surveillance. La livraison de publications par WhatsApp quand le bot ne suit pas la chaîne n’a pas été vérifiée : la commande peut ne rien recevoir tant que ce comportement n’a pas été confirmé.
-- `.tostatus` garde le cache d’appareils Baileys activé pour réutiliser les résolutions et raccourcir le fanout; l’audience contient aussi l’identité PN/LID du bot afin que son propre compte voie sa publication. Le contrôle d’ACK est plus court (750 ms).
+- `.tostatus` garde le cache d’appareils Baileys activé pour réutiliser les résolutions et raccourcir le fanout; l’audience inclut explicitement le numéro PN du bot, même si les autres destinataires sont routés en LID. Le contrôle d’ACK est plus court (750 ms).
 
 ### AntiDelete
 

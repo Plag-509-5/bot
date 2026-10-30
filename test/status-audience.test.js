@@ -67,7 +67,7 @@ test('refuse un ajout qui dépasserait la limite de 1 000 destinataires', () => 
   );
 });
 
-test('route tous les destinataires vers les LID du compte émetteur sans liste mixte', async () => {
+test('route les destinataires en LID tout en ajoutant le numéro PN du bot à son audience', async () => {
   const socket = {
     user: { id: '50900000000:7@s.whatsapp.net' },
     authState: {
@@ -103,8 +103,9 @@ test('route tous les destinataires vers les LID du compte émetteur sans liste m
   ]);
 
   assert.deepEqual(result, {
-    statusJidList: ['self-lid@lid', 'contact-222@lid', 'contact-333@lid', 'already-lid@lid'],
+    statusJidList: ['contact-222@lid', 'contact-333@lid', 'already-lid@lid', '50900000000@s.whatsapp.net'],
     ownJid: 'self-lid@lid',
+    selfJids: ['50900000000@s.whatsapp.net', 'self-lid@lid'],
     addressingMode: 'lid',
     unresolvedJids: []
   });
@@ -128,7 +129,8 @@ test('exclut et signale les numéros sans mapping LID au lieu de publier une aud
     '50922222222@s.whatsapp.net',
     '50933333333@s.whatsapp.net'
   ]);
-  assert.deepEqual(result.statusJidList, ['self-lid@lid', 'contact-222@lid']);
+  assert.deepEqual(result.statusJidList, ['contact-222@lid', '50900000000@s.whatsapp.net']);
+  assert.deepEqual(result.selfJids, ['50900000000@s.whatsapp.net', 'self-lid@lid']);
   assert.deepEqual(result.unresolvedJids, ['50933333333@s.whatsapp.net']);
   assert.equal(result.addressingMode, 'lid');
 });
@@ -152,7 +154,7 @@ test('convertit les LID en PN pour un émetteur non migré et déduplique la lis
     '50922222222@s.whatsapp.net',
     'unknown-lid@lid'
   ]);
-  assert.deepEqual(result.statusJidList, ['50900000000@s.whatsapp.net', '50922222222@s.whatsapp.net']);
+  assert.deepEqual(result.statusJidList, ['50922222222@s.whatsapp.net', '50900000000@s.whatsapp.net']);
   assert.equal(result.ownJid, '50900000000@s.whatsapp.net');
   assert.equal(result.addressingMode, null);
   assert.deepEqual(result.unresolvedJids, ['unknown-lid@lid']);
