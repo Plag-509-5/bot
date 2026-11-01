@@ -76,8 +76,8 @@ async function getStatusJidMappings(mapping, sourceJids, direction) {
  * Baileys 7 rc14 resolves status recipients using the sender's addressing
  * mode. On LID-migrated accounts a PN-only audience can omit recipients (the
  * server rejects it with ack 479), so route the configured audience into the
- * sender's address space. The bot's own phone-number JID is appended separately
- * because the requested self-recipient is specifically the bot number.
+ * sender's address space. The bot's own identity is appended in that same
+ * address space; mixing its PN into a LID audience can make WhatsApp reject it.
  */
 async function resolveStatusRelayAudience(socket, statusJidList = [], options = {}) {
   const ownPn = normalizedUserJid(socket?.authState?.creds?.me?.id || socket?.user?.id);
@@ -151,9 +151,9 @@ async function resolveStatusRelayAudience(socket, statusJidList = [], options = 
     }
   }
 
-  // Include the bot's phone-number JID explicitly, even when the other
-  // recipients are routed as LIDs. Keep both identities for accurate counting.
-  const selfRecipientJid = ownPn || ownLid;
+  // Keep the whole recipient list in one address space. `ownJid` is the bot's
+  // identity in that space (LID for migrated sockets, PN otherwise).
+  const selfRecipientJid = ownJid;
   if (selfRecipientJid && !seen.has(selfRecipientJid)) outgoing.push(selfRecipientJid);
 
   return {

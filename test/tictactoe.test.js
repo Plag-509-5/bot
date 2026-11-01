@@ -121,7 +121,7 @@ test('l’IA prend une victoire immédiate et ne peut pas être forcée à perdr
   assert.notEqual(checkWinner(board), 'X');
 });
 
-test('refuse les parties sans adversaire, contre soi-même ou contre le compte du bot', async () => {
+test('refuse les parties sans adversaire ou contre soi-même; le JID du bot lance l’IA', async () => {
   const { socket, sent } = createSocket('50933333333');
   await startTicTacToe(socket, incoming(chat, 'missing', playerX), chat, playerX, '');
   assert.match(sent.at(-1).content.text, /Adversaire introuvable/);
@@ -130,12 +130,13 @@ test('refuse les parties sans adversaire, contre soi-même ou contre le compte d
   assert.match(sent.at(-1).content.text, /vous-même/);
 
   await startTicTacToe(socket, incoming(chat, 'bot', playerX), chat, playerX, '50933333333@s.whatsapp.net');
-  assert.match(sent.at(-1).content.text, /compte du bot/);
+  assert.match(sent.at(-1).content.text, /CONTRE KAIDO IA/);
+  assert.deepEqual(sent.at(-1).content.mentions, [playerX]);
 
   const { socket: lidSocket, sent: lidSent } = createSocket('50933333334');
   lidSocket.user.lid = '188811111111:4';
   await startTicTacToe(lidSocket, incoming(chat, 'bot-lid', playerX), chat, playerX, '188811111111@lid');
-  assert.match(lidSent.at(-1).content.text, /compte du bot/);
+  assert.match(lidSent.at(-1).content.text, /CONTRE KAIDO IA/);
 });
 
 test('un coup ne peut être joué que par le joueur attendu et sur une case libre', async () => {

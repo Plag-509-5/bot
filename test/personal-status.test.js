@@ -241,7 +241,7 @@ test('publie un statut texte avec statusJidList, option de fond et journal de su
   assert.match(sent.at(-1).content.text, /\.delstatus/);
 });
 
-test('un compte migré route les destinataires en LID et inclut le numéro PN du bot', async () => {
+test('un compte migré route toute l’audience en LID, y compris l’identité du bot', async () => {
   resetLog();
   const relayed = [];
   const { socket, sent } = fakeSocket({
@@ -277,7 +277,7 @@ test('un compte migré route les destinataires en LID et inclut le numéro PN du
   const statusSend = relayed.find(event => event.jid === 'status@broadcast');
   assert.deepEqual(
     [...statusSend.options.statusJidList].sort(),
-    ['contact-222@lid', 'contact-333@lid', '50900000000@s.whatsapp.net'].sort()
+    ['contact-222@lid', 'contact-333@lid', 'self-lid@lid'].sort()
   );
   assert.equal(statusSend.options.additionalAttributes, undefined);
   assert.equal(statusSend.options.useUserDevicesCache, undefined, 'le plugin laisse le cache Baileys activé par défaut');
@@ -288,7 +288,7 @@ test('un compte migré route les destinataires en LID et inclut le numéro PN du
   const revoke = sent.find(event => event.jid === 'status@broadcast' && event.content.delete);
   assert.deepEqual(
     [...revoke.options.statusJidList].sort(),
-    ['contact-222@lid', 'contact-333@lid', '50900000000@s.whatsapp.net'].sort()
+    ['contact-222@lid', 'contact-333@lid', 'self-lid@lid'].sort()
   );
   assert.equal(revoke.options.additionalAttributes, undefined);
   assert.equal(revoke.options.useUserDevicesCache, undefined);

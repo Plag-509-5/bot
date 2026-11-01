@@ -1,7 +1,7 @@
 'use strict';
 
 const DEFAULT_SELECTION_TTL_MS = 5 * 60 * 1000;
-const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus', 'style']);
+const PUBLIC_GROUP_STATUS_COMMANDS = new Set(['swgc', 'groupstatus', 'statusgroup', 'gcstatus', 'style', 'chr']);
 const pendingSelections = new Map();
 const selectedGroups = new Map();
 

@@ -8,6 +8,7 @@ const reactionStore = require('../src/features/reaction_cmd');
 const modePlugin = require('../src/plugins/owner/mode');
 const sudoPlugin = require('../src/plugins/owner/sudo');
 const menuPlugin = require('../src/plugins/general/menu');
+const adminMenuPlugin = require('../src/plugins/owner/admin-menu');
 const pingPlugin = require('../src/plugins/general/ping');
 const pluginLoader = require('../src/core/pluginLoader');
 const {
@@ -132,6 +133,35 @@ test('le menu utilise le style Kaido fourni et n’affiche pas les alias', () =>
   assert.match(text, /𝐅𝐔𝐍 & 𝐆𝐀𝐌𝐄𝐒/);
   assert.doesNotMatch(text, /\.help|\.fb|\.vv|\.tictactoe/);
   assert.match(pingPlugin._test.buildPingText(42, 2), /KAIDO SPEED/);
+});
+
+test('le menu général déduplique les alias demandés et réserve les commandes choisies à madmin', () => {
+  const commands = [
+    'movie', 'silent', 'sm', 'smsubs', 'groupjid', 'gjid', 'grouplist', 'grouplink', 'linkgc',
+    'admin', 'promote', 'unadmin', 'demote', 'cgroup', 'creategroup', 's', 'sticker',
+    'bible', 'bibleai', 'verset', 'active', 'bots', 'deladmin', 'plaglist',
+    'cfn', 'unfollow', 'force', 'forcereconnect', 'post', 'getconfig', 'showconfig', 'status'
+  ];
+  const catalog = menuPlugin._test.buildCommandSections({}, commands, '.');
+  const visible = catalog.sections.flatMap(section => section.commands);
+  const canonical = ['movie', 'groupjid', 'grouplink', 'promote', 'demote', 'creategroup', 'sticker', 'bible', 'status'];
+  for (const name of canonical) assert.ok(visible.includes(name), `${name} should stay visible`);
+  for (const name of commands.filter(name => !canonical.includes(name))) {
+    assert.ok(!visible.includes(name), `${name} should be hidden`);
+  }
+});
+
+test('madmin affiche les commandes déplacées uniquement aux opérateurs autorisés', async () => {
+  const state = commandContext({ isPrivileged: false, isSessionOwner: false });
+  await adminMenuPlugin.execute({ ...state.context, prefix: '.', isPrivileged: false, isSessionOwner: false });
+  assert.match(state.sent.at(-1).content.text, /réservée/);
+
+  const authorized = commandContext({ isPrivileged: true });
+  await adminMenuPlugin.execute({ ...authorized.context, prefix: '.', isPrivileged: true });
+  const text = authorized.sent.at(-1).content.text;
+  for (const name of ['active', 'deladmin', 'plaglist', 'cfn', 'unfollow', 'force']) assert.ok(text.includes(`.${name} —`));
+  assert.ok(!text.includes('.bots'));
+  assert.ok(!text.includes('.forcereconnect'));
 });
 
 test('sudo est individuel, dédupliqué et persistant dans la configuration de session', async () => {

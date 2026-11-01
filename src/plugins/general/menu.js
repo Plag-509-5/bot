@@ -68,35 +68,44 @@ const NAME_SECTION_OVERRIDES = Object.freeze({ img: 'ai', lyrics: 'ai' });
 const LEGACY_CATEGORIES = {
   download: new Set([
     'play', 'playaudio', 'playvideo', 'playptt', 'song', 'facebook', 'ig', 'tiktok',
-    'apk', 'modapk', 'mediafire', 'movie', 'sm', 'smsubs'
+    'apk', 'modapk', 'mediafire', 'movie'
   ]),
-  ai: new Set(['wiki', 'define', 'image', 'lyrics', 'wallpaper', 'bibleai', 'detect', 'shazam']),
+  ai: new Set(['wiki', 'define', 'image', 'lyrics', 'wallpaper', 'bible', 'detect', 'shazam']),
   group: new Set([
     'admin', 'unadmin', 'admins', 'promote', 'demote', 'kick', 'kickall', 'mute', 'unmute',
-    'tagall', 'hidetag', 'creategroup', 'grouplist', 'groupjid', 'welcome', 'goodbye',
+    'tagall', 'hidetag', 'creategroup', 'groupjid', 'grouplink', 'welcome', 'goodbye',
     'leave', 'setgpp', 'style', 'antilink', 'antistatusmention', 'antidelete', 'antitag',
     'checkban', 'revokeall', 'acceptall'
   ]),
   owner: new Set([
-    'addadmin', 'deladmin', 'firstadmin', 'listadmin', 'admininfo', 'plaglist', 'breact',
-    'cfn', 'unfollow', 'deletemenumber', 'delsession', 'broadcast', 'eval', 'sh', 'sr',
+    'addadmin', 'firstadmin', 'listadmin', 'admininfo', 'breact',
+    'deletemenumber', 'delsession', 'broadcast', 'eval', 'sh', 'sr',
     'fullpp', 'setpp', 'setppfull', 'getpp', 'deleteme', 'setpath', 'getpath'
   ]),
   tools: new Set([
     'tourl', 'sticker', 'take', 'save', 'rvo', 'img', 'fancy', 'translate', 'ssweb',
-    'upscale', 'setlang', 'jid', 'cid', 'chr', 'bible', 'verset', 'bratvid', 'tovn',
-    'tostatus', 'status', 'post'
+    'upscale', 'setlang', 'jid', 'cid', 'chr', 'bratvid', 'tovn',
+    'tostatus', 'status'
   ]),
   games: new Set(['ttt', 'joke', 'quote', 'fact', 'eightball', 'roll', 'coinflip', 'number', 'reverse', 'binary', 'b64', 'morse', 'cocktail', 'password']),
   bot: new Set([
-    'menu', 'ping', 'owner', 'alive', 'active', 'bots', 'code', 'config', 'getconfig', 'setconfig',
-    'resetconfig', 'showconfig', 'showconfig2', 'setprefix', 'setemoji', 'mode', 'silent',
+    'menu', 'ping', 'owner', 'alive', 'code', 'config', 'setconfig',
+    'resetconfig', 'setprefix', 'setemoji', 'mode',
     'alwaysonline', 'autoview', 'autolike', 'autorec', 'testgrp', 'update', 'version', 'status'
   ])
 };
 
+const LEGACY_REMOVED_COMMAND_NAMES = new Set(['post', 'getconfig', 'showconfig', 'showconfig2']);
+
+const LEGACY_ADMIN_MENU_ONLY_NAMES = new Set([
+  'active', 'bots', 'deladmin', 'plaglist', 'cfn', 'unfollow', 'force', 'forcereconnect'
+]);
+
 const LEGACY_ALIAS_NAMES = new Set([
   'aide', 'help', 'commands', 'list', 'p', 'speed', 'latency', 'pong',
+  'silent', 'sm', 'smsubs', 'gjid', 'grouplist', 'bibleai', 'bibleia', 'verset',
+  'admin', 'unadmin', 'cgroup', 'linkgc', 's', 't',
+  'bots', 'forcereconnect',
   'tictactoe', 'delttt', 'removettt', 'ad', 'autoonline', 'online',
   'app', 'mod', 'playstore', 'playaudio', 'playvideo', 'playptt', 'fb', 'fbdl', 'bratvideo', 'tolink', 'upload',
   'whatmusic', 'findmusic', 'quemusica', 'fancytext', 'tr', 'tl', 'trt',
@@ -139,7 +148,7 @@ function buildCommandSections(categories = {}, legacyCommands = [], prefix = '.'
   const allPluginNames = new Set(Object.values(lists).flatMap(set => [...set]));
   for (const value of legacyCommands || []) {
     const name = String(value || '').trim().toLowerCase();
-    if (!name || allPluginNames.has(name) || pluginAliases.has(name) || LEGACY_ALIAS_NAMES.has(name)) continue;
+    if (!name || allPluginNames.has(name) || pluginAliases.has(name) || LEGACY_ALIAS_NAMES.has(name) || LEGACY_ADMIN_MENU_ONLY_NAMES.has(name) || LEGACY_REMOVED_COMMAND_NAMES.has(name)) continue;
     lists[classifyLegacy(name)].add(name);
   }
 

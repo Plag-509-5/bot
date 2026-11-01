@@ -120,9 +120,7 @@ module.exports = {
       if (isGroupAdmin(groupMeta, targetParticipant)) {
         return await socket.sendMessage(from, { text: '❌ Cette personne est déjà administratrice.' }, { quoted: msg });
       }
-      if (!isGroupSuperAdmin(groupMeta, socket)) {
-        return await socket.sendMessage(from, { text: '❌ Le bot doit être super-administrateur pour promouvoir un membre.' }, { quoted: msg });
-      }
+      // Le rôle admin du bot suffit pour promouvoir; WhatsApp ne requiert pas le créateur du groupe.
       await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
       await socket.sendMessage(from, { text: `👑 @${userNum} est désormais administrateur du groupe.`, mentions: [targetMentionJid] }, { quoted: msg });
     } else if (command === 'demote') {

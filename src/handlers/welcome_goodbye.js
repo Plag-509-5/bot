@@ -3,6 +3,24 @@
 // Thème stylé "Kaido" — mentionne l'utilisateur et le nom du groupe
 // Les messages par défaut sont construits dynamiquement (pas de placeholders dans les constantes)
 
+let initMongoProvider = null;
+let getDbProvider = null;
+
+function configureWelcomeGoodbyeStorage({ initMongo, getDb } = {}) {
+  initMongoProvider = typeof initMongo === 'function' ? initMongo : null;
+  getDbProvider = typeof getDb === 'function' ? getDb : null;
+}
+
+async function getSettingsCollection() {
+  if (!initMongoProvider || !getDbProvider) {
+    throw new Error('Le stockage MongoDB Welcome/Goodbye n’est pas configuré.');
+  }
+  await initMongoProvider();
+  const db = getDbProvider();
+  if (!db) throw new Error('La base MongoDB Welcome/Goodbye n’est pas disponible.');
+  return db.collection('group_welcome_goodbye');
+}
+
 /**
  * Builders par défaut (Kaido theme)
  * Ces fonctions reçoivent les valeurs et retournent le texte final.
@@ -34,45 +52,26 @@ function buildDefaultGoodbye(userJid, userName, groupName) {
  * Utilise la collection 'group_welcome_goodbye'.
  */
 async function getGroupSettings(groupId) {
-  try {
-    // initMongo() doit être accessible globalement ou importé si nécessaire.
-    if (typeof initMongo === 'function') await initMongo(); 
-    
-    const col = mongoDB.collection('group_welcome_goodbye');
-    const doc = await col.findOne({ groupId: groupId });
-    
-    return doc || { 
-      groupId: groupId, 
-      welcomeEnabled: false, 
-      goodbyeEnabled: false, 
-      welcomeTemplate: null, 
-      goodbyeTemplate: null 
-    };
-  } catch (e) {
-    console.error('Erreur getGroupSettings MongoDB:', e);
-    return { 
-      groupId: groupId, 
-      welcomeEnabled: false, 
-      goodbyeEnabled: false, 
-      welcomeTemplate: null, 
-      goodbyeTemplate: null 
-    };
-  }
+  const col = await getSettingsCollection();
+  const doc = await col.findOne({ groupId });
+  return doc || {
+    groupId,
+    welcomeEnabled: false,
+    goodbyeEnabled: false,
+    welcomeTemplate: null,
+    goodbyeTemplate: null
+  };
 }
 
 async function updateGroupSetting(groupId, field, value) {
-  try {
-    if (typeof initMongo === 'function') await initMongo();
-    
-    const col = mongoDB.collection('group_welcome_goodbye');
-    await col.updateOne(
-      { groupId: groupId },
-      { $set: { [field]: value, updatedAt: new Date() } },
-      { upsert: true }
-    );
-  } catch (e) {
-    console.error(`Erreur updateGroupSetting pour ${field}:`, e);
-  }
+  const allowedFields = new Set(['welcomeEnabled', 'goodbyeEnabled', 'welcomeTemplate', 'goodbyeTemplate']);
+  if (!allowedFields.has(field)) throw new Error(`Réglage Welcome/Goodbye inconnu : ${field}`);
+  const col = await getSettingsCollection();
+  await col.updateOne(
+    { groupId },
+    { $set: { [field]: value, updatedAt: new Date() } },
+    { upsert: true }
+  );
 }
 
 /**
@@ -148,8 +147,11 @@ async function handleParticipantUpdate(socket, from, update) {
     }
 
     for (const participant of participants) {
-      const userJid = participant;
-      const userName = (participant || '').split('@')[0];
+      const userJid = typeof participant === 'string'
+        ? participant
+        : (participant?.id || participant?.jid || participant?.phoneNumber || '');
+      if (!userJid) continue;
+      const userName = userJid.split('@')[0];
 
       // JOIN (Vérification via MongoDB)
       if (update.action === 'add' && settings.welcomeEnabled) {
@@ -184,6 +186,7 @@ async function handleParticipantUpdate(socket, from, update) {
 }
 
 module.exports = {
+  configureWelcomeGoodbyeStorage,
   getGroupSettings,     // Ajouté aux exports au cas où vous en auriez besoin dans votre switch principal
   updateGroupSetting,   // Ajouté aux exports
   toggleWelcome,

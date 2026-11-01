@@ -28,7 +28,8 @@
   - Facebook (Vidéos HD/SD)
 - **🧠 Intelligence Artificielle :** Chatbot Kaido activable par session (`.chatbot on|off`), mémoire courte partagée entre fournisseurs et commandes `.ai` / `.gpt`.
 - **🛠️ Outils & Utilitaires :**
-  - Recherche d’images pertinente avec Pexels (clé facultative) et Openverse en fallback sans clé (`.img`).
+  - Recherche d’images pertinente via Pexels, Google Custom Search (facultatif), Openverse et Wikimedia Commons (`.img` / `.img google`).
+  - Stickers `.bratvid` animés générés localement en WebP, sans API externe ni dépendance brat volumineuse.
   - Recherche de paroles en cascade sur cinq fournisseurs : LRCLIB, Lyrics.ovh, JioSaavn, Musixmatch et Vagalume (`.lyrics <artiste - titre>`). Les deux derniers utilisent `MUSIXMATCH_API_KEY` et `VAGALUME_API_KEY` facultatifs; chaque fournisseur est abandonné automatiquement s’il échoue ou ne trouve pas de paroles.
   - **Sticker/Emoji to Command (`.setcmd`) :** chaque session possède ses propres alias persistants dans MongoDB; un même sticker ou emoji peut donc lancer des commandes différentes selon la session.
   - **Statuts personnels (`.tostatus`) :** publie texte, photo, vidéo ou audio sur `status@broadcast`; gère l’audience par session avec `.setstatusviewers`, `.tostatus new group`, `.tostatus add` et `.tostatus export`. `.delstatus` retire la dernière publication suivie. Les statuts audio utilisent un cadre illustré Kaido, une waveform animée et la marque « Kaido-MD — Développeur : PlagTech ».
@@ -329,9 +330,13 @@ FACEBOOK_DOWNLOADER_API=https://fdown.isuru.eu.org
 COBALT_API_URLS=https://rue-cobalt.xenon.zone,https://cobaltapi.cjs.nz
 COBALT_API_KEY=
 
-# Facultatif : photos Pexels prioritaires pour `.img`.
-# Sans clé, `.img` utilise automatiquement Openverse.
+# Recherche d’images : Pexels (facultatif), puis Google CSE si configuré,
+# puis Openverse et Wikimedia Commons sans clé. `.img google <mots>` force Google.
 PEXELS_API_KEY=
+# Google Custom Search JSON API exige une clé API et un moteur programmable (cx).
+# Google annonce la fin de cette API au 1er janvier 2027 pour les clients existants.
+GOOGLE_CSE_API_KEY=
+GOOGLE_CSE_CX=
 
 # Facultatif : durée/quota antidelete et limites de .tourl
 ANTIDELETE_STORE_MAX=400

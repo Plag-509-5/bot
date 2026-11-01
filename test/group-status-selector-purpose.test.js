@@ -9,6 +9,12 @@ function clearPending() {
   selector._test.selectedGroups.clear();
 }
 
+test('.chr est public en groupe, y compris en mode privé', () => {
+  assert.equal(selector.isPublicGroupStatusCommand('120363@g.us', 'chr'), true);
+  assert.equal(selector.isPublicGroupStatusCommand('120363@g.us', 'menu'), false);
+  assert.equal(selector.isPublicGroupStatusCommand('50912345678@s.whatsapp.net', 'chr'), false);
+});
+
 test('les réponses aliasées au sélecteur de public ne changent pas la sélection swgc', () => {
   clearPending();
   selector.beginGroupSelection(

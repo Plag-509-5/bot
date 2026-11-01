@@ -378,10 +378,15 @@ async function startTicTacToe(socket, msg, from, sender, opponentJid) {
   }
 
   const botPlayer = makePlayer(getSelfJids(socket));
-  if (playersMatch(playerX, botPlayer) || playersMatch(playerO, botPlayer)) {
+  if (playersMatch(playerX, botPlayer)) {
     return socket.sendMessage(from, {
-      text: '🤖 Le compte du bot ne peut pas participer à une partie.'
+      text: '🤖 Le compte du bot ne peut pas être le joueur humain.'
     }, { quoted: msg });
+  }
+  // Une mention du numéro/JID du bot démarre le mode IA au lieu d’essayer de
+  // faire jouer une véritable session WhatsApp comme si elle lisait le plateau.
+  if (playersMatch(playerO, botPlayer)) {
+    return startSoloTicTacToe(socket, msg, from, sender);
   }
 
   const state = getSessionState(socket);

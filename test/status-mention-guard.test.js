@@ -31,6 +31,16 @@ test('les avertissements sont brandés Kaido MD et restent lisibles en français
   assert.doesNotMatch(message, /TOXIC-MD|xh_?clinton/i);
 });
 
+test('AntiStatusMention propose uniquement des sous-commandes textuelles', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
+  const start = source.indexOf("case 'antistatusmention': {");
+  const end = source.indexOf('// ---------------- CASE tagall', start);
+  const command = source.slice(start, end);
+  assert.match(command, /sub === 'on' \|\| sub === 'off'/);
+  assert.match(command, /sub === 'set' \|\| sub === 'threshold'/);
+  assert.doesNotMatch(command, /buttons\s*:/i);
+});
+
 test('la configuration du bot démarre avec les deux protections de mentions désactivées', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'core', 'pair.js'), 'utf8');
   assert.match(source, /ANTI_TAG_MODE:\s*'off'/);

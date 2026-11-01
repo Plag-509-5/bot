@@ -86,6 +86,7 @@ const {
 const { sms, downloadMediaMessage } = require('../lib/msg')
 const { startTicTacToe, startSoloTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
 const { resolveGroupCreationParticipant } = require('../services/group-creation');
+const { createBratVideoSticker } = require('../services/brat-video');
 const { buildChannelInfoInteractiveMessage } = require('../services/channel-info-message');
 const { applyPairingCors } = require('../services/pairing-cors');
 const {
@@ -135,6 +136,7 @@ const statusLog = require('../services/status-log');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
 const {
+  configureWelcomeGoodbyeStorage,
   toggleWelcome,
   toggleGoodbye,
   isWelcomeEnabled,
@@ -376,6 +378,10 @@ configureTranslationStorage({
   initMongo,
   getDb: () => mongoDB,
   getSessionConfig: loadUserConfigFromMongo
+});
+configureWelcomeGoodbyeStorage({
+  initMongo,
+  getDb: () => mongoDB
 });
 configureGitHubUpdateSettings({
   initMongo,
@@ -2604,8 +2610,7 @@ function setupCommandHandlers(socket, number) {
 
     try {
       switch (command) {
-      case 'post':
-case 'status': {
+      case 'status': {
   try {
     const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 
@@ -2859,89 +2864,29 @@ case 'removettt': {
   break;
 }
               // ============================================================
-// BRATVIDEO — Sticker animé Brat
+// ============================================================
+// BRATVID — Sticker animé généré localement (sans API tierce)
 // ============================================================
 case 'bratvid':
 case 'bratvideo': {
   try {
-    if (!args.length) {
+    const text = args.join(' ').trim();
+    if (!text) {
       await socket.sendMessage(sender, {
-        text: `╭━━━━━━━━━━━━━━━━━━━━━━━╮\n` +
-              `┃  🎬 *KAIDO STICKER TEXTE ANIMÉ*\n` +
-              `╰━━━━━━━━━━━━━━━━━━━━━━━╯\n\n` +
-              `❌ Aucun texte fourni !\n\n` +
-              `*Usage :* ${prefix}bratvideo <texte>\n\n` +
-              `*Exemples :*\n` +
-              `  ${prefix}bratvideo KAIDO MD\n` +
-              `  ${prefix}bratvideo plag\n\n` +
-              `> ${config.BOT_FOOTER}`
+        text: `🎬 Usage : ${prefix}bratvid <texte>\nExemple : ${prefix}bratvid KAIDO MD`
       }, { quoted: msg });
       break;
     }
 
-    const text = args.join(' ').trim();
-
     await socket.sendMessage(from, { react: { text: '⚡', key: msg.key } });
-
-    const mediaUrl = `https://brat.caliphdev.com/api/brat/animate?text=${encodeURIComponent(text)}`;
-
-    // ── Télécharger le gif/webp animé ──
-    const response = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      timeout: 20000
-    });
-    const buffer = Buffer.from(response.data);
-
-    if (!buffer || buffer.length === 0) {
-      throw new Error('Téléchargement du média échoué.');
-    }
-
-    // ── Ajouter les métadonnées EXIF (packname + auteur) ──
-    const webp   = require('node-webpmux');
-    const crypto = require('crypto');
-
-    async function addExif(webpSticker, packName, authorName) {
-      const img           = new webp.Image();
-      const stickerPackId = crypto.randomBytes(32).toString('hex');
-      const json          = {
-        'sticker-pack-id': stickerPackId,
-        'sticker-pack-name': packName,
-        'sticker-pack-publisher': authorName,
-        'emojis': ['🎬']
-      };
-      const exifAttr   = Buffer.from([
-        0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x16, 0x00, 0x00, 0x00
-      ]);
-      const jsonBuffer = Buffer.from(JSON.stringify(json), 'utf8');
-      const exif       = Buffer.concat([exifAttr, jsonBuffer]);
-      exif.writeUIntLE(jsonBuffer.length, 14, 4);
-      await img.load(webpSticker);
-      img.exif = exif;
-      return await img.save(null);
-    }
-
-    let stickerBuffer;
-    try {
-      stickerBuffer = await addExif(buffer, text, 'KAIDO-MD');
-    } catch(_) {
-      // Si addExif échoue (pas un webp valide) → envoyer le buffer brut
-      stickerBuffer = buffer;
-    }
-
-    // ── Envoyer comme sticker ──
-    await socket.sendMessage(sender, {
-      sticker: stickerBuffer
-    }, { quoted: msg });
-
+    const stickerBuffer = await createBratVideoSticker(text);
+    await socket.sendMessage(sender, { sticker: stickerBuffer }, { quoted: msg });
     await socket.sendMessage(from, { react: { text: '✅', key: msg.key } });
-
-  } catch (e) {
-    console.error('[BRATVIDEO ERROR]', e);
-    await socket.sendMessage(from, { react: { text: '❌', key: msg.key } });
+  } catch (error) {
+    console.error('[BRATVIDEO ERROR]', error);
+    await socket.sendMessage(from, { react: { text: '❌', key: msg.key } }).catch(() => {});
     await socket.sendMessage(sender, {
-      text: `❌ Échec génération brat video.\n_${e.message || e}_\n\n💡 Réessaie dans quelques secondes.`
+      text: `❌ Échec de génération du bratvid.\n_${error.message || error}_`
     }, { quoted: msg });
   }
   break;
@@ -3892,6 +3837,7 @@ case 'mod': {
 case 'sm':
 case 'movie':
 case 'silent': {
+    const jid = from;
     try {
         const query = args.join(" ");
         if (!query) {
@@ -4020,6 +3966,7 @@ case 'silent': {
 
 // === COMMANDE SOUS-TITRES ===
 case 'smsubs': {
+    const jid = from;
     try {
         const movieId = args[0];
         const season = args[1] === 'null' ? null : args[1];
@@ -4358,9 +4305,9 @@ case 'tr': {
 case 'antitag': {
           try {
             // Optionnel : restreindre au propriétaire
-            if (!isOwner) {
+            if (!(isOwner || isSessionOwner)) {
               await socket.sendMessage(sender, {
-                text: '❌ Seul le propriétaire peut utiliser cette commande.'
+                text: '❌ Seul le propriétaire de la session ou du bot peut utiliser cette commande.'
               }, { quoted: msg });
               break;
             }
@@ -4376,7 +4323,7 @@ case 'antitag': {
             }
 
             // Récupérer le numéro de la session (le bot) pour la config
-            const botNumberForConfig = socket.user?.id?.split(':')[0] + '@s.whatsapp.net' || socket.user?.id;
+            const botNumberForConfig = String(number || '').replace(/[^0-9]/g, '');
             if (!botNumberForConfig) throw new Error('Impossible de récupérer le numéro du bot');
 
             // Charger la config actuelle du bot
@@ -5153,71 +5100,57 @@ END:VCARD`
 case 'antistatusmention': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
-    const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = primaryOwnerNumber();
-
     if (!from.endsWith('@g.us')) {
       return await socket.sendMessage(sender, {
         text: '❌ Cette commande doit être utilisée dans un groupe.'
       }, { quoted: msg });
     }
-
     if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire de la session ou du bot peut changer ce mode.'
       }, { quoted: msg });
     }
 
-    // Charger la config actuelle
-    let cfg = await loadUserConfigFromMongo(sanitized) || {};
+    const sub = String(args[0] || 'status').toLowerCase();
+    const cfg = await loadUserConfigFromMongo(sanitized) || {};
     if (typeof cfg.antistatusmention === 'undefined') cfg.antistatusmention = false;
-    if (typeof cfg.antistatusmention_threshold === 'undefined') cfg.antistatusmention_threshold = 2;
+    const savedThreshold = Number(cfg.antistatusmention_threshold);
+    if (!Number.isInteger(savedThreshold) || savedThreshold < 1 || savedThreshold > 20) cfg.antistatusmention_threshold = 2;
+    else cfg.antistatusmention_threshold = savedThreshold;
 
-    // Construire le texte d’état
-    const statusText = cfg.antistatusmention
-      ? `✅ AntiStatusMention activé\n⚠️ Seuil: ${cfg.antistatusmention_threshold}`
-      : `⛔ AntiStatusMention désactivé\n⚠️ Seuil: ${cfg.antistatusmention_threshold}`;
-
-    // Construire le bouton ON/OFF
-    const buttons = [
-      {
-        buttonId: cfg.antistatusmention ? 'antistatusmention_off' : 'antistatusmention_on',
-        buttonText: { displayText: cfg.antistatusmention ? 'OFF' : 'ON' },
-        type: 1
+    if (sub === 'on' || sub === 'off') {
+      cfg.antistatusmention = sub === 'on';
+      await setUserConfigInMongo(sanitized, cfg);
+    } else if (sub === 'set' || sub === 'threshold') {
+      const threshold = Number(args[1]);
+      if (!Number.isInteger(threshold) || threshold < 1 || threshold > 20) {
+        return await socket.sendMessage(sender, {
+          text: `❌ Seuil invalide. Utilise ${prefix}antistatusmention set <1-20>.`
+        }, { quoted: msg });
       }
-    ];
+      cfg.antistatusmention_threshold = threshold;
+      await setUserConfigInMongo(sanitized, cfg);
+    } else if (sub !== 'status' && args.length) {
+      return await socket.sendMessage(sender, {
+        text: `Usage : ${prefix}antistatusmention [on|off|status|set <seuil>]`
+      }, { quoted: msg });
+    }
 
-    await socket.sendMessage(sender, {
-      text: `⚙️ Paramètre AntiStatusMention\n\n${statusText}\n\nClique sur le bouton pour changer.`,
-      buttons: buttons,
-      headerType: 1
-    }, { quoted: msg });
-
+    const statusText = cfg.antistatusmention ? 'activé ✅' : 'désactivé ❌';
+    const response = [
+      `⚙️ AntiStatusMention ${statusText}`,
+      `Seuil : ${cfg.antistatusmention_threshold}`,
+      '',
+      `Commandes : ${prefix}antistatusmention on | off | status`,
+      `${prefix}antistatusmention set <1-20>`
+    ].join('\n');
+    await socket.sendMessage(sender, { text: response }, { quoted: msg });
   } catch (err) {
     console.error('[ANTISTATUS SWITCH ERROR]', err);
     await socket.sendMessage(sender, {
       text: `❌ Erreur lors du changement de mode : ${err.message || err}`
     }, { quoted: msg });
   }
-  break;
-}
-
-// Gestion des boutons
-case 'antistatusmention_on': {
-  const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  let cfg = await loadUserConfigFromMongo(sanitized) || {};
-  cfg.antistatusmention = true;
-  await setUserConfigInMongo(sanitized, cfg);
-  await socket.sendMessage(from, { text: '✅ AntiStatusMention activé.' }, { quoted: msg });
-  break;
-}
-
-case 'antistatusmention_off': {
-  const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  let cfg = await loadUserConfigFromMongo(sanitized) || {};
-  cfg.antistatusmention = false;
-  await setUserConfigInMongo(sanitized, cfg);
-  await socket.sendMessage(from, { text: '⛔ AntiStatusMention désactivé.' }, { quoted: msg });
   break;
 }
 
@@ -5492,7 +5425,7 @@ case 'promote': {
     const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
     if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
-    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour promouvoir.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .promote @membre' }, { quoted: msg });
@@ -6030,8 +5963,8 @@ case 'promote': {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!isGroupSuperAdmin(metadata, socket)) {
-      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour promouvoir des membres.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour promouvoir des membres.' }, { quoted: msg });
       break;
     }
 
@@ -6131,7 +6064,7 @@ case 'setconfig': {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_SETCONFIG_HELP" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
       };
-      return await socket.sendMessage(sender, { text: '❗ Usage: .setconfig <KEY> <VALUE>\nEx: .setconfig AUTO_VIEW_STATUS false\nPour voir les clés disponibles: .showconfig' }, { quoted: meta });
+      return await socket.sendMessage(sender, { text: '❗ Usage: .setconfig <KEY> <VALUE>\nEx: .setconfig AUTO_VIEW_STATUS false\nPour les réglages courants: .config show' }, { quoted: meta });
     }
 
     if (typeof ALLOWED_KEYS !== 'undefined' && Array.isArray(ALLOWED_KEYS) && !ALLOWED_KEYS.includes(key)) {
@@ -6168,44 +6101,6 @@ case 'setconfig': {
   break;
 }
 
-/* getconfig */
-case 'getconfig': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const key = (args[0] || '').trim();
-    if (!key) {
-      const meta = {
-        key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG_HELP" },
-        message: { contactMessage: { displayName: BOT_NAME_FANCY } }
-      };
-      return await socket.sendMessage(sender, { text: '❗ Usage: .getconfig <KEY>\nEx: .getconfig AUTO_VIEW_STATUS\nPour voir toutes les clés: .showconfig' }, { quoted: meta });
-    }
-
-    const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    const botName = cfg.botName || BOT_NAME_FANCY;
-    const value = (cfg.hasOwnProperty(key)) ? cfg[key] : (DEFAULT_SESSION_CONFIG && DEFAULT_SESSION_CONFIG[key] !== undefined ? DEFAULT_SESSION_CONFIG[key] : undefined);
-
-    const meta = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG" },
-      message: { contactMessage: { displayName: botName } }
-    };
-
-    if (typeof value === 'undefined') {
-      await socket.sendMessage(sender, { text: `ℹ️ Clé introuvable: ${key}` }, { quoted: meta });
-    } else {
-      await socket.sendMessage(sender, { text: `🔎 ${key} = ${formatValueForDisplay ? formatValueForDisplay(value) : String(value)}` }, { quoted: meta });
-    }
-
-  } catch (e) {
-    console.error('getconfig error', e);
-    const metaErr = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG_ERR" },
-      message: { contactMessage: { displayName: BOT_NAME_FANCY } }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: metaErr });
-  }
-  break;
-}
 /* resetconfig */
 case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
@@ -6242,80 +6137,6 @@ case 'resetconfig': {
   }
   break;
 }
-
-/* showconfig */
-case 'showconfig2': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const cfgRaw = await loadUserConfigFromMongo(sanitized) || {};
-    const cfg = Object.assign({}, DEFAULT_SESSION_CONFIG || {}, cfgRaw);
-    const botName = cfg.botName || BOT_NAME_FANCY;
-
-    const shonux = {
-      key: {
-        remoteJid: "status@broadcast",
-        participant: "0@s.whatsapp.net",
-        fromMe: false,
-        id: "META_AI_SHOWCONFIG"
-      },
-      message: {
-        contactMessage: {
-          displayName: botName,
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
-        }
-      }
-    };
-
-    // Construire le texte de sortie
-    const lines = [];
-    lines.push(`📋 Configuration de session — ${sanitized}`);
-    lines.push('');
-    lines.push(`• Bot name: ${botName}`);
-    lines.push(`• Logo: ${cfg.logo || config.RCD_IMAGE_PATH || 'aucun'}`);
-    // Afficher les clés par défaut dans un ordre lisible
-    for (const k of Object.keys(DEFAULT_SESSION_CONFIG || {})) {
-      if (k === 'botName') continue; // déjà affiché
-      const val = cfg.hasOwnProperty(k) ? cfg[k] : DEFAULT_SESSION_CONFIG[k];
-      lines.push(`• ${k}: ${formatValueForDisplay ? formatValueForDisplay(val) : String(val)}`);
-    }
-    // Clés personnalisées
-    const extraKeys = Object.keys(cfg).filter(k => !DEFAULT_SESSION_CONFIG.hasOwnProperty(k) && k !== '_meta');
-    if (extraKeys.length) {
-      lines.push('');
-      lines.push('🔧 Clés personnalisées:');
-      for (const k of extraKeys) {
-        lines.push(`• ${k}: ${formatValueForDisplay ? formatValueForDisplay(cfg[k]) : String(cfg[k])}`);
-      }
-    }
-    // Meta info
-    if (cfg._meta) {
-      lines.push('');
-      lines.push(`Dernière mise à jour: ${cfg._meta.updatedAt || ''}`);
-      lines.push(`Par: ${cfg._meta.updatedBy || ''}`);
-    }
-
-    await socket.sendMessage(sender, { text: lines.join('\n') }, { quoted: shonux });
-  } catch (e) {
-    console.error('showconfig error', e);
-    const shonuxErr = {
-      key: {
-        remoteJid: "status@broadcast",
-        participant: "0@s.whatsapp.net",
-        fromMe: false,
-        id: "META_AI_SHOWCONFIG_ERR"
-      },
-      message: {
-        contactMessage: {
-          displayName: BOT_NAME_FANCY,
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
-        }
-      }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: shonuxErr });
-  }
-  break;
-}
-
 
 case 'sticker': case 's': {
   try {
@@ -6707,16 +6528,16 @@ case 'admin': {
       break;
     }
 
-    // Vérifier si l'expéditeur est superadmin
+    // Un administrateur de groupe peut demander une promotion; pas besoin d’être super-admin.
     const groupMetadata = await socket.groupMetadata(from);
-    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
+    if (!isGroupAdmin(groupMetadata, [nowsender, msg.key?.participantAlt, msg.key?.participant])) {
       await socket.sendMessage(sender, {
-        text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.'
+        text: '❌ Seuls les administrateurs du groupe peuvent promouvoir des membres.'
       }, { quoted: msg });
       break;
     }
-    if (!isGroupSuperAdmin(groupMetadata, socket)) {
-      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour promouvoir un membre.' }, { quoted: msg });
+    if (!isBotGroupAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être administrateur du groupe pour promouvoir un membre.' }, { quoted: msg });
       break;
     }
 
@@ -6770,7 +6591,7 @@ case 'admin': {
 
     let errorMsg = '❌ Impossible de promouvoir le membre. ';
     if (error.message?.includes('not-authorized')) {
-      errorMsg += 'Le bot doit être super-admin.';
+      errorMsg += 'Le bot doit être administrateur du groupe.';
     } else if (error.message?.includes('not-a-participant')) {
       errorMsg += 'Cette personne n\'est pas dans le groupe.';
     } else {
@@ -6871,7 +6692,7 @@ case 'unadmin': {
 
     let errorMsg = '❌ Impossible de rétrograder le membre. ';
     if (error.message?.includes('not-authorized')) {
-      errorMsg += 'Le bot doit être super-admin.';
+      errorMsg += 'Le bot doit être administrateur du groupe.';
     } else if (error.message?.includes('not-a-participant')) {
       errorMsg += 'Cette personne n\'est pas dans le groupe.';
     } else {
@@ -8124,9 +7945,11 @@ ${statusEmoji} *Statut :* ${status}
                 }
 
                 await socket.sendMessage(sender, { text: '⏳ Création du groupe en cours…' }, { quoted: msg });
+                let createdGroupId = '';
                 try {
                     const group = await socket.groupCreate(groupName, [groupParticipant]);
                     if (!group?.id) throw new Error('WhatsApp n’a pas renvoyé l’identifiant du nouveau groupe.');
+                    createdGroupId = group.id;
 
                     let response = `✅ Groupe *${groupName}* créé avec succès !`;
                     try {
@@ -8161,11 +7984,14 @@ ${statusEmoji} *Statut :* ${status}
                         mentions: [groupParticipant]
                     }, { quoted: msg });
                 } catch (error) {
-                    console.error('[CGROUP] Création impossible :', error?.message || error);
+                    console.error('[CGROUP] Création/finition impossible :', error?.message || error);
                     const detail = error?.output?.payload?.message || error?.message || 'erreur inconnue';
-                    await socket.sendMessage(sender, {
-                        text: `❌ Erreur lors de la création du groupe : ${detail}`
-                    }, { quoted: msg });
+                    const text = createdGroupId
+                        ? `⚠️ Le groupe a bien été créé (${createdGroupId}), mais la finition de la commande a échoué : ${detail}`
+                        : /internal-server-error|500/i.test(String(detail))
+                            ? `❌ WhatsApp a renvoyé une erreur serveur interne pendant la création du groupe. Aucun groupe n’a été confirmé comme créé. Réessaie plus tard ou vérifie la création dans l’application WhatsApp. Détail : ${detail}`
+                            : `❌ Erreur lors de la création du groupe : ${detail}`;
+                    await socket.sendMessage(sender, { text }, { quoted: msg });
                 }
                 break;
             }
@@ -10978,32 +10804,6 @@ Les médias sauvegardés seront envoyés à ce numéro.`
     await socket.sendMessage(sender, {
       text: '❌ Impossible de récupérer la configuration.'
     }, { quoted: msg });
-  }
-  break;
-}
-
-case 'showconfig': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    const botName = cfg.botName || BOT_NAME_FANCY;
-
-    const shonux = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SHOWCONFIG" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-
-    let txt = `*Session config for ${sanitized}:*\n`;
-    txt += `• Bot name: ${botName}\n`;
-    txt += `• Logo: ${cfg.logo || config.RCD_IMAGE_PATH}\n`;
-    await socket.sendMessage(sender, { text: txt }, { quoted: shonux });
-  } catch (e) {
-    console.error('showconfig error', e);
-    const shonux = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SHOWCONFIG2" },
-      message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: shonux });
   }
   break;
 }

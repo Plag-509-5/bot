@@ -147,7 +147,7 @@ test('le plugin kick accepte les alias du demandeur et de la cible, puis agit su
   assert.deepEqual(socket.sent.at(-1)[1].mentions, [MEMBER_PN]);
 });
 
-test('le plugin refuse une cible administratrice et un bot sans rôle superadmin', async () => {
+test('le plugin refuse une cible administratrice, mais un bot admin peut promouvoir sans rôle superadmin', async () => {
 
   const adminTargetSocket = makeSocket(makeMetadata({ memberRole: 'admin' }));
   const kickMsg = {
@@ -184,8 +184,8 @@ test('le plugin refuse une cible administratrice et un bot sans rôle superadmin
     isSessionOwner: false,
     isSudo: false
   });
-  assert.deepEqual(regularBotSocket.updates, []);
-  assert.match(regularBotSocket.sent.at(-1)[1].text, /super-administrateur/i);
+  assert.deepEqual(regularBotSocket.updates, [[GROUP, [MEMBER_LID], 'promote']]);
+  assert.match(regularBotSocket.sent.at(-1)[1].text, /désormais administrateur/i);
 });
 
 test('refuse un demandeur non-admin ou un bot qui n\'est pas admin', async () => {
