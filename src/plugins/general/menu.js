@@ -78,7 +78,7 @@ const LEGACY_CATEGORIES = {
     'checkban', 'revokeall', 'acceptall'
   ]),
   owner: new Set([
-    'addadmin', 'firstadmin', 'listadmin', 'admininfo', 'breact',
+    'addadmin', 'firstadmin', 'listadmin', 'admininfo', 'breact', 'bpoll',
     'deletemenumber', 'delsession', 'broadcast', 'eval', 'sh', 'sr',
     'fullpp', 'setpp', 'setppfull', 'getpp', 'deleteme', 'setpath', 'getpath'
   ]),

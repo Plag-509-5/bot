@@ -59,6 +59,13 @@ const {
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
+  parseBPollInput,
+  allocateBPollVotes,
+  getPollOptionNames,
+  resolveBPollTarget,
+  voteAcrossNewsletterSockets
+} = require('../services/newsletter-poll');
+const {
   subscribeNewsletterStalker,
   stopNewsletterStalker,
   stopAllNewsletterStalkers,
@@ -7285,6 +7292,88 @@ case 'breact': {
   } catch (error) {
     console.error('[BREACT] Impossible de démarrer la tâche :', error?.message || error);
     await socket.sendMessage(sender, { text: '❌ Impossible de démarrer la tâche.' }, { quoted: msg }).catch(() => {});
+  }
+  break;
+}
+
+case 'bpoll': {
+  try {
+    const input = parseBPollInput(body.split(' ').slice(1).join(' '));
+    if (!input) {
+      await socket.sendMessage(sender, {
+        text: `Utilisation : ${prefix}bpoll 1\nOu : ${prefix}bpoll 1 (75), 3 (25)\nLes pourcentages doivent totaliser 100. Réponds directement au sondage transféré depuis la chaîne.`
+      }, { quoted: msg });
+      break;
+    }
+
+    const quotedContext = msg.message?.extendedTextMessage?.contextInfo
+      || msg.message?.imageMessage?.contextInfo
+      || msg.message?.videoMessage?.contextInfo
+      || {};
+    const quotedPoll = quotedContext.quotedMessage || null;
+    const optionNames = getPollOptionNames(quotedPoll);
+    if (!optionNames.length) {
+      await socket.sendMessage(sender, {
+        text: '❌ Réponds à un sondage de chaîne transféré. Les options du sondage ne sont pas présentes dans le message cité.'
+      }, { quoted: msg });
+      break;
+    }
+    const invalidChoice = input.choices.find(choice => choice.option > optionNames.length);
+    if (invalidChoice) {
+      await socket.sendMessage(sender, {
+        text: `❌ L’option ${invalidChoice.option} n’existe pas. Ce sondage contient ${optionNames.length} option(s).`
+      }, { quoted: msg });
+      break;
+    }
+
+    const target = resolveBPollTarget({
+      pollMessage: quotedPoll,
+      quotedContext,
+      chatJid: from,
+      quotedKey: {
+        remoteJid: quotedContext.remoteJid,
+        id: quotedContext.stanzaId,
+        participant: quotedContext.participant
+      }
+    });
+    if (!target) {
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de retrouver la chaîne et le server_id d’origine. Réponds au post de sondage transféré depuis la chaîne, pas à une capture ou à un résultat recopié.'
+      }, { quoted: msg });
+      break;
+    }
+
+    const sessions = [...activeSockets.entries()]
+      .filter(([, botSocket]) => botSocket)
+      .map(([session, botSocket]) => ({ session, socket: botSocket }));
+    if (!sessions.some(entry => entry.socket === socket)) {
+      sessions.push({ session: number || socket.user?.id || 'session-courante', socket });
+    }
+    const assignments = allocateBPollVotes(sessions.length, input.choices);
+    const optionNamesBySession = assignments.map(option => [optionNames[option - 1]]);
+
+    await socket.sendMessage(sender, { text: '⏳ Envoi des votes en cours…' }, { quoted: msg });
+    const pollRun = (async () => {
+      const results = await voteAcrossNewsletterSockets(sessions, target, optionNamesBySession);
+      const succeeded = results.filter(result => result.ok).length;
+      const failed = results.length - succeeded;
+      const byOption = new Map();
+      results.filter(result => result.ok).forEach(result => {
+        const label = result.options[0];
+        byOption.set(label, (byOption.get(label) || 0) + 1);
+      });
+      const distribution = [...byOption].map(([option, count]) => `• ${option} : ${count}`).join('\n');
+      await socket.sendMessage(sender, {
+        text: `✅ Votes terminés.\nSessions ayant voté : ${succeeded}\nÉchecs : ${failed}${distribution ? `\n\nRépartition réelle :\n${distribution}` : ''}`
+      }).catch(error => console.warn('[BPOLL] Résumé non envoyé :', error?.message || error));
+    })().catch(error => {
+      console.error('[BPOLL] Erreur pendant l’envoi des votes :', error?.message || error);
+      return socket.sendMessage(sender, { text: `❌ Les votes n’ont pas pu être envoyés : ${error?.message || error}` }).catch(() => {});
+    });
+    void pollRun;
+  } catch (error) {
+    console.error('[BPOLL] Impossible de démarrer la tâche :', error?.message || error);
+    await socket.sendMessage(sender, { text: `❌ Impossible de démarrer .bpoll : ${error?.message || error}` }, { quoted: msg }).catch(() => {});
   }
   break;
 }
