@@ -39,6 +39,40 @@ test('socketReadiness détecte une websocket fermée', () => {
   assert.equal(socketReadiness(makeSocket({ registered: false })).ready, false);
 });
 
+test('socketReadiness utilise le getter isOpen de Baileys 7 avant readyState', () => {
+  assert.equal(socketReadiness({ ws: { isOpen: false }, sendMessage() {} }).ready, false);
+  assert.equal(socketReadiness({ ws: { isOpen: true }, sendMessage() {} }).ready, true);
+  assert.equal(socketReadiness({ ws: { isOpen: false, readyState: 1 }, sendMessage() {} }).ready, false);
+  assert.equal(socketReadiness({ ws: { isOpen: true, readyState: 3 }, sendMessage() {} }).ready, true);
+});
+
+test('un envoi attend que isOpen passe à true sur le WebSocketClient Baileys', async () => {
+  const socket = {
+    ws: { isOpen: false },
+    authState: { creds: { registered: true } },
+    sendMessage: async () => ({ key: { id: 'BAILEYS-OPEN' } })
+  };
+  let attempts = 0;
+  const result = await safeSend(
+    async () => {
+      attempts += 1;
+      return { key: { id: 'BAILEYS-OPEN' } };
+    },
+    socket,
+    '50947440869@s.whatsapp.net',
+    { text: 'test' },
+    {
+      delay: async () => { socket.ws.isOpen = true; },
+      readyTimeoutMs: 100,
+      logger: quiet
+    }
+  );
+
+  assert.equal(result.key.id, 'BAILEYS-OPEN');
+  assert.equal(attempts, 1);
+  assert.equal(getSendStats(socket).waitedForConnection, 1);
+});
+
 test('un envoi sur connexion ouverte passe immédiatement', async () => {
   const socket = makeSocket();
   const sent = [];

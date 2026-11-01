@@ -10,6 +10,10 @@ const pairHtml = fs.readFileSync(
   path.join(__dirname, '..', 'dashboard', 'pages', 'pair.html'),
   'utf8'
 );
+const pairingCodeSource = fs.readFileSync(
+  path.join(__dirname, '..', 'src', 'auth', 'pairing-code.js'),
+  'utf8'
+);
 const code = source
   .split('\n')
   .filter((line) => {
@@ -80,14 +84,16 @@ test('le cycle central distingue le 515 immédiat des vrais échecs de pairing',
   assert.match(autoRestart, /purgeFailedSession\(sanitized, \{ socket, reason: decision\.reason \}\)/);
 });
 
-test('le code attend pair-device et une reconnexion interne n’en génère jamais un autre', () => {
+test('le code attend le handshake Baileys et une reconnexion interne n’en génère jamais un autre', () => {
   const empirePair = code.slice(code.indexOf('async function EmpirePair('));
   assert.match(empirePair, /waitForPairingReady\(socket, \{ timeoutMs: PAIRING_READY_TIMEOUT_MS \}\)/);
+  assert.match(empirePair, /issuePairingCode\(\{/);
+  assert.match(empirePair, /readiness: pairingReadyResult/);
   assert.match(empirePair, /!forceFresh && !internalReconnect/);
   assert.match(empirePair, /if \(!internalReconnect\) pairingGuard\.reacquire/);
   assert.match(empirePair, /if \(internalReconnect\)/);
   assert.match(empirePair, /reconnexion interne sans creds enregistrées/);
-  assert.equal(occurrences(empirePair, 'socket.requestPairingCode(sanitizedNumber)'), 1);
+  assert.equal(occurrences(pairingCodeSource, 'socket.requestPairingCode(String(number))'), 1);
   assert.doesNotMatch(empirePair, /demande de code échouée \(essai/);
 });
 
@@ -129,4 +135,10 @@ test('le dashboard n’affiche pas « Indisponible » silencieusement', () => {
   assert.match(pairHtml, /Forcer un nouveau code/);
   assert.match(pairHtml, /Réessayer maintenant/);
   assert.match(pairHtml, /force=1/);
+});
+
+test('la commande .code utilise l’hôte local/site et le port dynamique, sans URL fixe', () => {
+  assert.match(code, /createPairingCodeUrlCandidates\(\s*cleanNumber/);
+  assert.match(code, /timeout: PAIRING_CODE_HTTP_TIMEOUT_MS/);
+  assert.doesNotMatch(code, /https:\/\/kaidomd-byplag\.mooo\.com\/code\?/);
 });

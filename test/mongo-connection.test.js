@@ -96,6 +96,19 @@ test('un ping raté ferme le client et permet une nouvelle tentative', async () 
   assert.ok(fake.clients.every((client) => client.closeCalls === 1));
 });
 
+test('le pool Mongo par défaut est dimensionné pour un cluster multi-sessions', () => {
+  const previous = process.env.MONGO_MAX_POOL_SIZE;
+  delete process.env.MONGO_MAX_POOL_SIZE;
+  try {
+    const connection = createMongoConnection({ uri: 'mongodb://localhost:27017' });
+    assert.equal(connection.clientOptions.maxPoolSize, 100);
+    assert.equal(connection.clientOptions.maxConnecting, 10);
+  } finally {
+    if (previous === undefined) delete process.env.MONGO_MAX_POOL_SIZE;
+    else process.env.MONGO_MAX_POOL_SIZE = previous;
+  }
+});
+
 test('les paramètres numériques invalides gardent une valeur sûre', () => {
   assert.equal(positiveInteger('2500', 10), 2500);
   assert.equal(positiveInteger('0', 10), 10);

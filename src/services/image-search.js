@@ -3,7 +3,9 @@
 const axios = require('axios');
 
 const PEXELS_API = 'https://api.pexels.com/v1/search';
+const GOOGLE_CSE_API = 'https://www.googleapis.com/customsearch/v1';
 const OPENVERSE_API = 'https://api.openverse.org/v1/images/';
+const WIKIMEDIA_API = 'https://commons.wikimedia.org/w/api.php';
 const SUPPORTED_FILETYPES = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', '']);
 
 function safeHttpUrl(value) {
@@ -92,6 +94,58 @@ function normaliseOpenverseResponse(data, query, limit = 5) {
     });
 }
 
+function normaliseGoogleResponse(data, limit = 5) {
+  const seen = new Set();
+  const images = [];
+  for (const result of data?.items || []) {
+    const originalUrl = safeHttpUrl(result?.link);
+    const thumbnail = safeHttpUrl(result?.image?.thumbnailLink);
+    const url = thumbnail || originalUrl;
+    if (!url || seen.has(originalUrl || url)) continue;
+    seen.add(originalUrl || url);
+    images.push({
+      url,
+      originalUrl: originalUrl || url,
+      sourceUrl: safeHttpUrl(result?.image?.contextLink),
+      title: result?.title || 'Image',
+      provider: 'Google Images',
+      attribution: result?.displayLink ? `Résultat Google Images — ${result.displayLink}` : null
+    });
+    if (images.length >= limit) break;
+  }
+  return images;
+}
+
+function normaliseWikimediaResponse(data, limit = 5) {
+  const pages = Object.values(data?.query?.pages || {});
+  const images = [];
+  const seen = new Set();
+  for (const page of pages) {
+    const info = page?.imageinfo?.[0] || {};
+    const originalUrl = safeHttpUrl(info.url);
+    const url = safeHttpUrl(info.thumburl || originalUrl);
+    if (!url || seen.has(originalUrl || url)) continue;
+    seen.add(originalUrl || url);
+    const metadata = info.extmetadata || {};
+    const creator = metadata.Artist?.value
+      ? String(metadata.Artist.value).replace(/<[^>]*>/g, '').trim()
+      : null;
+    const license = metadata.LicenseShortName?.value || null;
+    images.push({
+      url,
+      originalUrl: originalUrl || url,
+      sourceUrl: safeHttpUrl(`https://commons.wikimedia.org/wiki/${encodeURIComponent(page.title || '').replace(/%20/g, '_')}`),
+      title: String(page.title || 'Image').replace(/^File:/i, '').replace(/_/g, ' '),
+      creator,
+      provider: 'Wikimedia Commons',
+      license,
+      attribution: [creator, license].filter(Boolean).join(' — ') || null
+    });
+    if (images.length >= limit) break;
+  }
+  return images;
+}
+
 async function searchPexels(query, limit, apiKey, http = axios) {
   if (!apiKey) return [];
   const response = await http.get(PEXELS_API, {
@@ -100,6 +154,23 @@ async function searchPexels(query, limit, apiKey, http = axios) {
     timeout: 20_000
   });
   return normalisePexelsResponse(response.data, limit);
+}
+
+async function searchGoogleImages(query, limit, apiKey, engineId, http = axios) {
+  if (!apiKey || !engineId) return [];
+  const response = await http.get(GOOGLE_CSE_API, {
+    params: {
+      key: apiKey,
+      cx: engineId,
+      q: query,
+      searchType: 'image',
+      num: Math.min(Math.max(limit, 1), 10),
+      safe: 'active'
+    },
+    headers: { Accept: 'application/json' },
+    timeout: 20_000
+  });
+  return normaliseGoogleResponse(response.data, limit);
 }
 
 async function searchOpenverse(query, limit, http = axios) {
@@ -119,31 +190,63 @@ async function searchOpenverse(query, limit, http = axios) {
   return normaliseOpenverseResponse(response.data, query, limit);
 }
 
+async function searchWikimedia(query, limit, http = axios) {
+  const response = await http.get(WIKIMEDIA_API, {
+    params: {
+      action: 'query',
+      generator: 'search',
+      gsrsearch: query,
+      gsrnamespace: 6,
+      gsrlimit: Math.min(Math.max(limit * 2, 10), 50),
+      prop: 'imageinfo',
+      iiprop: 'url|extmetadata',
+      iiurlwidth: 1000,
+      format: 'json',
+      origin: '*'
+    },
+    headers: { Accept: 'application/json', 'User-Agent': 'KAIDO-MD/2.0 (WhatsApp image search)' },
+    timeout: 20_000
+  });
+  return normaliseWikimediaResponse(response.data, limit);
+}
+
 async function searchImages(query, limit = 5, http = axios, options = {}) {
   const cleanQuery = String(query || '').trim();
   if (!cleanQuery) throw new Error('La recherche est vide.');
   const safeLimit = Math.min(Math.max(Number(limit) || 5, 1), 8);
-  const apiKey = options.pexelsApiKey ?? process.env.PEXELS_API_KEY;
-  let pexelsError = null;
+  const pexelsApiKey = options.pexelsApiKey ?? process.env.PEXELS_API_KEY;
+  const googleApiKey = options.googleApiKey ?? process.env.GOOGLE_CSE_API_KEY;
+  const googleEngineId = options.googleEngineId ?? process.env.GOOGLE_CSE_CX;
+  const provider = String(options.provider || '').toLowerCase();
+  const attempts = [];
 
-  if (apiKey) {
+  // Le chemin explicite permet à l’utilisateur de demander Google Images même
+  // si un autre fournisseur est configuré ou répond plus vite.
+  const providers = provider === 'google'
+    ? [() => searchGoogleImages(cleanQuery, safeLimit, googleApiKey, googleEngineId, http)]
+    : [
+        ...(pexelsApiKey ? [() => searchPexels(cleanQuery, safeLimit, pexelsApiKey, http)] : []),
+        ...(googleApiKey && googleEngineId ? [() => searchGoogleImages(cleanQuery, safeLimit, googleApiKey, googleEngineId, http)] : []),
+        () => searchOpenverse(cleanQuery, safeLimit, http),
+        () => searchWikimedia(cleanQuery, safeLimit, http)
+      ];
+
+  for (const search of providers) {
     try {
-      const pexels = await searchPexels(cleanQuery, safeLimit, apiKey, http);
-      if (pexels.length) return pexels;
+      const images = await search();
+      if (images.length) return images;
     } catch (error) {
-      pexelsError = error;
-      console.warn('[IMAGE SEARCH] Pexels indisponible, fallback Openverse:', error?.message || error);
+      attempts.push(error?.message || String(error));
+      console.warn('[IMAGE SEARCH] Fournisseur indisponible, essai du suivant:', error?.message || error);
     }
   }
 
-  try {
-    const openverse = await searchOpenverse(cleanQuery, safeLimit, http);
-    if (openverse.length) return openverse;
-  } catch (error) {
-    if (pexelsError) throw new Error(`Pexels et Openverse indisponibles : ${error?.message || error}`);
-    throw error;
+  if (provider === 'google' && (!googleApiKey || !googleEngineId)) {
+    throw new Error('Google Images nécessite GOOGLE_CSE_API_KEY et GOOGLE_CSE_CX (Programmable Search Engine).');
   }
-
+  if (attempts.length === providers.length) {
+    throw new Error(`Aucun service d’images n’a répondu : ${attempts.join(' | ')}`);
+  }
   throw new Error('Aucune image pertinente trouvée.');
 }
 
@@ -151,13 +254,19 @@ module.exports = {
   searchImages,
   _test: {
     PEXELS_API,
+    GOOGLE_CSE_API,
     OPENVERSE_API,
+    WIKIMEDIA_API,
     SUPPORTED_FILETYPES,
     normaliseText,
     relevanceScore,
     normalisePexelsResponse,
     normaliseOpenverseResponse,
+    normaliseGoogleResponse,
+    normaliseWikimediaResponse,
     searchPexels,
-    searchOpenverse
+    searchGoogleImages,
+    searchOpenverse,
+    searchWikimedia
   }
 };

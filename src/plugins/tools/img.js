@@ -6,19 +6,20 @@ module.exports = {
   name: 'img',
   alias: ['image', 'images', 'image-search'],
   category: 'tools',
-  description: 'Recherche des images pertinentes via Pexels/Openverse',
+  description: 'Recherche des images via Pexels, Google Images, Openverse et Wikimedia Commons',
   usage: '.img <recherche>',
   async execute({ socket, msg, from, args, prefix }) {
-    const query = args.join(' ').trim();
+    const useGoogle = String(args[0] || '').toLowerCase() === 'google';
+    const query = args.slice(useGoogle ? 1 : 0).join(' ').trim();
     if (!query) {
       return socket.sendMessage(from, {
-        text: `🔎 Usage : ${prefix}img <mot-clé>\nExemple : ${prefix}img paysages d'Haïti`
+        text: `🔎 Usage : ${prefix}img <mot-clé>\n${prefix}img google <mot-clé> pour Google Images\nExemple : ${prefix}img paysages d'Haïti`
       }, { quoted: msg });
     }
 
     await socket.sendMessage(from, { react: { text: '🔎', key: msg.key } });
     try {
-      const images = await searchImages(query, 4);
+      const images = await searchImages(query, 4, undefined, { provider: useGoogle ? 'google' : undefined });
       if (!images.length) throw new Error('Aucune image compatible trouvée.');
 
       for (let index = 0; index < images.length; index += 1) {
