@@ -104,6 +104,61 @@ test('bascule sur Openverse si Pexels échoue', async () => {
   assert.equal(images[0].provider, 'Openverse');
 });
 
+test('utilise Google Custom Search en mode image lorsqu’il est configuré', async () => {
+  let request;
+  const http = {
+    async get(url, config) {
+      request = { url, config };
+      return { data: { items: [{
+        title: 'Palais Sans Souci',
+        link: 'https://images.example/original.jpg',
+        displayLink: 'example.com',
+        image: {
+          thumbnailLink: 'https://images.example/thumb.jpg',
+          contextLink: 'https://example.com/article'
+        }
+      }] } };
+    }
+  };
+  const images = await searchImages('palais sans souci', 4, http, {
+    provider: 'google', googleApiKey: 'google-key', googleEngineId: 'engine-id'
+  });
+  assert.equal(request.url, _test.GOOGLE_CSE_API);
+  assert.equal(request.config.params.searchType, 'image');
+  assert.equal(request.config.params.key, 'google-key');
+  assert.equal(request.config.params.cx, 'engine-id');
+  assert.equal(images[0].provider, 'Google Images');
+  assert.equal(images[0].url, 'https://images.example/thumb.jpg');
+  assert.equal(images[0].originalUrl, 'https://images.example/original.jpg');
+});
+
+test('Google Images sans clé explique la configuration requise', async () => {
+  await assert.rejects(
+    () => searchImages('chat', 4, { get: async () => ({ data: { items: [] } }) }, { provider: 'google', googleApiKey: '', googleEngineId: '' }),
+    /GOOGLE_CSE_API_KEY.*GOOGLE_CSE_CX/
+  );
+});
+
+test('Wikimedia Commons normalise les fichiers et métadonnées de licence', () => {
+  const images = _test.normaliseWikimediaResponse({ query: { pages: {
+    1: {
+      title: 'File:Citadelle Laferrière.jpg',
+      imageinfo: [{
+        url: 'https://upload.wikimedia.org/original.jpg',
+        thumburl: 'https://upload.wikimedia.org/thumb.jpg',
+        extmetadata: {
+          Artist: { value: 'Photographe' },
+          LicenseShortName: { value: 'CC BY-SA 4.0' }
+        }
+      }]
+    }
+  } } }, 4);
+  assert.equal(images[0].provider, 'Wikimedia Commons');
+  assert.equal(images[0].url, 'https://upload.wikimedia.org/thumb.jpg');
+  assert.equal(images[0].license, 'CC BY-SA 4.0');
+  assert.equal(images[0].creator, 'Photographe');
+});
+
 test('searchImages rejette une recherche vide', async () => {
   await assert.rejects(() => searchImages('   '), /vide/i);
 });

@@ -2,6 +2,9 @@ const express = require('express');
 const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
+const { configureWhatsAppMediaTempDir } = require('../services/media-temp-dir');
+const mediaTemp = configureWhatsAppMediaTempDir();
+if (mediaTemp.configured) console.log(`[MEDIA TEMP] Baileys media files: ${mediaTemp.directory}`);
 const { exec } = require('child_process');
 const router = express.Router();
 const pino = require('pino');
@@ -9,6 +12,7 @@ const moment = require('moment-timezone');
 const yts = require('yt-search');
 const Jimp = require('jimp');
 const crypto = require('crypto');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const axios = require('axios');
 const FileType = require('file-type');
 const fetch = require('node-fetch');
@@ -16,14 +20,20 @@ const { loadPlugins, executePlugin, getPlugins, getPluginsByCategory, getAllPlug
 const {
   resolveSessionPrefix,
   parseCommandInput,
+  shouldRouteToChatbot,
   extractMainCommandNames
 } = require('../services/command-routing');
 const {
   configEnabled,
   handleIgnoredMessage,
   wakeForCommand,
-  applyAlwaysOnlineSetting
+  applyAlwaysOnlineSetting,
+  setupReplyPresenceWrapper
 } = require('../services/presence-mode');
+const { respond: respondToAi, formatAiError } = require('../services/ai-chatbot');
+const { animeQuiz, formatQuizVerdict } = require('../services/anime-quiz');
+const { setupMetaAiFakeQuote } = require('../services/meta-ai-fake-quote');
+const { getChatbotInput } = require('../services/chatbot-message');
 const {
   canonicalAdmin,
   collectMessageIdentifiers,
@@ -31,16 +41,33 @@ const {
   ownerNumbers,
   resolveAccess
 } = require('../services/access-control');
+const { resolveAntiStatusMode, formatKaidoStatusMention } = require('../services/status-mention-guard');
 const {
   DEFAULT_NEWSLETTER_EMOJIS,
   normaliseNewsletterJid,
   normaliseEmojiList,
   resolveNewsletterEmojis,
+  formatBReactSummary,
+  parseNewsletterMessageReference,
+  parseNewsletterChannelReference,
+  parseReactionEmojiList,
+  parseBReactInput,
+  resolveNewsletterJid,
+  extractNewsletterServerId,
+  reactToNewsletterMessage,
+  reactAcrossNewsletterSockets,
   syncNewsletterSockets
 } = require('../services/newsletter-config');
 const {
+  subscribeNewsletterStalker,
+  stopNewsletterStalker,
+  stopAllNewsletterStalkers,
+  isLiveNewsletterPost
+} = require('../services/newsletter-stalker');
+const {
   modeAllowsChat,
   normaliseAntideleteMode,
+  shouldCacheIncomingMessage,
   unwrapMessage: unwrapAntideleteMessage,
   resolveOriginalAuthor,
   resolveRevoker,
@@ -49,45 +76,77 @@ const {
   buildAntideleteHeader,
   sendRecoveredMessage
 } = require('../services/antidelete');
-const {
-  withCommandTheme,
-  activateCommandTheme,
-  isOniThemeEnabled,
-  setupCommandThemeWrapper
-} = require('../services/oni-theme');
 loadPlugins();
 const { findStickerCommand, initStickerDb } = require('../features/sticker_cmd');
-const { findReactionCommand, initReactionDb } = require('../features/reaction_cmd');
+const {
+  findReactionCommand,
+  hasReactionCommands: sessionHasReactionCommands,
+  initReactionDb
+} = require('../features/reaction_cmd');
 const { sms, downloadMediaMessage } = require('../lib/msg')
-const { startTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
+const { startTicTacToe, startSoloTicTacToe, handleTicTacToeMove, deleteGame } = require('../features/tictactoe');
+const { resolveGroupCreationParticipant } = require('../services/group-creation');
+const { createBratVideoSticker } = require('../services/brat-video');
+const { buildChannelInfoInteractiveMessage } = require('../services/channel-info-message');
+const { applyPairingCors } = require('../services/pairing-cors');
 const {
   configureTranslationStorage,
   setupTranslationWrapper,
-  saveSessionLanguage
+  saveSessionLanguage,
+  getSessionLanguage,
+  SKIP_FORMATTING_OPTION
 } = require('../features/translation');
+const githubUpdater = require('../services/github-updater');
+const githubUpdateSettings = require('../services/github-update-settings');
+const { createGitHubAutoUpdater } = require('../services/github-auto-updater');
+const { configureGitHubUpdateSettings } = githubUpdateSettings;
 const { createStickerFromMedia, sendSticker } = require('../lib/s-utils');
 const { ytmp3, ytmp4 } = require('../lib/youtube');
-const { getGroupAdminsInfo, jidToNumber } = require('../lib/normalize');
+const { getGroupAdminsInfo } = require('../lib/normalize');
+const {
+  areSameIdentity,
+  findGroupParticipant,
+  getBotJid,
+  getGroupAdminJids,
+  getGroupAdminNumbers,
+  getParticipantId,
+  getParticipantMentionJid,
+  getPhoneNumberJid,
+  isAdminParticipant,
+  isBotAdmin: isBotGroupAdmin,
+  isBotIdentity,
+  isGroupAdmin,
+  isGroupSuperAdmin,
+  isSuperAdminParticipant
+} = require('../services/group-admins');
 const { uploadFile: uploadCloudku } = require("cloudku-uploader");
 const FormData = require("form-data");
 const {
   resolveGroupSelection,
-  actorIdFromMessage
+  actorIdFromMessage,
+  isPublicGroupStatusCommand
 } = require('../services/group-status-selector');
+const {
+  completeStatusAudienceGroupSelection,
+  STATUS_AUDIENCE_SELECTION_PURPOSE
+} = require('../plugins/owner/tostatus');
 const { handleAntiLink } = require('../handlers/antilink');
 const { toggleAntiLink, isAntiLinkEnabled } = require('../handlers/antilink');
+const statusLog = require('../services/status-log');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
 const {
+  configureWelcomeGoodbyeStorage,
   toggleWelcome,
   toggleGoodbye,
   isWelcomeEnabled,
   isGoodbyeEnabled,
   setWelcomeTemplate,
   setGoodbyeTemplate,
+  getGroupSettings,
+  updateGroupSetting,
   handleParticipantUpdate
 } = require('../handlers/welcome_goodbye');
-const translate = require('google-translate-api');
 const {
   default: makeWASocket,
   initAuthCreds,
@@ -95,7 +154,9 @@ const {
   getContentType,
   Browsers,
   fetchLatestWaWebVersion,
-  downloadContentFromMessage
+  downloadContentFromMessage,
+  decryptPollVote,
+  getKeyAuthor
 } = require('@whiskeysockets/baileys');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
 // -------- Sessions MongoDB uniquement --------
@@ -110,12 +171,67 @@ const {
   createPairingLifecycle,
   waitForPairingReady
 } = require('../auth/pairing-lifecycle');
+const { issuePairingCode } = require('../auth/pairing-code');
+const {
+  createPairingCodeUrlCandidates,
+  isPairingNetworkError,
+  fetchPairingCodeWithFallback
+} = require('../services/pairing-code-url');
+const { resolvePairingNumber } = require('../services/pairing-code-input');
+const { resolveReactionTargetMessage } = require('../services/reaction-target-message');
+const { createBoundedCache, isBoundedCache } = require('../services/bounded-cache');
+const { extractViewOnceMedia } = require('../services/view-once-media');
 const { createSessionPurger } = require('../auth/session-purge');
 const {
   createBaileysVersionResolver,
   formatWaVersion
 } = require('../services/baileys-version');
 const { installSafeSend, getSendStats } = require('../lib/safe-send');
+const { createStatusReplyForwarder } = require('../services/status-reply-forwarder');
+const {
+  createMessageDispatcher,
+  createMessageProcessingPool,
+  DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_MESSAGE_QUEUE_LIMIT,
+  DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT
+} = require('../services/message-batch');
+const { createMediaAlbumStore, snapshotMessageEnvelope } = require('../services/media-album-store');
+const { createReactionTargetCache } = require('../services/reaction-target-cache');
+const {
+  SESSION_KEEPALIVE_INTERVAL_MS,
+  SESSION_HEALTH_CHECK_INTERVAL_MS,
+  SESSION_STALE_AFTER_MS,
+  getSocketOpenState,
+  forceCloseSessionSocket,
+  createSessionHealthWatcher
+} = require('../services/session-health-watcher');
+const {
+  reconnectInactiveSessions,
+  formatForceReconnectReport
+} = require('../services/force-reconnect');
+
+function resolveGroupActionTargets(metadata, identities) {
+  const candidates = Array.isArray(identities) ? identities : [identities];
+  const seen = new Set();
+  const targets = [];
+
+  for (const identity of candidates) {
+    const participant = findGroupParticipant(metadata, identity);
+    if (!participant) continue;
+    const jid = getParticipantId(participant);
+    if (!jid || seen.has(jid)) continue;
+    seen.add(jid);
+    targets.push({
+      participant,
+      jid,
+      mentionJid: getParticipantMentionJid(participant) || jid
+    });
+  }
+
+  return targets;
+}
+
 // Au début de ton fichier, après les imports
 if (!global.scheduledRestart) {
     global.scheduledRestart = null;
@@ -143,10 +259,14 @@ const DEFAULT_SESSION_CONFIG = {
   AUTO_LIKE_EMOJI: ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
   PREFIX: '.',
   AUTO_ONLINE: false,
-  ANTI_TAG_MODE: true,
+  ANTI_TAG_MODE: 'off',
+  antistatusmention: false,
+  antistatusmention_threshold: 2,
   MODE: 'public',
-  THEME: 'onigashima',
-  SUDO_USERS: []
+  SUDO_USERS: [],
+  CHATBOT_ENABLED: false,
+  STATUS_REPLY_FORWARD_ENABLED: false,
+  STATUS_REPLY_KEYWORDS: []
 };
 
 // En mode prefixless, seuls les noms réellement connus doivent réveiller le bot.
@@ -172,10 +292,17 @@ function isKnownCommandName(command) {
   return getPlugins().has(name) || LEGACY_COMMANDS.has(name);
 }
 
-const SESSION_CONFIG_CACHE_TTL_MS = 5_000;
+const SESSION_CONFIG_CACHE_TTL_MS = 60_000;
+const SESSION_CONFIG_REFRESH_RETRY_MS = 5_000;
 const sessionConfigCache = new Map();
-const ADMIN_CACHE_TTL_MS = 5_000;
-let adminCache = { value: [], expiresAt: 0 };
+const sessionConfigLoads = new Map();
+const sessionConfigRefreshAfter = new Map();
+const sessionConfigRevision = new Map();
+const ADMIN_CACHE_TTL_MS = 60_000;
+let adminCache = { value: [], expiresAt: 0, loaded: false };
+let adminLoad = null;
+let adminRevision = 0;
+let adminRefreshAfter = 0;
 
 const config = {
   MAX_RETRIES: 3,
@@ -205,7 +332,9 @@ function primaryOwnerNumber() {
 const mongoConnection = createMongoConnection();
 let mongoDB;
 let mongoCollectionsPromise = null;
-let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol;
+let sessionsCol, numbersCol, adminsCol, newsletterCol, configsCol, newsletterReactsCol, newsletterStalkCol;
+const newsletterStalkConfigCache = new Map();
+const newsletterStalkSeen = new Map();
 
 async function initMongo() {
   mongoDB = await mongoConnection.connect();
@@ -217,12 +346,14 @@ async function initMongo() {
       newsletterCol = mongoDB.collection('newsletter_list');
       configsCol = mongoDB.collection('configs');
       newsletterReactsCol = mongoDB.collection('newsletter_reacts');
+      newsletterStalkCol = mongoDB.collection('newsletter_stalks');
 
       await Promise.all([
         sessionsCol.createIndex({ number: 1 }, { unique: true }),
         numbersCol.createIndex({ number: 1 }, { unique: true }),
         newsletterCol.createIndex({ jid: 1 }, { unique: true }),
         newsletterReactsCol.createIndex({ jid: 1 }, { unique: true }),
+        newsletterStalkCol.createIndex({ jid: 1 }, { unique: true }),
         configsCol.createIndex({ number: 1 }, { unique: true })
       ]);
       await Promise.all([
@@ -247,7 +378,24 @@ const authBackend = createMongoAuthBackend({
 });
 configureTranslationStorage({
   initMongo,
+  getDb: () => mongoDB,
+  getSessionConfig: loadUserConfigFromMongo
+});
+configureWelcomeGoodbyeStorage({
+  initMongo,
   getDb: () => mongoDB
+});
+configureGitHubUpdateSettings({
+  initMongo,
+  getDb: () => mongoDB
+});
+const githubAutoUpdater = createGitHubAutoUpdater({
+  env: process.env,
+  updater: githubUpdater,
+  settings: githubUpdateSettings,
+  // Le handler SIGTERM vide les creds Baileys/MongoDB avant que le superviseur
+  // de l’hébergeur ne relance le processus avec les nouveaux fichiers.
+  restart: () => process.kill(process.pid, 'SIGTERM')
 });
 
 // État d'authentification actif par numéro (cache mémoire d'exécution seulement).
@@ -300,26 +448,45 @@ async function getAllNumbersFromMongo() {
   return Array.from(numbers);
 }
 
-async function loadAdminsFromMongo(forceRefresh = false) {
-  try {
-    if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
-    await initMongo();
-    const docs = await adminsCol.find({}).toArray();
-    const admins = [];
-    const seen = new Set();
-    for (const doc of docs) {
-      const identity = canonicalAdmin(doc);
-      const value = identity.jid || identity.raw;
-      if (!value || seen.has(value)) continue;
-      seen.add(value);
-      admins.push(value);
-    }
-    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS };
-    return [...admins];
-  } catch (e) {
-    console.error('loadAdminsFromMongo', e);
-    return adminCache.value.length ? [...adminCache.value] : [];
+async function queryAdminsFromMongo() {
+  const revision = adminRevision;
+  await initMongo();
+  const docs = await adminsCol.find({}).toArray();
+  const admins = [];
+  const seen = new Set();
+  for (const doc of docs) {
+    const identity = canonicalAdmin(doc);
+    const value = identity.jid || identity.raw;
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    admins.push(value);
   }
+  if (revision === adminRevision) {
+    adminCache = { value: admins, expiresAt: Date.now() + ADMIN_CACHE_TTL_MS, loaded: true };
+    adminRefreshAfter = 0;
+  }
+  return admins;
+}
+
+function startAdminRefresh() {
+  if (adminLoad) return adminLoad;
+  adminLoad = queryAdminsFromMongo()
+    .catch(error => {
+      adminRefreshAfter = Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS;
+      console.error('loadAdminsFromMongo', error);
+      return adminCache.value;
+    })
+    .finally(() => { adminLoad = null; });
+  return adminLoad;
+}
+
+async function loadAdminsFromMongo(forceRefresh = false) {
+  if (!forceRefresh && adminCache.expiresAt > Date.now()) return [...adminCache.value];
+  if (!forceRefresh && adminCache.loaded) {
+    if (!adminLoad && adminRefreshAfter <= Date.now()) void startAdminRefresh();
+    return [...adminCache.value];
+  }
+  return [...await startAdminRefresh()];
 }
 
 // Récupérer le statut d'un groupe (welcome ou goodbye)
@@ -363,7 +530,9 @@ async function addAdminToMongo(jidOrNumber) {
       { $set: { jid, number: identity.number || null, updatedAt: new Date() } },
       { upsert: true }
     );
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Added admin ${jid}`);
     return jid;
   } catch (e) {
@@ -387,7 +556,9 @@ async function removeAdminFromMongo(jidOrNumber) {
       .map(doc => doc._id)
       .filter(Boolean);
     if (matchingIds.length) await adminsCol.deleteMany({ _id: { $in: matchingIds } });
-    adminCache = { value: [], expiresAt: 0 };
+    adminRevision += 1;
+    adminRefreshAfter = 0;
+    adminCache = { value: [], expiresAt: 0, loaded: false };
     console.log(`Removed admin ${identity.jid || identity.raw}`);
     return true;
   } catch (e) {
@@ -463,6 +634,8 @@ async function setUserConfigInMongo(number, conf) {
       { $set: { number: sanitized, config: conf, updatedAt: new Date() } },
       { upsert: true }
     );
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
+    sessionConfigRefreshAfter.delete(sanitized);
     sessionConfigCache.set(sanitized, {
       value: { ...DEFAULT_SESSION_CONFIG, ...(conf || {}) },
       expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
@@ -483,6 +656,35 @@ async function loadUserConfigFromMongo(number) {
   } catch (e) { console.error('loadUserConfigFromMongo', e); return null; }
 }
 
+function refreshSessionConfig(sanitized) {
+  const current = sessionConfigLoads.get(sanitized);
+  if (current) return current;
+
+  const revision = sessionConfigRevision.get(sanitized) || 0;
+  const load = (async () => {
+    try {
+      await initMongo();
+      const doc = await configsCol.findOne({ number: sanitized });
+      const merged = { ...DEFAULT_SESSION_CONFIG, ...(doc?.config || {}) };
+      if ((sessionConfigRevision.get(sanitized) || 0) === revision) {
+        sessionConfigCache.set(sanitized, {
+          value: merged,
+          expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
+        });
+      }
+      sessionConfigRefreshAfter.delete(sanitized);
+      return merged;
+    } catch (error) {
+      sessionConfigRefreshAfter.set(sanitized, Date.now() + SESSION_CONFIG_REFRESH_RETRY_MS);
+      throw error;
+    }
+  })().finally(() => {
+    if (sessionConfigLoads.get(sanitized) === load) sessionConfigLoads.delete(sanitized);
+  });
+  sessionConfigLoads.set(sanitized, load);
+  return load;
+}
+
 async function loadSessionConfigMerged(number, forceRefresh = false) {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   if (!sanitized) return { ...DEFAULT_SESSION_CONFIG };
@@ -490,13 +692,25 @@ async function loadSessionConfigMerged(number, forceRefresh = false) {
   const cached = sessionConfigCache.get(sanitized);
   if (!forceRefresh && cached && cached.expiresAt > Date.now()) return { ...cached.value };
 
-  const dbCfg = await loadUserConfigFromMongo(sanitized) || {};
-  const merged = { ...DEFAULT_SESSION_CONFIG, ...dbCfg };
-  sessionConfigCache.set(sanitized, {
-    value: merged,
-    expiresAt: Date.now() + SESSION_CONFIG_CACHE_TTL_MS
-  });
-  return { ...merged };
+  // Cache périmé disponible : ne jamais suspendre le traitement d'un message
+  // sur Mongo. Le rafraîchissement unique se fait en arrière-plan; une panne DB
+  // conserve la dernière configuration connue et temporise les nouvelles
+  // tentatives pour éviter une rafale de requêtes lors d'une déconnexion.
+  if (!forceRefresh && cached) {
+    if ((sessionConfigRefreshAfter.get(sanitized) || 0) <= Date.now()) {
+      void refreshSessionConfig(sanitized).catch(error => {
+        console.warn(`[CONFIG ${sanitized}] rafraîchissement en arrière-plan impossible :`, error?.message || error);
+      });
+    }
+    return { ...cached.value };
+  }
+
+  try {
+    return { ...await refreshSessionConfig(sanitized) };
+  } catch (error) {
+    if (cached) return { ...cached.value };
+    throw error;
+  }
 }
 
 // Helpers Mongo pour persister le schedule
@@ -671,6 +885,75 @@ async function listNewsletterReactsFromMongo() {
   } catch (e) { console.error('listNewsletterReactsFromMongo', e); return []; }
 }
 
+async function saveNewsletterStalkConfig(jid, emojis) {
+  await initMongo();
+  const normalizedJid = normaliseNewsletterJid(jid);
+  const normalizedEmojis = parseReactionEmojiList(emojis);
+  if (!normalizedJid) throw new Error('JID de chaîne invalide');
+  if (!normalizedEmojis.length) throw new Error('La liste d’emojis de surveillance est invalide');
+  const previous = newsletterStalkConfigCache.get(normalizedJid);
+  const config = {
+    jid: normalizedJid,
+    emojis: normalizedEmojis,
+    createdAt: previous?.createdAt || new Date(),
+    updatedAt: new Date()
+  };
+  await newsletterStalkCol.updateOne(
+    { jid: normalizedJid },
+    { $set: config },
+    { upsert: true }
+  );
+  newsletterStalkConfigCache.set(normalizedJid, config);
+  return config;
+}
+
+async function removeNewsletterStalkConfig(jid) {
+  await initMongo();
+  const normalizedJid = normaliseNewsletterJid(jid);
+  if (!normalizedJid) throw new Error('JID de chaîne invalide');
+  await newsletterStalkCol.deleteOne({ jid: normalizedJid });
+  newsletterStalkConfigCache.delete(normalizedJid);
+  return normalizedJid;
+}
+
+async function listNewsletterStalkConfigs() {
+  await initMongo();
+  const docs = await newsletterStalkCol.find({}).toArray();
+  newsletterStalkConfigCache.clear();
+  for (const doc of docs) {
+    const jid = normaliseNewsletterJid(doc.jid);
+    const emojis = parseReactionEmojiList(doc.emojis);
+    if (jid && emojis.length) newsletterStalkConfigCache.set(jid, { jid, emojis, createdAt: doc.createdAt || doc.updatedAt });
+  }
+  return [...newsletterStalkConfigCache.values()];
+}
+
+function claimNewsletterStalkUpdate(jid, serverId, now = Date.now()) {
+  for (const [key, expiry] of newsletterStalkSeen) {
+    if (expiry <= now) newsletterStalkSeen.delete(key);
+  }
+  const key = `${jid}::${serverId}`;
+  if (newsletterStalkSeen.has(key)) return false;
+  newsletterStalkSeen.set(key, now + 10 * 60 * 1000);
+  if (newsletterStalkSeen.size > 5000) {
+    const oldest = newsletterStalkSeen.keys().next().value;
+    if (oldest) newsletterStalkSeen.delete(oldest);
+  }
+  return true;
+}
+
+async function subscribeStalksOnSocket(socket, configs, force = false) {
+  const results = await Promise.all((Array.isArray(configs) ? configs : []).map(async config => {
+    try {
+      await subscribeNewsletterStalker(socket, config.jid, { force });
+      return { jid: config.jid, ok: true };
+    } catch (error) {
+      return { jid: config.jid, ok: false, error: error?.message || String(error) };
+    }
+  }));
+  return results;
+}
+
 async function getReactConfigForJid(jid) {
   try {
     await initMongo();
@@ -688,7 +971,7 @@ function formatMessage(title, content, footer) {
   return `*${title}*\n\n${content}\n\n> *${footer}*`;
 }
 function generateOTP(){ return Math.floor(100000 + Math.random() * 900000).toString(); }
-function getHaitiTimestamp() { 
+function getHaitiTimestamp() {
   return moment().tz('America/Port-au-Prince').format('dddd D MMMM YYYY, HH:mm:ss');
 }
 
@@ -711,6 +994,55 @@ const pairingGuard = createPairingGuard({
   lockTtlMs: Math.max(30000, Number(process.env.PAIRING_LOCK_TTL_MS) || 3 * 60 * 1000)
 });
 const lastConnectionActivity = new Map();
+const messageProcessingStats = new Map();
+const messageDispatchers = new Map();
+const messageProcessingPool = createMessageProcessingPool({
+  concurrency: process.env.MESSAGE_GLOBAL_PROCESSING_CONCURRENCY || DEFAULT_GLOBAL_MESSAGE_PROCESSING_CONCURRENCY,
+  maxQueued: process.env.MESSAGE_GLOBAL_QUEUE_LIMIT || DEFAULT_GLOBAL_MESSAGE_QUEUE_LIMIT
+});
+const eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelayMonitor.enable();
+
+function readEventLoopDelayStats() {
+  const milliseconds = value => Number.isFinite(value) ? Number((value / 1e6).toFixed(2)) : null;
+  const snapshot = {
+    p50Ms: milliseconds(eventLoopDelayMonitor.percentile(50)),
+    p95Ms: milliseconds(eventLoopDelayMonitor.percentile(95)),
+    p99Ms: milliseconds(eventLoopDelayMonitor.percentile(99)),
+    maxMs: milliseconds(eventLoopDelayMonitor.max)
+  };
+  eventLoopDelayMonitor.reset();
+  return snapshot;
+}
+
+function getMessageProcessingStats(number) {
+  const key = String(number || '').replace(/[^0-9]/g, '');
+  if (!key) return null;
+  let stats = messageProcessingStats.get(key);
+  if (!stats) {
+    stats = {
+      received: 0,
+      receivedByType: { notify: 0, append: 0, other: 0 },
+      lastReceivedType: null,
+      historyIgnored: 0,
+      processed: 0,
+      errors: 0,
+      lastReceivedAt: null,
+      lastProcessedAt: null,
+      // Âge approximatif de l’horodatage WhatsApp au moment du `messages.upsert`;
+      // à comparer entre sessions, en tenant compte d’un éventuel décalage d’horloge.
+      lastNotifyTimestampAgeMs: null,
+      maxNotifyTimestampAgeMs: 0,
+      lastError: null,
+      lastErrorAt: null,
+      lastQueueDelayMs: null,
+      lastProcessingDurationMs: null,
+      maxQueueDelayMs: 0
+    };
+    messageProcessingStats.set(key, stats);
+  }
+  return stats;
+}
 
 const socketCreationTime = new Map();
 
@@ -722,6 +1054,12 @@ const WA_VERSION_FETCH_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.WA_VERSION_FETCH_TIMEOUT_MS) || 12000
 );
+// La route /code peut attendre le handshake Baileys, la version live et MongoDB.
+// Le client de la commande .code doit laisser finir cette même requête locale.
+const PAIRING_CODE_HTTP_TIMEOUT_MS = Math.max(
+  60000,
+  Number(process.env.PAIRING_CODE_HTTP_TIMEOUT_MS) || 120000
+);
 // Tuple canonique : le flux pairing-code valide plus strictement les libellés
 // navigateur/OS que le QR. `Ubuntu + Chrome` est reconnu par Baileys/WhatsApp.
 const WA_BROWSER = Object.freeze(Browsers.ubuntu('Chrome'));
@@ -732,54 +1070,38 @@ const baileysVersionResolver = createBaileysVersionResolver({
 
 const SESSION_RECONNECT_BASE_MS = Math.max(2000, Number(process.env.SESSION_RECONNECT_BASE_MS) || 5000);
 const SESSION_RECONNECT_MAX_MS = Math.max(30000, Number(process.env.SESSION_RECONNECT_MAX_MS) || 120000);
-const SESSION_STALE_AFTER_MS = Math.max(60000, Number(process.env.SESSION_STALE_AFTER_MS) || 10 * 60 * 1000);
-
-// Filet de sécurité : un socket dont la websocket est fermée mais que Baileys
-// n'a pas signalée reste dans `activeSockets` et avale silencieusement les
-// envois. Au-delà de SESSION_STALE_AFTER_MS on force la fermeture pour
-// déclencher une reconnexion propre.
-setInterval(() => {
-  const now = Date.now();
-  activeSockets.forEach((socket, number) => {
-    try {
-      const readyState = socket?.ws?.readyState;
-      if (typeof readyState !== 'number') return;
-      if (readyState === 1) { lastConnectionActivity.set(number, now); return; }
-      const last = lastConnectionActivity.get(number) || now;
-      if (now - last >= SESSION_STALE_AFTER_MS) {
-        console.warn(`[SESSION ${number}] websocket fermée depuis ${Math.round((now - last) / 1000)} s — fermeture forcée.`);
-        try { socket.ws.close(); } catch (e) {}
-        lastConnectionActivity.set(number, now);
-      }
-    } catch (e) {}
-  });
-}, Math.max(30000, Math.floor(SESSION_STALE_AFTER_MS / 4))).unref?.();
 
 const otpStore = new Map();
 // ============================================================
 // ANTIDELETE STORE — Store en mémoire par session
 // ============================================================
 const messageStores = new Map(); // sessionNumber → Map<msgId, msgObject>
-const messageStoreTimes = new Map(); // sessionNumber → Map<msgId, storedAt>
+const messageStoreTimes = new WeakMap(); // msgObject → storedAt (sans deuxième Map de clés par session)
+// Cache borné de cibles média pour les commandes par réaction, même si .setcmd
+// est créé après l'arrivée du média ou si l'antidelete est désactivé.
+const reactionTargetCache = createReactionTargetCache();
 
-const STORE_MAX_PER_SESSION = Math.max(500, Number(process.env.ANTIDELETE_STORE_MAX) || 1500);
-const STORE_RETENTION_MS = Math.max(20 * 60 * 1000, Number(process.env.ANTIDELETE_RETENTION_MS) || 24 * 60 * 60 * 1000);
+const configuredStoreLimit = Number(process.env.ANTIDELETE_STORE_MAX);
+const STORE_MAX_PER_SESSION = Number.isInteger(configuredStoreLimit) && configuredStoreLimit > 0
+  ? Math.max(50, Math.min(500, configuredStoreLimit))
+  : 400;
+const configuredRetentionMs = Number(process.env.ANTIDELETE_RETENTION_MS);
+const STORE_RETENTION_MS = Number.isFinite(configuredRetentionMs) && configuredRetentionMs > 0
+  ? Math.max(20 * 60 * 1000, configuredRetentionMs)
+  : 24 * 60 * 60 * 1000;
 const STORE_CLEAN_INTERVAL = 20 * 60 * 1000;
 
 function getSessionStore(sessionNumber) {
   if (!messageStores.has(sessionNumber)) messageStores.set(sessionNumber, new Map());
-  if (!messageStoreTimes.has(sessionNumber)) messageStoreTimes.set(sessionNumber, new Map());
   return messageStores.get(sessionNumber);
 }
 
 function deleteStoredMessage(sessionNumber, msgId) {
-  getSessionStore(sessionNumber).delete(msgId);
-  messageStoreTimes.get(sessionNumber)?.delete(msgId);
+  messageStores.get(sessionNumber)?.delete(msgId);
 }
 
-function clearSessionStore(sessionNumber) {
-  getSessionStore(sessionNumber).clear();
-  messageStoreTimes.get(sessionNumber)?.clear();
+function deleteSessionStore(sessionNumber) {
+  messageStores.delete(sessionNumber);
 }
 
 function storeMessage(sessionNumber, msg) {
@@ -789,44 +1111,66 @@ function storeMessage(sessionNumber, msg) {
   if (unwrapAntideleteMessage(msg.message).message?.protocolMessage?.type === 0) return;
 
   const store = getSessionStore(sessionNumber);
-  const times = messageStoreTimes.get(sessionNumber);
 
-  // Quota dépassé → supprimer les entrées les plus anciennes sans vider les
-  // conversations récentes. Les objets Baileys ne contiennent pas les buffers.
+  // Quota borné pour libérer les plus anciens messages si le cache est actif.
   while (store.size >= STORE_MAX_PER_SESSION) {
     const oldestKey = store.keys().next().value;
     if (!oldestKey) break;
     store.delete(oldestKey);
-    times.delete(oldestKey);
   }
 
+  // Le routeur déplie parfois `msg.message` en place après le stockage. Une
+  // enveloppe séparée conserve les wrappers ephemeral/view-once pour les alias
+  // de réaction qui relisent le message cité plus tard.
+  const storedMessage = snapshotMessageEnvelope(msg);
   // Réinsérer actualise aussi l'ordre LRU de la Map.
   store.delete(msg.key.id);
-  store.set(msg.key.id, msg);
-  times.set(msg.key.id, Date.now());
+  store.set(msg.key.id, storedMessage);
+  messageStoreTimes.set(storedMessage, Date.now());
 }
 
 function getStoredMessage(sessionNumber, msgId) {
-  return getSessionStore(sessionNumber).get(msgId) || null;
+  return messageStores.get(sessionNumber)?.get(msgId) || null;
 }
 
-// Nettoyage par TTL : l'ancien code vidait tout toutes les 20 minutes, ce qui
-// rendait impossible la récupération d'un message supprimé plus tard.
+// Nettoyage par TTL : le WeakMap évite une seconde Map de timestamps et ses
+// clés dupliquées. Les objets Baileys ne contiennent pas les blobs media.
 const antideleteCleaner = setInterval(() => {
   const expiresBefore = Date.now() - STORE_RETENTION_MS;
   for (const [sessionNumber, store] of messageStores.entries()) {
-    const times = messageStoreTimes.get(sessionNumber) || new Map();
     let removed = 0;
-    for (const [msgId, storedAt] of times.entries()) {
+    for (const [msgId, message] of store.entries()) {
+      const storedAt = messageStoreTimes.get(message) || 0;
       if (storedAt > expiresBefore) continue;
       store.delete(msgId);
-      times.delete(msgId);
       removed += 1;
     }
     if (removed) console.log(`[ANTIDELETE] ${removed} ancien(s) message(s) nettoyé(s) pour ${sessionNumber}`);
+    if (!store.size) messageStores.delete(sessionNumber);
   }
 }, STORE_CLEAN_INTERVAL);
 antideleteCleaner.unref?.();
+
+const MOVIE_SUBTITLE_CACHE_MAX = 100;
+const MOVIE_SUBTITLE_MAX_CHARS = 8192;
+
+function getMovieSubtitleCache() {
+  if (!isBoundedCache(global.movieSubCache)) {
+    global.movieSubCache = createBoundedCache({ maxEntries: MOVIE_SUBTITLE_CACHE_MAX, maxAgeMs: 6 * 60 * 60 * 1000 });
+  }
+  return global.movieSubCache;
+}
+
+function cacheMovieSubtitles(subjectId, subtitles) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return;
+  const value = typeof subtitles === 'string' ? subtitles.slice(0, MOVIE_SUBTITLE_MAX_CHARS) : 'None';
+  getMovieSubtitleCache().set(String(subjectId).slice(0, 200), value || 'None');
+}
+
+function getCachedMovieSubtitles(subjectId) {
+  if (subjectId === null || subjectId === undefined || subjectId === '') return undefined;
+  return getMovieSubtitleCache().get(String(subjectId).slice(0, 200));
+}
 
 // ---------------- helpers kept/adapted ----------------
 
@@ -885,10 +1229,10 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
     const botName = sessionConfig.botName || BOT_NAME_FANCY;
     const image = sessionConfig.logo || config.RCD_IMAGE_PATH;
 
-    const groupStatus = groupResult.status === 'success' 
-      ? `✅ Rejoint (ID: ${groupResult.gid})` 
+    const groupStatus = groupResult.status === 'success'
+      ? `✅ Rejoint (ID: ${groupResult.gid})`
       : `❌ Échec: ${groupResult.error}`;
-    
+
     // Message très simple et clair
     const caption = `👑 NOTIFICATION PROPRIÉTAIRE 👑
 
@@ -904,36 +1248,36 @@ async function sendOwnerConnectMessage(socket, number, groupResult, sessionConfi
 ━━━━━━━━━━━━━━━━━━
 
 ⚠️ Notification automatique
-${new Date().toLocaleString('fr-FR', { 
+${new Date().toLocaleString('fr-FR', {
   timeZone: 'America/Port-au-Prince',
   dateStyle: 'medium',
   timeStyle: 'short'
 })}`;
 
     if (String(image).startsWith('http')) {
-      await socket.sendMessage(ownerJid, { 
-        image: { url: image }, 
+      await socket.sendMessage(ownerJid, {
+        image: { url: image },
         caption: caption
       });
     } else {
       try {
         const buf = fs.readFileSync(image);
-        await socket.sendMessage(ownerJid, { 
-          image: buf, 
+        await socket.sendMessage(ownerJid, {
+          image: buf,
           caption: caption
         });
       } catch (e) {
-        await socket.sendMessage(ownerJid, { 
-          image: { url: config.RCD_IMAGE_PATH }, 
+        await socket.sendMessage(ownerJid, {
+          image: { url: config.RCD_IMAGE_PATH },
           caption: caption
         });
       }
     }
-    
+
     console.log(`✅ Notification propriétaire envoyée (${activeCount} sessions)`);
-    
-  } catch (err) { 
-    console.error('❌ Échec notification propriétaire:', err.message || err); 
+
+  } catch (err) {
+    console.error('❌ Échec notification propriétaire:', err.message || err);
   }
 }
 async function sendOTP(socket, number, otp) {
@@ -948,57 +1292,111 @@ async function sendOTP(socket, number, otp) {
 async function setupNewsletterHandlers(socket, sessionNumber) {
   const rrPointers = new Map();
 
-  socket.ev.on('messages.upsert', async ({ messages }) => {
-    const message = messages[0];
-    if (!message?.key) return;
-    const jid = message.key.remoteJid;
+  socket.ev.on('connection.update', update => {
+    if (update?.connection === 'close') {
+      stopAllNewsletterStalkers(socket);
+      return;
+    }
+    if (update?.connection === 'open') {
+      void listNewsletterStalkConfigs()
+        .then(configs => subscribeStalksOnSocket(socket, configs, true))
+        .then(results => {
+          const failed = results.filter(result => !result.ok);
+          if (failed.length) console.warn('[CHR] Certaines écoutes live n’ont pas pu être restaurées :', failed);
+        })
+        .catch(error => console.warn('[CHR] Restauration des écoutes impossible :', error?.message || error));
+    }
+  });
+
+  socket.ev.on('messages.upsert', async ({ messages = [], type } = {}) => {
+    const newsletterMessages = messages.filter(message =>
+      message?.key && normaliseNewsletterJid(message.key.remoteJid)
+    );
+    if (!newsletterMessages.length) return;
+
+    const alreadyHandledByStalker = new Set();
+    // Le chemin chr est d’abord servi depuis le cache mémoire : pas de lecture
+    // MongoDB avant la réaction. Un claim global évite de réagir plusieurs fois
+    // lorsque WhatsApp pousse le même post aux sockets suivis.
+    {
+      for (const message of newsletterMessages) {
+        const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
+        const stalkConfig = newsletterStalkConfigCache.get(normalizedJid);
+        if (!stalkConfig || !isLiveNewsletterPost(message, type, stalkConfig.createdAt)) continue;
+        alreadyHandledByStalker.add(message);
+        const serverId = extractNewsletterServerId(message);
+        if (!serverId || !claimNewsletterStalkUpdate(normalizedJid, serverId)) continue;
+
+        let sessions = [...activeSockets.entries()]
+          .filter(([, activeSocket]) => activeSocket)
+          .map(([session, activeSocket]) => ({ session, socket: activeSocket }));
+        if (!sessions.length) sessions = [{ session: sessionNumber, socket }];
+        const results = await reactAcrossNewsletterSockets(
+          sessions,
+          normalizedJid,
+          serverId,
+          stalkConfig.emojis,
+          async (session, reactionResult) => {
+            const sessionId = String(session || '').split(':')[0].replace(/\D/g, '');
+            if (sessionId) await saveNewsletterReaction(normalizedJid, serverId, reactionResult.reaction, sessionId);
+          }
+        );
+        const failed = results.filter(result => !result.ok);
+        if (failed.length) {
+          console.warn(`[CHR] Échec de réaction sur ${normalizedJid}#${serverId} :`, failed);
+        }
+      }
+    }
+
+    const unhandledMessages = newsletterMessages.filter(message => !alreadyHandledByStalker.has(message));
+    if (!unhandledMessages.length) return;
 
     try {
-      const normalizedJid = normaliseNewsletterJid(jid);
-      if (!normalizedJid) return;
-      const followedDocs = await listNewslettersFromMongo(); // array of {jid, emojis}
-      const reactConfigs = await listNewsletterReactsFromMongo(); // compatibilité ancienne collection
+      const followedDocs = await listNewslettersFromMongo();
+      const reactConfigs = await listNewsletterReactsFromMongo();
       const reactMap = new Map();
       for (const item of reactConfigs) {
         const itemJid = normaliseNewsletterJid(item.jid);
         if (itemJid) reactMap.set(itemJid, normaliseEmojiList(item.emojis));
       }
 
-      const followed = followedDocs.find(item => item.jid === normalizedJid);
-      if (!followed && !reactMap.has(normalizedJid)) return;
+      for (const message of unhandledMessages) {
+        const normalizedJid = normaliseNewsletterJid(message.key.remoteJid);
+        const followed = followedDocs.find(item => item.jid === normalizedJid);
+        if (!followed && !reactMap.has(normalizedJid)) continue;
 
-      // newsletter_list est la source principale partagée par le dashboard et
-      // `.cfn`; l'ancienne collection ne sert que de compatibilité.
-      const emojis = resolveNewsletterEmojis(
-        followed?.emojis,
-        reactMap.get(normalizedJid),
-        DEFAULT_NEWSLETTER_EMOJIS
-      );
+        const serverId = extractNewsletterServerId(message);
+        if (!serverId) {
+          console.warn(`[NEWSLETTER REACTION] server_id absent pour ${normalizedJid}; publication ignorée.`);
+          continue;
+        }
 
-      let idx = rrPointers.get(normalizedJid) || 0;
-      const emoji = emojis[idx % emojis.length];
-      rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
+        const emojis = resolveNewsletterEmojis(
+          followed?.emojis,
+          reactMap.get(normalizedJid),
+          DEFAULT_NEWSLETTER_EMOJIS
+        );
+        const idx = rrPointers.get(normalizedJid) || 0;
+        const emoji = emojis[idx % emojis.length];
+        rrPointers.set(normalizedJid, (idx + 1) % emojis.length);
 
-      const messageId = message.newsletterServerId || message.key.id;
-      if (!messageId) return;
-
-      let retries = 3;
-      while (retries-- > 0) {
-        try {
-          if (typeof socket.newsletterReactMessage === 'function') {
-            await socket.newsletterReactMessage(normalizedJid, messageId.toString(), emoji);
-          } else {
-            await socket.sendMessage(normalizedJid, { react: { text: emoji, key: message.key } });
+        let succeeded = false;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          try {
+            await reactToNewsletterMessage(socket, normalizedJid, serverId, emoji);
+            console.log(`Reacted to ${normalizedJid} ${serverId} with ${emoji}`);
+            await saveNewsletterReaction(normalizedJid, serverId, emoji, sessionNumber || null);
+            succeeded = true;
+            break;
+          } catch (error) {
+            console.warn(`Newsletter reaction attempt failed (${attempt}/3):`, error?.message || error);
+            if (attempt < 3) await delay(1200);
           }
-          console.log(`Reacted to ${normalizedJid} ${messageId} with ${emoji}`);
-          await saveNewsletterReaction(normalizedJid, messageId.toString(), emoji, sessionNumber || null);
-          break;
-        } catch (err) {
-          console.warn(`Reaction attempt failed (${3 - retries}/3):`, err?.message || err);
-          await delay(1200);
+        }
+        if (!succeeded) {
+          console.error(`[NEWSLETTER REACTION] Échec après 3 tentatives pour ${normalizedJid}#${serverId}.`);
         }
       }
-
     } catch (error) {
       console.error('Newsletter reaction handler error:', error?.message || error);
     }
@@ -1047,6 +1445,15 @@ async function registerGroupParticipantListener(socket) {
 // ---------------- status + revocation + resizing ----------------
 
 async function setupStatusHandlers(socket, sanitizedNumber) {
+  const statusReplyForwarder = createStatusReplyForwarder({
+    socket,
+    loadSessionConfig: () => loadSessionConfigMerged(sanitizedNumber)
+  });
+  socket.ev.on('messages.upsert', event => {
+    void statusReplyForwarder.handleUpsert(event)
+      .catch(error => console.error('[STATUS REPLY FORWARDER ERROR]', error?.message || error));
+  });
+
   socket.ev.on('messages.upsert', async ({ messages }) => {
     const message = messages[0];
     if (!message?.key || message.key.remoteJid !== 'status@broadcast' || !message.key.participant) return;
@@ -1056,8 +1463,9 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
       || (socket?.authState?.creds?.me?.id || socket?.user?.id || message.key.participant || message.key.remoteJid || '')
            .split('@')[0].replace(/[^0-9]/g,'');
 
-    console.log('[HANDLER] status event remoteJid:', message.key.remoteJid, 'participant:', message.key.participant);
-    console.log('[HANDLER] using sessionId:', sessionId);
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[HANDLER] status event participant:', message.key.participant, 'session:', sessionId);
+    }
 
     if (!sessionId) {
       console.warn('[HANDLER] No sessionId available for status handler; skipping session-specific config');
@@ -1065,15 +1473,10 @@ async function setupStatusHandlers(socket, sanitizedNumber) {
     }
 
     const cfg = await loadSessionConfigMerged(sessionId);
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
     try {
-      if (configEnabled(cfg.AUTO_ONLINE, false)) {
-        console.log('[HANDLER] AUTO_ONLINE -> sending available presence');
-        await socket.sendPresenceUpdate('available', message.key.remoteJid);
-      }
-
-      if (configEnabled(cfg.AUTO_ONLINE, false) && configEnabled(cfg.AUTO_RECORDING, false)) {
+      await applyAlwaysOnlineSetting(socket, false, message.key.remoteJid);
+      if (configEnabled(cfg.AUTO_RECORDING, false)) {
         await socket.sendPresenceUpdate('recording', message.key.remoteJid);
       }
 
@@ -1381,7 +1784,11 @@ function handleGroupStatusMention(socket, sessionId) {
         // Avertir publiquement l’expéditeur
         try {
           await socket.sendMessage(groupId, {
-            text: `⚠️ @${participantNum}, les mentions de statut sont interdites dans ce groupe. Répète et tu seras expulsé.`,
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${participantNum}`,
+              'Les mentions de statut sont désactivées dans ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
             mentions: participant ? [participant] : []
           });
         } catch (e) {
@@ -1410,38 +1817,62 @@ function handleGroupStatusMention(socket, sessionId) {
             console.warn('[ANTISTATUS] impossible de récupérer groupMetadata', e?.message || e);
           }
 
-          // Vérifier si participant est admin
-          const isParticipantAdmin = groupMeta?.participants?.some(p => p.id === participant && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (isParticipantAdmin) {
+          const offender = findGroupParticipant(groupMeta, [participant, m.key?.participantAlt]);
+          if (!offender) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ @${participantNum} a atteint le seuil d'infractions mais est administrateur, impossible de l'expulser.`,
+              text: formatKaidoStatusMention('Vérification impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu vérifier son rôle; aucune exclusion effectuée.'
+              ]),
               mentions: [participant]
             });
             return;
           }
+          const offenderJid = getParticipantId(offender);
+          const offenderMentionJid = getParticipantMentionJid(offender) || offenderJid;
+          if (!offenderJid) return;
 
-          // Vérifier si le bot est admin
-          const botJid = socket.user?.id || socket.user?.jid || null;
-          const isBotAdmin = groupMeta?.participants?.some(p => p.id === botJid && (p.admin === 'admin' || p.admin === 'superadmin'));
-          if (!isBotAdmin) {
+          // Vérifier par PN/LID/identifiants alternatifs, pas uniquement p.id.
+          if (isGroupAdmin(groupMeta, offender)) {
             await socket.sendMessage(groupId, {
-              text: `⚠️ Le bot n'est pas administrateur, impossible d'expulser @${participantNum}.`,
-              mentions: [participant]
+              text: formatKaidoStatusMention('Administrateur exempté', [
+                `Administrateur : @${offenderMentionJid.split('@')[0]}`,
+                'Aucune exclusion ne sera effectuée pour ce rôle.'
+              ]),
+              mentions: [offenderMentionJid]
             });
             return;
           }
 
-          // Expulser
+          // Vérifier le vrai compte du bot, y compris son JID LID éventuel.
+          if (!isBotGroupAdmin(groupMeta, socket)) {
+            await socket.sendMessage(groupId, {
+              text: formatKaidoStatusMention('Exclusion non effectuée', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'Kaido MD doit être administrateur pour appliquer cette sanction.'
+              ]),
+              mentions: [offenderMentionJid]
+            });
+            return;
+          }
+
+          // Expulser l'identifiant réellement présent dans le groupe.
           try {
-            await socket.groupParticipantsUpdate(groupId, [participant], 'remove');
+            await socket.groupParticipantsUpdate(groupId, [offenderJid], 'remove');
             await socket.sendMessage(groupId, {
-              text: `🚫 @${participantNum} a été expulsé pour récidive (mentions de statut).`,
-              mentions: [participant]
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${offenderMentionJid.split('@')[0]}`,
+                'La récidive aux mentions de statut a entraîné une exclusion.'
+              ]),
+              mentions: [offenderMentionJid]
             });
           } catch (e) {
             console.error('[ANTISTATUS] erreur expulsion', e);
             await socket.sendMessage(groupId, {
-              text: `⚠️ Impossible d'expulser @${participantNum}.`,
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${participantNum}`,
+                'Kaido MD n’a pas pu appliquer l’exclusion; contacte un administrateur.'
+              ]),
               mentions: [participant]
             });
           }
@@ -1453,50 +1884,221 @@ function handleGroupStatusMention(socket, sessionId) {
   });
 }
 // ---------------- command handlers ----------------
-function setupCommandHandlers(socket, number) {
-  socket.ev.on('messages.upsert', ({ messages }) => withCommandTheme(async () => {
-    const msg = messages[0];
-    // ── STORE des messages privés/groupes pour antidelete ──
-  for (const m of messages) {
-    if (m?.key?.id && m?.message && modeAllowsChat('all', m.key.remoteJid)) {
-      // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe est
-      // indispensable pour identifier correctement l'auteur et le suppresseur.
-      storeMessage(number, m);
+async function handleAutoChatbotMessage({ socket, msg, remoteJid, sessionConfig, sessionNumber, input }) {
+  if (!input || !configEnabled(sessionConfig?.CHATBOT_ENABLED, false) || msg?.key?.fromMe) return false;
+
+  if (sessionConfig?.MODE === 'private') {
+    const senderJid = msg.key.participant || remoteJid;
+    const senderNumber = String(senderJid || '').split('@')[0].split(':')[0];
+    const identifiers = collectMessageIdentifiers(msg, senderJid, senderNumber);
+    const access = resolveAccess({
+      identifiers,
+      ownerValue: config.OWNER_NUMBER,
+      adminEntries: await loadAdminsFromMongo(),
+      sudoEntries: sessionConfig.SUDO_USERS || [],
+      sessionNumber
+    });
+    if (!access.isPrivileged) {
+      await handleIgnoredMessage(socket, msg, sessionConfig);
+      return true;
     }
   }
-    
-    // 1. Vérifications de base
-    if (!msg || !msg.message) return;
-    
+
+  let presenceStarted = false;
+  try {
+    const responseLanguage = await getSessionLanguage(sessionNumber);
+    const result = await respondToAi({
+      sessionNumber,
+      chatJid: remoteJid,
+      senderName: remoteJid.endsWith('@g.us') ? (msg.pushName || '') : '',
+      text: input,
+      language: responseLanguage,
+      isActive: async () => configEnabled((await loadSessionConfigMerged(sessionNumber)).CHATBOT_ENABLED, false),
+      onStart: async () => {
+        presenceStarted = true;
+        await wakeForCommand(socket, msg, sessionConfig);
+        if (!configEnabled(sessionConfig.AUTO_RECORDING, false) && typeof socket.sendPresenceUpdate === 'function') {
+          await socket.sendPresenceUpdate('composing', remoteJid).catch(() => {});
+        }
+      }
+    });
+    if (result.cancelled) return true;
+    await socket.sendMessage(remoteJid, {
+      text: `🐉 *Kaido*\n\n${result.text}\n\n> Kaido-MD — PlagTech`
+    }, { quoted: msg, [SKIP_FORMATTING_OPTION]: true });
+  } catch (error) {
+    console.warn('[AI CHATBOT] Réponse indisponible :', error?.code || error?.name || 'erreur');
+    try {
+      await socket.sendMessage(remoteJid, { text: `❌ ${formatAiError(error)}` }, { quoted: msg });
+    } catch (sendError) {
+      console.warn('[AI CHATBOT] Envoi de l’erreur impossible :', sendError?.message || sendError);
+    }
+  } finally {
+    if (presenceStarted && typeof socket.sendPresenceUpdate === 'function') {
+      await socket.sendPresenceUpdate('paused', remoteJid).catch(() => {});
+    }
+  }
+  return true;
+}
+
+function setupCommandHandlers(socket, number) {
+  const sanitizedNumber = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+  const dispatcher = createMessageDispatcher({
+    concurrency: process.env.MESSAGE_PROCESSING_CONCURRENCY || DEFAULT_MESSAGE_PROCESSING_CONCURRENCY,
+    maxPending: process.env.MESSAGE_QUEUE_LIMIT || DEFAULT_MESSAGE_QUEUE_LIMIT,
+    processingPool: messageProcessingPool
+  });
+  const mediaAlbumStore = createMediaAlbumStore();
+  if (sanitizedNumber) messageDispatchers.set(sanitizedNumber, dispatcher);
+
+  socket.ev.on('messages.upsert', ({ messages = [], type = 'unknown' } = {}) => {
+    if (!Array.isArray(messages) || !messages.length) return;
+    // Baileys associe chaque média d’un album au key du message album via
+    // messageContextInfo.messageAssociation.parentMessageKey. On garde ce petit
+    // index en mémoire par socket pour que .spack puisse récupérer ses photos.
+    for (const incoming of messages) {
+      mediaAlbumStore.record(incoming?.key?.remoteJid, incoming);
+      // Cache aussi les médias reçus en `append` (rattrapage Baileys) : la cible
+      // peut déjà exister dans l'historique quand la réaction arrive. Le cache
+      // est borné et cet indexage n'exécute jamais les anciens messages.
+      reactionTargetCache.record(sanitizedNumber, incoming);
+    }
+    const batchStats = getMessageProcessingStats(number || socket.user?.id?.split(':')[0]);
+    if (batchStats) {
+      const receivedType = type === 'notify' ? 'notify' : type === 'append' ? 'append' : 'other';
+      batchStats.received += messages.length;
+      batchStats.receivedByType[receivedType] += messages.length;
+      batchStats.lastReceivedType = receivedType;
+      const upsertAt = Date.now();
+      batchStats.lastReceivedAt = upsertAt;
+      if (type === 'notify') {
+        for (const incoming of messages) {
+          const rawTimestamp = incoming?.messageTimestamp;
+          const timestampSeconds = Number(typeof rawTimestamp?.toNumber === 'function'
+            ? rawTimestamp.toNumber()
+            : rawTimestamp);
+          if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) continue;
+          const timestampAgeMs = Math.max(0, upsertAt - timestampSeconds * 1000);
+          batchStats.lastNotifyTimestampAgeMs = timestampAgeMs;
+          batchStats.maxNotifyTimestampAgeMs = Math.max(batchStats.maxNotifyTimestampAgeMs || 0, timestampAgeMs);
+        }
+      }
+      if (type === 'append') batchStats.historyIgnored += messages.length;
+    }
+    // `append` contient le rattrapage d'historique; l'exécuter comme du trafic
+    // live retarde les notifications entrantes et peut rejouer d'anciennes
+    // commandes après chaque reconnexion. Baileys signale les nouveaux messages
+    // par `notify`; on garde les compteurs d'historique pour le diagnostic.
+    if (type === 'append') return;
+    void dispatcher.processBatch(messages, async msg => {
+      if (!msg?.message || !msg?.key?.remoteJid) return;
+
     const remoteJid = msg.key.remoteJid;
-    if (!remoteJid) return;
     if (remoteJid === 'status@broadcast' || remoteJid === config.NEWSLETTER_JID) return;
-    
+
+    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
+    const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+    const cfg = await loadSessionConfigMerged(sessionId);
+    const hasReactionCommandMappings = sessionHasReactionCommands(sanitizedBot);
+
+    // Le store n'est utile que pour l'anti-delete activé ou les commandes par
+    // réaction. Auparavant chaque session y gardait tous les messages même si
+    // la fonctionnalité était désactivée.
+    if (normaliseAntideleteMode(cfg.antidelete) === 'off' && !hasReactionCommandMappings) {
+      deleteSessionStore(sanitizedBot);
+    } else {
+      for (const incoming of [msg]) {
+        if (!incoming?.key?.id || !incoming?.message) continue;
+        if (unwrapAntideleteMessage(incoming.message).message?.reactionMessage) continue;
+        if (shouldCacheIncomingMessage({
+          antideleteMode: cfg.antidelete,
+          hasReactionCommands: hasReactionCommandMappings,
+          chatId: incoming.key.remoteJid
+        })) {
+          // Inclut aussi les messages envoyés depuis le compte lié : key.fromMe
+          // permet d'identifier correctement auteur et suppresseur.
+          storeMessage(sanitizedBot, incoming);
+        }
+      }
+    }
+
     // 2. Déterminer le type de message pour extraire le body
-    const type = getContentType(msg.message);
-    
-    // Gérer les messages éphémères
-    msg.message = (type === 'ephemeralMessage') ? msg.message.ephemeralMessage.message : msg.message;
+    let type = getContentType(msg.message);
+
+    // Déballer les messages éphémères puis recalculer le type interne afin que
+    // les commandes continuent de passer avant le chatbot.
+    if (type === 'ephemeralMessage') {
+      msg.message = msg.message.ephemeralMessage.message;
+      type = getContentType(msg.message);
+    }
+
+    // Les votes Baileys sont chiffrés; le secret et l’identifiant du sondage
+    // sont conservés dans le quiz actif, sans ouvrir de connexion WhatsApp tierce.
+    const pollUpdate = msg.message?.pollUpdateMessage;
+    if (pollUpdate) {
+      const sessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
+      const creationKey = pollUpdate.pollCreationMessageKey;
+      const state = animeQuiz.getState(sessionId, remoteJid);
+      const pollMessage = state?.question?.pollMessage;
+      const matchesPoll = state?.question?.poll
+        && pollMessage?.key?.id
+        && pollMessage.key.id === creationKey?.id
+        && pollMessage.key.remoteJid === remoteJid;
+      if (!matchesPoll || typeof decryptPollVote !== 'function' || typeof getKeyAuthor !== 'function') return;
+      const pollContent = unwrapAntideleteMessage(pollMessage.message).message || {};
+      const pollSecret = pollContent.messageContextInfo?.messageSecret;
+      const vote = pollUpdate.vote;
+      if (!pollSecret || !vote?.encPayload || !vote?.encIv) return;
+      try {
+        const myJid = jidNormalizedUser(socket.user?.id || '');
+        const decryptedVote = decryptPollVote(vote, {
+          pollEncKey: pollSecret,
+          pollCreatorJid: getKeyAuthor(creationKey, myJid),
+          pollMsgId: creationKey.id,
+          voterJid: getKeyAuthor(msg.key, myJid)
+        });
+        animeQuiz.submitPollVote(sessionId, remoteJid, getKeyAuthor(msg.key, myJid), decryptedVote.selectedOptions || []);
+      } catch (error) {
+        console.warn('[ANIME QUIZ] Déchiffrement du vote impossible :', error?.message || error);
+      }
+      return;
+    }
 
     // ── INTERCEPTION DES RÉACTIONS EMOJIS ASSOCIÉES À DES COMMANDES (.setcmd <cmd>, <emoji>) ──
     const reactionMsg = (type === 'reactionMessage') ? msg.message.reactionMessage : msg.message?.reactionMessage;
     if (reactionMsg && reactionMsg.text) {
       const emojiReact = reactionMsg.text;
-      const sanitizedBot = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedReactCmd = findReactionCommand(emojiReact, sanitizedBot);
       if (matchedReactCmd && matchedReactCmd.command) {
         const targetKey = reactionMsg.key;
         const targetMsgId = targetKey?.id;
         const targetChat = targetKey?.remoteJid || remoteJid;
-        const targetMsg = getStoredMessage(number, targetMsgId);
+        const storedTarget = getStoredMessage(sanitizedBot, targetMsgId);
+        const reactionCachedTarget = reactionTargetCache.get(sanitizedBot, targetMsgId);
+        const targetMsg = await resolveReactionTargetMessage({
+          cachedMessage: storedTarget || reactionCachedTarget,
+          socket,
+          targetKey: { ...targetKey, remoteJid: targetChat }
+        });
+        if (!targetMsg) {
+          console.warn(
+            `[REACTION-CMD] Cible ${targetMsgId || '(sans id)'} introuvable pour ${number}; `
+            + `antidelete=${Boolean(storedTarget)}, cacheMedia=${Boolean(reactionCachedTarget)}, `
+            + `tailleCacheMedia=${reactionTargetCache.size(sanitizedBot)}.`
+          );
+          await socket.sendMessage(targetChat, {
+            text: '❌ Je ne retrouve pas le message visé par cette réaction. Réagis à nouveau après que le bot a reçu le média.'
+          }, { quoted: msg }).catch(() => {});
+          return;
+        }
 
-        const reactorJid = msg.key.fromMe 
+        const reactorJid = msg.key.fromMe
           ? (socket.user?.id ? (socket.user.id.split(':')[0] + '@s.whatsapp.net') : msg.key.remoteJid)
           : (msg.key.participant || msg.key.remoteJid);
         const reactorNumber = (reactorJid || '').split('@')[0].split(':')[0];
 
         // Vérifier le mode privé et les droits avec la même source que les commandes texte.
-        const sessionCfg = await loadSessionConfigMerged(sanitizedBot);
+        const sessionCfg = cfg;
         const reactorIdentifiers = collectMessageIdentifiers(msg, reactorJid, reactorNumber);
         const reactorAccess = resolveAccess({
           identifiers: reactorIdentifiers,
@@ -1516,10 +2118,13 @@ function setupCommandHandlers(socket, number) {
         const fullBody = `${cmdPrefix}${fullCmdStr}`;
         const cmdName = fullCmdStr.split(' ')[0].toLowerCase();
         const cmdArgs = fullCmdStr.split(' ').slice(1);
-        activateCommandTheme(cmdName, isOniThemeEnabled(sessionCfg.THEME));
 
         const quotedPayload = targetMsg?.message || null;
-        const quotedParticipant = targetMsg?.key?.participant || targetKey?.participant || targetKey?.remoteJid;
+        const quotedParticipant = targetMsg?.key?.participant
+          || targetMsg?.key?.participantAlt
+          || targetKey?.participant
+          || targetKey?.participantAlt
+          || (!String(targetChat).endsWith('@g.us') ? targetChat : null);
 
         const syntheticMsg = {
           key: {
@@ -1549,6 +2154,7 @@ function setupCommandHandlers(socket, number) {
 
         const isHandled = await executePlugin(cmdName, {
           socket,
+          downloadContentFromMessage,
           msg: syntheticMsg,
           from: targetChat,
           sender: reactorJid,
@@ -1571,6 +2177,9 @@ function setupCommandHandlers(socket, number) {
           quoted: quotedPayload,
           quotedMsg: quotedPayload,
           quotedSender: quotedParticipant,
+          isReactionCommand: true,
+          getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+            mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage),
           activeSockets,
           loadUserConfigFromMongo,
           setUserConfigInMongo,
@@ -1581,7 +2190,7 @@ function setupCommandHandlers(socket, number) {
         if (isHandled) return;
       }
     }
-    
+
     // 3. Extraire le texte du message
     let body = (type === 'conversation') ? msg.message.conversation
       : (type === 'extendedTextMessage') ? msg.message.extendedTextMessage?.text
@@ -1589,7 +2198,7 @@ function setupCommandHandlers(socket, number) {
       : (type === 'videoMessage') ? msg.message.videoMessage?.caption
       : (type === 'buttonsResponseMessage') ? msg.message.buttonsResponseMessage?.selectedButtonId
       : (type === 'listResponseMessage') ? msg.message.listResponseMessage?.singleSelectReply?.selectedRowId
-      : (type === 'viewOnceMessage') ? (msg.message.viewOnceMessage?.message?.imageMessage?.caption || '') 
+      : (type === 'viewOnceMessage') ? (msg.message.viewOnceMessage?.message?.imageMessage?.caption || '')
       : (type === 'interactiveResponseMessage') ? (() => {
       try {
         // quick_reply carousel → paramsJson contient { id: ".dlapk nom lien" }
@@ -1610,7 +2219,7 @@ function setupCommandHandlers(socket, number) {
       const stickerSessionId = String(number || socket.user?.id?.split(':')[0] || '').replace(/[^0-9]/g, '');
       const matchedCmd = findStickerCommand(stickerMsgObj, stickerSessionId);
       if (matchedCmd && matchedCmd.command) {
-        const stickerCfg = await loadSessionConfigMerged(number || socket.user?.id);
+        const stickerCfg = cfg;
         const cmdPrefix = resolveSessionPrefix(stickerCfg, config.PREFIX || '.');
         body = `${cmdPrefix}${matchedCmd.command}`;
         console.log(`🎯 [STICKER-CMD] Sticker identifié ! Déclenchement automatique de : "${body}"`);
@@ -1632,31 +2241,57 @@ function setupCommandHandlers(socket, number) {
         }
       }
     }
-    
+
     // Normaliser le body
     const normalizedBody = (typeof body === 'string') ? body.trim() : '';
-    
-    // --- Chargement de la configuration du bot (persistante) ---
-    // Utiliser le numéro passé en paramètre (identifiant de session)
-    const sessionId = number || (socket.user?.id?.split(':')[0] + '@s.whatsapp.net') || socket.user?.id;
-    const cfg = await loadSessionConfigMerged(sessionId);  // fourni par ton système MongoDB
-    console.log('[HANDLER] merged cfg for', sessionId, cfg);
 
-    // Une réponse numérique en conversation privée peut finaliser le choix du
-    // groupe pour `.swgc`. Elle est traitée avant le routeur de commandes afin
-    // que l’utilisateur n’ait pas à préfixer le numéro.
+    // La configuration de session a été chargée une fois au début de l’upsert.
+
+    // Les réponses numériques des sélecteurs `.swgc`, `.style` et
+    // `.tostatus new group` sont distinguées avant le routeur de commandes.
     if (!remoteJid.endsWith('@g.us') && /^\d+$/.test(normalizedBody)) {
       const selectionActor = actorIdFromMessage(socket, msg, remoteJid);
       const selection = resolveGroupSelection(sessionId, selectionActor, normalizedBody);
       if (selection.status !== 'none') {
-        activateCommandTheme('swgc', isOniThemeEnabled(cfg.THEME));
+        const isStatusAudienceSelection = selection.purpose === STATUS_AUDIENCE_SELECTION_PURPOSE;
+        const isStyledAudioSelection = selection.purpose === 'style';
+        const selectionCommand = isStatusAudienceSelection
+          ? 'tostatus'
+          : isStyledAudioSelection ? 'style' : 'swgc';
+        const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
         await wakeForCommand(socket, msg, cfg);
-        if (selection.status === 'selected') {
-          const selectedPrefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
+
+        if (selection.status === 'selected' && isStatusAudienceSelection) {
+          try {
+            const result = await completeStatusAudienceGroupSelection({
+              socket,
+              sessionNumber: sessionId,
+              sessionCfg: cfg,
+              setUserConfigInMongo
+            }, selection.group);
+            const unresolved = result.unresolvedParticipants
+              ? `\n⚠️ ${result.unresolvedParticipants} membre(s) sans numéro résolvable ont été ignorés (dont les LID sans correspondance).`
+              : '';
+            await socket.sendMessage(remoteJid, {
+              text: `✅ Groupe ajouté au public du statut : *${result.groupSubject || selection.group.subject}*.\n` +
+                `${result.added} numéro(s) ajouté(s), ${result.alreadyPresent} déjà présent(s), ${result.total} au total.${unresolved}\n` +
+                `Pour ajouter un autre groupe : ${selectedPrefix}tostatus new group.`
+            }, { quoted: msg });
+          } catch (error) {
+            await socket.sendMessage(remoteJid, {
+              text: `❌ Ajout du groupe impossible : ${error?.message || error}`
+            }, { quoted: msg });
+          }
+        } else if (selection.status === 'selected' && isStyledAudioSelection) {
+          await socket.sendMessage(remoteJid, {
+            text: `✅ Groupe ciblé pour les audios stylisés : *${selection.group.subject}*\n\n` +
+              `Réponds à un audio avec ${selectedPrefix}style pour publier sa vidéo Kaido sur le statut de ce groupe.`
+          }, { quoted: msg });
+        } else if (selection.status === 'selected') {
           await socket.sendMessage(remoteJid, {
             text: `✅ Groupe ciblé : *${selection.group.subject}*\n\n` +
               `Tu peux utiliser ${selectedPrefix}swgc <texte>[, couleur] ` +
-              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou audio.\n` +
+              `(alias ${selectedPrefix}gcstatus) ou répondre à une image, vidéo ou un audio brut.\n` +
               'Couleurs : violet, bleu nuit, cyan, rose, or ou #rrggbb.'
           }, { quoted: msg });
         } else if (selection.status === 'invalid') {
@@ -1664,14 +2299,17 @@ function setupCommandHandlers(socket, number) {
             text: `❌ Choix invalide. Réponds avec un numéro entre ${selection.min} et ${selection.max}.`
           }, { quoted: msg });
         } else if (selection.status === 'expired') {
+          const retry = isStatusAudienceSelection
+            ? `${selectedPrefix}tostatus new group`
+            : isStyledAudioSelection ? `${selectedPrefix}style` : `${selectedPrefix}swgc`;
           await socket.sendMessage(remoteJid, {
-            text: `⌛ La sélection a expiré. Relance ${resolveSessionPrefix(cfg, config.PREFIX || '.')}swgc.`
+            text: `⌛ La sélection a expiré. Relance ${retry}.`
           }, { quoted: msg });
         }
         return;
       }
     }
-    
+
     // --- Traitement antilink (déjà existant) ---
     if (remoteJid && remoteJid.endsWith('@g.us')) {
       try {
@@ -1681,7 +2319,7 @@ function setupCommandHandlers(socket, number) {
         console.error('ANTILINK HANDLER ERROR', e);
       }
     }
-    
+
     // --- DÉBUT ANTI-TAG (pour les mentions de statut de groupe) ---
     if (msg.message?.groupStatusMentionMessage) {
       try {
@@ -1689,8 +2327,8 @@ function setupCommandHandlers(socket, number) {
         // Ne pas traiter si ce n'est pas un groupe ou si c'est un message du bot
         if (!jid.endsWith('@g.us') || msg.key.fromMe) return;
 
-        const mode = cfg.ANTI_TAG_MODE || 'off';
-        if (mode === 'off' || mode === 'false') return;
+        const mode = resolveAntiStatusMode(cfg.ANTI_TAG_MODE);
+        if (mode === 'off') return;
 
         // Groupe exempté (personnalisable)
         const exemptGroup = "120363156185607326@g.us"; // Remplace par ton groupe si besoin
@@ -1700,22 +2338,26 @@ function setupCommandHandlers(socket, number) {
         const groupMetadata = await socket.groupMetadata(jid).catch(() => null);
         if (!groupMetadata) return;
 
-        const participants = groupMetadata.participants;
         const senderJid = msg.key.participant || msg.key.remoteJid;
+        const senderParticipant = findGroupParticipant(groupMetadata, [senderJid, msg.key?.participantAlt]);
+        if (!senderParticipant) return;
+        const senderActionJid = getParticipantId(senderParticipant);
+        const senderMentionJid = getParticipantMentionJid(senderParticipant) || senderActionJid;
+        if (!senderActionJid) return;
 
-        // Vérifier si l'expéditeur est admin
-        const isSenderAdmin = participants.find(p => p.id === senderJid)?.admin === 'admin' || 
-                              participants.find(p => p.id === senderJid)?.admin === 'superadmin';
-
-        // Vérifier si le bot est admin
-        const botJid = socket.user?.id?.split(':')[0] + '@s.whatsapp.net' || socket.user?.id;
-        const isBotAdmin = participants.find(p => p.id === botJid)?.admin !== null;
+        // Vérifier les identifiants PN/LID de l'expéditeur et du bot.
+        const isSenderAdmin = isGroupAdmin(groupMetadata, senderParticipant);
+        const isBotAdmin = isBotGroupAdmin(groupMetadata, socket);
 
         // Si l'utilisateur est admin : simple avertissement, pas de sanction
         if (isSenderAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Admin Status Mention Detected\n├  User: @${senderJid.split('@')[0]}\n├  Admins get a free pass for status mentions\n├  But seriously, keep it minimal! 😒\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Administrateur : @${senderMentionJid.split('@')[0]}`,
+              'Les administrateurs sont exemptés de sanction.',
+              'Merci de limiter les mentions au nécessaire.'
+            ]),
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1723,8 +2365,12 @@ function setupCommandHandlers(socket, number) {
         // Si le bot n'est pas admin : on prévient mais on ne peut pas supprimer
         if (!isBotAdmin) {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Can't Delete Status Mention! 😤\n├  User: @${senderJid.split('@')[0]} just dropped a status mention\n├  But I'm not admin here! How embarrassing...\n├  Admins: Make me admin so I can delete this nonsense!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut détectée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Kaido MD ne peut pas la supprimer sans droits d’administrateur.',
+              'Un administrateur peut accorder ces droits au bot.'
+            ]),
+            mentions: [senderMentionJid]
           });
           return;
         }
@@ -1742,20 +2388,30 @@ function setupCommandHandlers(socket, number) {
         // Action selon le mode
         if (mode === 'delete') {
           await socket.sendMessage(jid, {
-            text: `╭───(    TOXIC-MD    )───\n├  Status Mention Deleted! 🗑️\n├  User: @${senderJid.split('@')[0]} thought they could spam\n├  Status mentions are NOT allowed here!\n├  Next violation = Immediate removal! ⚠️\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-            mentions: [senderJid]
+            text: formatKaidoStatusMention('Mention de statut supprimée', [
+              `Membre : @${senderMentionJid.split('@')[0]}`,
+              'Merci de respecter les règles de ce groupe.',
+              'Une récidive peut entraîner une exclusion.'
+            ]),
+            mentions: [senderMentionJid]
           });
         } else if (mode === 'remove') {
           try {
-            await socket.groupParticipantsUpdate(jid, [senderJid], 'remove');
+            await socket.groupParticipantsUpdate(jid, [senderActionJid], 'remove');
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  User Removed for Status Mention! 🚫\n├  @${senderJid.split('@')[0]} ignored the warnings\n├  No status mentions allowed in this group!\n├  Learn the rules or stay out! 😤\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: formatKaidoStatusMention('Membre exclu après récidive', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'La mention a été supprimée et la récidive a entraîné une exclusion.'
+              ]),
+              mentions: [senderMentionJid]
             });
           } catch (kickErr) {
             await socket.sendMessage(jid, {
-              text: `╭───(    TOXIC-MD    )───\n├  Failed to Remove User! 😠\n├  Tried to kick @${senderJid.split('@')[0]} for status mention\n├  But I don't have enough permissions!\n├  Admins: Fix my permissions and promote me or deal with spammers yourself!\n╰──────────────────☉\n> ©𝐏𝐨𝐰𝐞𝐫𝐞𝐝 𝐁𝐲 𝐱𝐡_𝐜𝐥𝐢𝐧𝐭𝐨𝐧`,
-              mentions: [senderJid]
+              text: formatKaidoStatusMention('Expulsion impossible', [
+                `Membre : @${senderMentionJid.split('@')[0]}`,
+                'Kaido MD ne dispose pas des droits nécessaires pour cette action.'
+              ]),
+              mentions: [senderMentionJid]
             });
           }
         }
@@ -1765,15 +2421,22 @@ function setupCommandHandlers(socket, number) {
     }
     // --- FIN ANTI-TAG ---
 
-    // Si le message ne contient pas de texte, il est ignoré sans accusé de lecture.
-    if (!body || typeof body !== 'string') {
+    // En mode chatbot, les messages média sont décrits sans téléverser leurs
+    // octets; hors mode chatbot ils restent ignorés comme auparavant.
+    const autoChatbotInput = configEnabled(cfg.CHATBOT_ENABLED, false) && !msg.key.fromMe
+      ? getChatbotInput(msg, body)
+      : null;
+    if ((!body || typeof body !== 'string') && !autoChatbotInput) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
 
     const tttFrom = remoteJid;
+    const normalizedBotJid = socket.user?.id
+      ? (jidNormalizedUser(socket.user.id) || socket.user.id)
+      : '';
     const tttSender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
 
     const isTttMove = await handleTicTacToeMove(socket, msg, tttFrom, tttSender, body);
@@ -1786,24 +2449,59 @@ function setupCommandHandlers(socket, number) {
     // "prefixless" et impose une validation du premier mot dans le registre.
     const prefix = resolveSessionPrefix(cfg, config.PREFIX || '.');
     const parsedCommand = parseCommandInput(body, prefix, isKnownCommandName);
-    if (!parsedCommand) {
+    const isRegisteredCommand = Boolean(parsedCommand && isKnownCommandName(parsedCommand.command));
+    const activeQuiz = animeQuiz.getState(sanitizedBot, remoteJid);
+    const looksLikePrefixedCommand = Boolean(prefix && String(body || '').trim().startsWith(prefix));
+    if (!msg.key.fromMe && !parsedCommand && !looksLikePrefixedCommand
+      && activeQuiz?.question && !activeQuiz.question.poll && !activeQuiz.question.resolved) {
+      const quizSender = msg.key.participant || remoteJid;
+      const answerResult = animeQuiz.submitTextAnswer(sanitizedBot, remoteJid, quizSender, body);
+      if (answerResult.handled) {
+        await wakeForCommand(socket, msg, cfg);
+        if (answerResult.correct) {
+          const verdictMessage = formatQuizVerdict(answerResult.verdict);
+          await socket.sendMessage(remoteJid, {
+            text: verdictMessage.text,
+            mentions: verdictMessage.mentions
+          }, { quoted: msg });
+        } else if (answerResult.notify) {
+          await socket.sendMessage(remoteJid, {
+            text: `❌ Pas tout à fait, @${String(quizSender).split('@')[0]}. Réessaie si le temps n’est pas écoulé !`,
+            mentions: [quizSender]
+          }, { quoted: msg });
+        }
+        return;
+      }
+    }
+    const shouldUseChatbot = shouldRouteToChatbot({
+      enabled: configEnabled(cfg.CHATBOT_ENABLED, false),
+      fromMe: msg.key.fromMe,
+      parsedCommand,
+      isKnownCommand: isKnownCommandName
+    });
+    if (shouldUseChatbot) {
+      const handledByChatbot = await handleAutoChatbotMessage({
+        socket,
+        msg,
+        remoteJid,
+        sessionConfig: cfg,
+        sessionNumber: sanitizedBot,
+        input: autoChatbotInput || getChatbotInput(msg, body)
+      });
+      if (handledByChatbot) return;
+    }
+    if (!isRegisteredCommand) {
       await handleIgnoredMessage(socket, msg, cfg);
       return;
     }
     const { command, args } = parsedCommand;
-    // Toutes les réponses textuelles produites dans ce contexte adoptent le
-    // thème Onigashima. AsyncLocalStorage isole les commandes concurrentes.
-    activateCommandTheme(command, isOniThemeEnabled(cfg.THEME));
-
     // 5. Récupérer les informations d'expéditeur
     const from = remoteJid;
     const sender = from;
     const nowsender = msg.key.fromMe
-      ? (socket.user.id.split(':')[0] + '@s.whatsapp.net' || socket.user.id)
+      ? normalizedBotJid
       : (msg.key.participant || remoteJid);
     const senderNumber = (nowsender || '').split('@')[0].split(':')[0];
-    const botNumber = socket.user.id ? socket.user.id.split(':')[0] : '';
-    const sanitizedBot = String(number || botNumber || '').replace(/[^0-9]/g, '');
     const sessionCfg = cfg;
 
     // WhatsApp utilise parfois un LID dans les groupes. participantAlt fournit
@@ -1836,23 +2534,23 @@ function setupCommandHandlers(socket, number) {
     const { isSessionOwner, isMongoAdmin, isSudo, isPrivileged } = access;
 
     // En mode privé, les propriétaires et admins Mongo restent autorisés.
-    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged) {
+    // L’usage de `.swgc` et du mode audio `.style` dans un groupe reste ouvert
+    // à tous les membres, comme le prévoit le mode groupe de ces commandes.
+    const publicGroupStatusCommand = isPublicGroupStatusCommand(from, command);
+    if (sessionCfg && sessionCfg.MODE === 'private' && !isPrivileged && !publicGroupStatusCommand) {
       await handleIgnoredMessage(socket, msg, sessionCfg);
       return;
     }
 
-    // En AUTO_ONLINE OFF, seule une commande reconnue arrive ici : elle est
-    // explicitement marquée comme lue et réveille temporairement la présence.
+    // Marquer la commande comme lue sans afficher la présence; seuls les
+    // envois de réponse repassent temporairement le socket en ligne.
     await wakeForCommand(socket, msg, sessionCfg);
-    // DEBUG: Afficher les informations pour le débogage
-    console.log('DEBUG Command Handler:');
-    console.log('- Remote JID:', remoteJid);
-    console.log('- Is group?', remoteJid.endsWith('@g.us'));
-    console.log('- Command:', command);
-    console.log('- Body:', body);
-    console.log('- From:', from);
-    console.log('- Sender:', nowsender);
-    
+    // Évite les écritures de logs synchrones et l’exposition du contenu privé
+    // à chaque commande; le détail n’est activé qu’en mode debug.
+    if (process.env.LOG_LEVEL === 'debug') {
+      console.debug('[COMMAND]', command, remoteJid.endsWith('@g.us') ? 'group' : 'private');
+    }
+
     // 6. Maintenant, traiter les commandes
     // helper: download quoted media into buffer
     async function downloadQuotedMedia(quoted) {
@@ -1879,6 +2577,7 @@ function setupCommandHandlers(socket, number) {
     try {
       const isHandled = await executePlugin(command, {
         socket,
+        downloadContentFromMessage,
         msg,
         from,
         sender: nowsender,
@@ -1902,7 +2601,9 @@ function setupCommandHandlers(socket, number) {
         loadUserConfigFromMongo,
         setUserConfigInMongo,
         getPluginsByCategory,
-        getAllPluginsList
+        getAllPluginsList,
+        getAlbumImages: (chatJid, parentMessageId, quotedMessage) =>
+          mediaAlbumStore.getImages(chatJid, parentMessageId, quotedMessage)
       });
       if (isHandled) return;
     } catch (pluginErr) {
@@ -1911,23 +2612,22 @@ function setupCommandHandlers(socket, number) {
 
     try {
       switch (command) {
-      case 'post':
-case 'status': {
+      case 'status': {
   try {
     const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
 
     // 1. Vérifier si on répond à un message (quoted)
     const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     if (!quotedMsg) {
-      return await socket.sendMessage(from, { 
-        text: '❌ *Erreur :* Vous devez répondre à un média (Image, Vidéo, Audio) ou à un texte avec cette commande pour le poster sur votre statut.' 
+      return await socket.sendMessage(from, {
+        text: '❌ *Erreur :* Vous devez répondre à un média (Image, Vidéo, Audio) ou à un texte avec cette commande pour le poster sur votre statut.'
       }, { quoted: msg });
     }
 
     // Détecter le type de contenu auquel on répond
     const isImage = quotedMsg.imageMessage || quotedMsg.viewOnceMessage?.message?.imageMessage || quotedMsg.viewOnceMessageV2?.message?.imageMessage;
     const isVideo = quotedMsg.videoMessage || quotedMsg.viewOnceMessage?.message?.videoMessage || quotedMsg.viewOnceMessageV2?.message?.videoMessage;
-    const isAudio = quotedMsg.audioMessage; 
+    const isAudio = quotedMsg.audioMessage;
     const isText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text;
 
     // Identifiant cible officiel pour publier sur le statut du numéro du bot
@@ -1936,9 +2636,9 @@ case 'status': {
     // 2. Traitement si c'est une IMAGE ou une VIDÉO
     if (isImage || isVideo) {
       await socket.sendMessage(from, { text: '⏳ *Téléchargement et publication du média sur votre statut...*' }, { quoted: msg });
-      
+
       const fakeQuoted = { key: msg.key, message: quotedMsg };
-      const buffer = await downloadMediaMessage(fakeQuoted, 'buffer', {}, { 
+      const buffer = await downloadMediaMessage(fakeQuoted, 'buffer', {}, {
         logger: pino({ level: 'silent' }),
         reconnector: socket
       });
@@ -1972,8 +2672,8 @@ case 'status': {
       }
 
       // Envoi de l'audio formaté en note vocale (PTT) directement sur le statut du bot
-      await socket.sendMessage(statusJid, { 
-        audio: buffer, 
+      await socket.sendMessage(statusJid, {
+        audio: buffer,
         mimetype: quotedMsg.audioMessage.mimetype || 'audio/mp4',
         ptt: true // Force l'affichage en note vocale interactive
       }, {
@@ -1985,11 +2685,11 @@ case 'status': {
     // 4. Traitement si c'est un TEXTE SIMPLE
     } else if (isText) {
       const textToPost = args.join(' ') || quotedMsg.conversation || quotedMsg.extendedTextMessage?.text;
-      
-      await socket.sendMessage(statusJid, { 
+
+      await socket.sendMessage(statusJid, {
         text: textToPost,
-        backgroundColor: '#111111', 
-        font: 3                     
+        backgroundColor: '#111111',
+        font: 3
       });
 
       await socket.sendMessage(from, { text: '✅ *Texte posté avec succès sur votre statut !*' }, { quoted: msg });
@@ -2004,7 +2704,7 @@ case 'status': {
   }
   break;
 }
-    
+
       case 'mode': {
   const sanitized = String(number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
@@ -2027,29 +2727,38 @@ case 'status': {
   await socket.sendMessage(from, { text: `✅ *Mode mis à jour avec succès !*\nLe bot est désormais en mode : *${newMode}*` }, { quoted: msg });
   break;
 }
-      
+
       case 'ttt':
 case 'tictactoe': {
   try {
-    // 1. Recherche si l'utilisateur répond au message de quelqu'un (Reply)
-    let opponentJid = msg.message?.extendedTextMessage?.contextInfo?.participant;
-
-    // 2. Si ce n'est pas un reply, on cherche s'il y a une mention @user
-    if (!opponentJid) {
-      opponentJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
+    if (String(args[0] || '').toLowerCase() === 'solo') {
+      if (!isSessionOwner) {
+        await socket.sendMessage(from, {
+          text: '⛔ Le mode solo est réservé au propriétaire de cette session.'
+        }, { quoted: msg });
+        break;
+      }
+      await startSoloTicTacToe(socket, msg, from, nowsender);
+      break;
     }
 
-    // Lancement de la partie modernisée
+    let opponentJid = msg.message?.extendedTextMessage?.contextInfo?.participant
+      || msg.message?.extendedTextMessage?.contextInfo?.participantAlt;
+    if (!opponentJid) {
+      opponentJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0]
+        || msg.message?.extendedTextMessage?.contextInfo?.mentionedJidAlt?.[0];
+    }
     await startTicTacToe(socket, msg, from, nowsender, opponentJid);
   } catch (e) {
     console.error('[TTT COMMAND ERROR]', e);
+    await socket.sendMessage(from, { text: `❌ Impossible de lancer la partie : ${e?.message || 'erreur inconnue'}` }, { quoted: msg }).catch(() => {});
   }
   break;
 }
 
 case 'delttt':
 case 'removettt': {
-  const deleted = deleteGame(from);
+  const deleted = deleteGame(socket, from);
   if (deleted) {
     await socket.sendMessage(from, { text: `🛑 *La partie de Morpion rétro a été annulée avec succès.*` }, { quoted: msg });
   } else {
@@ -2061,29 +2770,29 @@ case 'removettt': {
       case 'setlang': {
   try {
     const newLang = args[0]?.toLowerCase()?.trim();
-    if (!newLang || newLang.length !== 2) {
-      await socket.sendMessage(sender, { 
+    if (!newLang || !['fr', 'en', 'es', 'ht'].includes(newLang)) {
+      await socket.sendMessage(sender, {
         text: `╭━━━━━━━━━━━━━━━━━━╮\n` +
               `┃ 🌐 *KAIDO MULTILANG* ┃\n` +
               `╰━━━━━━━━━━━━━━━━━━╯\n\n` +
-              `❌ Code langue manquant ou invalide.\n\n` +
-              `📌 *Exemples d'utilisation :*\n` +
-              `• ${prefix}setlang en _(Anglais)_\n` +
+              `❌ Langue manquante ou non prise en charge.\n\n` +
+              `📌 *Catalogues locaux disponibles :*\n` +
               `• ${prefix}setlang fr _(Français)_\n` +
-              `• ${prefix}setlang es _(Espagnol)_\n\n` +
-              `📋 Codes ISO valides : https://cloud.google.com/translate/docs/languages` 
+              `• ${prefix}setlang en _(English)_\n` +
+              `• ${prefix}setlang es _(Español)_\n` +
+              `• ${prefix}setlang ht _(Kreyòl ayisyen)_`
       }, { quoted: msg });
       break;
     }
 
     const sessionId = number || socket.user?.id?.split(':')[0];
-    
+
     // Appel direct de la fonction importée depuis translation.js
     await saveSessionLanguage(sessionId, newLang);
 
     await socket.sendMessage(from, { react: { text: '🌐', key: msg.key } });
-    await socket.sendMessage(sender, { 
-      text: `✅ *Configuration réussie !*\n\nToutes les réponses du bot seront désormais automatiquement traduites en : *${newLang.toUpperCase()}* avant envoi.` 
+    await socket.sendMessage(sender, {
+      text: `✅ *Configuration réussie !*\n\nLes réponses statiques utilisent désormais le catalogue local *${newLang.toUpperCase()}*. L’IA et les quiz répondront dans cette langue.`
     }, { quoted: msg });
 
   } catch (e) {
@@ -2092,7 +2801,7 @@ case 'removettt': {
   }
   break;
 }
- 
+
               case 'fullpp': {
   const { plag, jid, msg, quotedMsg, cfg, reply, isOwner } = ctx;
   if (!isOwner) return reply(`❌ ${F.bold('Réservé au propriétaire.')}`);
@@ -2157,94 +2866,34 @@ case 'removettt': {
   break;
 }
               // ============================================================
-// BRATVIDEO — Sticker animé Brat
+// ============================================================
+// BRATVID — Sticker animé généré localement (sans API tierce)
 // ============================================================
 case 'bratvid':
 case 'bratvideo': {
   try {
-    if (!args.length) {
+    const text = args.join(' ').trim();
+    if (!text) {
       await socket.sendMessage(sender, {
-        text: `╭━━━━━━━━━━━━━━━━━━━━━━━╮\n` +
-              `┃  🎬 *KAIDO STICKER TEXTE ANIMÉ*\n` +
-              `╰━━━━━━━━━━━━━━━━━━━━━━━╯\n\n` +
-              `❌ Aucun texte fourni !\n\n` +
-              `*Usage :* ${prefix}bratvideo <texte>\n\n` +
-              `*Exemples :*\n` +
-              `  ${prefix}bratvideo KAIDO MD\n` +
-              `  ${prefix}bratvideo plag\n\n` +
-              `> ${config.BOT_FOOTER}`
+        text: `🎬 Usage : ${prefix}bratvid <texte>\nExemple : ${prefix}bratvid KAIDO MD`
       }, { quoted: msg });
       break;
     }
 
-    const text = args.join(' ').trim();
-
     await socket.sendMessage(from, { react: { text: '⚡', key: msg.key } });
-
-    const mediaUrl = `https://brat.caliphdev.com/api/brat/animate?text=${encodeURIComponent(text)}`;
-
-    // ── Télécharger le gif/webp animé ──
-    const response = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      timeout: 20000
-    });
-    const buffer = Buffer.from(response.data);
-
-    if (!buffer || buffer.length === 0) {
-      throw new Error('Téléchargement du média échoué.');
-    }
-
-    // ── Ajouter les métadonnées EXIF (packname + auteur) ──
-    const webp   = require('node-webpmux');
-    const crypto = require('crypto');
-
-    async function addExif(webpSticker, packName, authorName) {
-      const img           = new webp.Image();
-      const stickerPackId = crypto.randomBytes(32).toString('hex');
-      const json          = {
-        'sticker-pack-id': stickerPackId,
-        'sticker-pack-name': packName,
-        'sticker-pack-publisher': authorName,
-        'emojis': ['🎬']
-      };
-      const exifAttr   = Buffer.from([
-        0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x16, 0x00, 0x00, 0x00
-      ]);
-      const jsonBuffer = Buffer.from(JSON.stringify(json), 'utf8');
-      const exif       = Buffer.concat([exifAttr, jsonBuffer]);
-      exif.writeUIntLE(jsonBuffer.length, 14, 4);
-      await img.load(webpSticker);
-      img.exif = exif;
-      return await img.save(null);
-    }
-
-    let stickerBuffer;
-    try {
-      stickerBuffer = await addExif(buffer, text, 'KAIDO-MD');
-    } catch(_) {
-      // Si addExif échoue (pas un webp valide) → envoyer le buffer brut
-      stickerBuffer = buffer;
-    }
-
-    // ── Envoyer comme sticker ──
-    await socket.sendMessage(sender, {
-      sticker: stickerBuffer
-    }, { quoted: msg });
-
+    const stickerBuffer = await createBratVideoSticker(text);
+    await socket.sendMessage(sender, { sticker: stickerBuffer }, { quoted: msg });
     await socket.sendMessage(from, { react: { text: '✅', key: msg.key } });
-
-  } catch (e) {
-    console.error('[BRATVIDEO ERROR]', e);
-    await socket.sendMessage(from, { react: { text: '❌', key: msg.key } });
+  } catch (error) {
+    console.error('[BRATVIDEO ERROR]', error);
+    await socket.sendMessage(from, { react: { text: '❌', key: msg.key } }).catch(() => {});
     await socket.sendMessage(sender, {
-      text: `❌ Échec génération brat video.\n_${e.message || e}_\n\n💡 Réessaie dans quelques secondes.`
+      text: `❌ Échec de génération du bratvid.\n_${error.message || error}_`
     }, { quoted: msg });
   }
   break;
 }
-      
+
       // ============================================================
 // SONG — Recherche + téléchargement audio YouTube
 // ============================================================
@@ -2900,8 +3549,8 @@ case 'findmusic': {
   }
   break;
 }
-      
-      
+
+
 case 'fancy':
 case 'fancytext':
 case 'style': {
@@ -3183,37 +3832,38 @@ case 'mod': {
     }, { quoted: msg });
   }
   break;
-}      
-      
-      
+}
+
+
 // === COMMANDE RECHERCHE DE FILMS ===
 case 'sm':
 case 'movie':
 case 'silent': {
+    const jid = from;
     try {
         const query = args.join(" ");
         if (!query) {
-            await socket.sendMessage(sender, { 
-                text: `🎥 *Usage:* ${prefix}${command} <nom du film>\n*Exemple:* ${prefix}${command} Batman` 
+            await socket.sendMessage(sender, {
+                text: `🎥 *Usage:* ${prefix}${command} <nom du film>\n*Exemple:* ${prefix}${command} Batman`
             }, { quoted: msg });
             break;
         }
 
         await socket.sendMessage(jid, { react: { text: '🔎', key: msg.key } });
-        await socket.sendMessage(sender, { 
-            text: `🔎 *Recherche de films pour :* "${query}"...\n_Génération des cartes de sélection..._` 
+        await socket.sendMessage(sender, {
+            text: `🔎 *Recherche de films pour :* "${query}"...\n_Génération des cartes de sélection..._`
         }, { quoted: msg });
 
         const axios = require('axios');
-        
+
         const { data } = await axios.get(`https://darkvibe314-silent-movies-api.hf.space/api/search`, {
             params: { query: query },
             timeout: 30000
         });
 
         if (!data.results || data.results.length === 0) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Aucun film trouvé !* Essaie un autre terme de recherche." 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Aucun film trouvé !* Essaie un autre terme de recherche."
             }, { quoted: msg });
             break;
         }
@@ -3221,69 +3871,66 @@ case 'silent': {
         const results = data.results.slice(0, 5); // 5 max pour le carousel WA
         const cards = [];
 
-        // Initialiser le cache des sous-titres si nécessaire
-        if (!global.movieSubCache) global.movieSubCache = {};
-
         for (let i = 0; i < results.length; i++) {
             const movie = results[i];
             const title = (movie.title || "Inconnu").slice(0, 50);
-            const isSeries = movie.subjectType === 2; 
+            const isSeries = movie.subjectType === 2;
 
-            // Stocker les sous-titres dans le cache global
-            global.movieSubCache[movie.subjectId] = movie.subtitles || "None";
-            
+            // Cache LRU borné : les recherches ponctuelles ne font plus grossir le heap sans limite.
+            cacheMovieSubtitles(movie.subjectId, typeof movie.subtitles === 'string' ? movie.subtitles : 'None');
+
             const subText = movie.subtitles ? movie.subtitles.split(',').slice(0, 3).join(', ') + "..." : 'Aucun';
             const desc = `⭐ IMDb: ${movie.imdbRatingValue || 'N/A'}\n` +
                         `🎭 Genre: ${movie.genre || 'N/A'}\n` +
                         `📅 Année: ${movie.releaseDate?.split('-')[0] || 'Inconnue'}\n` +
                         `📌 Type: ${isSeries ? 'Série 📺' : 'Film 🎬'}\n` +
                         `💬 Sous-titres: ${subText}`;
-            
+
             const coverUrl = movie.cover?.url || 'https://i.ibb.co/99KrSHn2/c4cd381ffed6.jpg';
 
             // Préparer le média pour l'image
             const { generateWAMessageContent, generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-            
+
             const media = await generateWAMessageContent({
                 image: { url: coverUrl }
             }, { upload: socket.waUploadToServer });
 
             let actionButtons = [];
-            
+
             if (isSeries) {
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📺 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} 1 1` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📺 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} 1 1` })
                 });
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} 1 1` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} 1 1` })
                 });
-                actionButtons.push({ 
-                    name: "cta_copy", 
-                    buttonParamsJson: JSON.stringify({ 
-                        display_text: "📋 Copier ID", 
-                        id: "copy_id", 
-                        copy_code: `.dlmovie ${movie.subjectId} <saison> <épisode> <Langue>` 
-                    }) 
+                actionButtons.push({
+                    name: "cta_copy",
+                    buttonParamsJson: JSON.stringify({
+                        display_text: "📋 Copier ID",
+                        id: "copy_id",
+                        copy_code: `.dlmovie ${movie.subjectId} <saison> <épisode> <Langue>`
+                    })
                 });
             } else {
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "🎬 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} null null` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "🎬 Télécharger (Défaut)", id: `.dlmovie ${movie.subjectId} null null` })
                 });
-                actionButtons.push({ 
-                    name: "quick_reply", 
-                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} null null` }) 
+                actionButtons.push({
+                    name: "quick_reply",
+                    buttonParamsJson: JSON.stringify({ display_text: "📝 Choisir sous-titres", id: `.smsubs ${movie.subjectId} null null` })
                 });
             }
 
             cards.push({
                 body: { text: desc },
-                header: { 
-                    title: `🎬 ${title}`, 
-                    hasMediaAttachment: true, 
-                    imageMessage: media.imageMessage 
+                header: {
+                    title: `🎬 ${title}`,
+                    hasMediaAttachment: true,
+                    imageMessage: media.imageMessage
                 },
                 nativeFlowMessage: { buttons: actionButtons }
             });
@@ -3291,18 +3938,18 @@ case 'silent': {
 
         // Créer le message interactif avec carousel
         const { generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-        
+
         const interactiveMessage = {
             body: { text: `🎥 *Résultats pour :* ${query}\n\nGlisse pour choisir ! ➡️` },
             carouselMessage: { cards: cards, messageVersion: 1 }
         };
 
         const msgContent = generateWAMessageFromContent(jid, {
-            viewOnceMessage: { 
-                message: { 
-                    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 }, 
-                    interactiveMessage: interactiveMessage 
-                } 
+            viewOnceMessage: {
+                message: {
+                    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
+                    interactiveMessage: interactiveMessage
+                }
             }
         }, { quoted: msg, userJid: sender });
 
@@ -3311,8 +3958,8 @@ case 'silent': {
 
     } catch (e) {
         console.error("[MOVIE SEARCH ERROR]", e.message);
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur de recherche: ${e.response?.data?.detail || e.message}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur de recherche: ${e.response?.data?.detail || e.message}`
         }, { quoted: msg });
         await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
     }
@@ -3321,28 +3968,29 @@ case 'silent': {
 
 // === COMMANDE SOUS-TITRES ===
 case 'smsubs': {
+    const jid = from;
     try {
         const movieId = args[0];
         const season = args[1] === 'null' ? null : args[1];
         const episode = args[2] === 'null' ? null : args[2];
-        
+
         if (!movieId) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Usage:* `.smsubs <movie_id> [saison] [épisode]`" 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Usage:* `.smsubs <movie_id> [saison] [épisode]`"
             }, { quoted: msg });
             break;
         }
-        
-        const cachedSubs = global.movieSubCache?.[movieId];
+
+        const cachedSubs = getCachedMovieSubtitles(movieId);
         if (!cachedSubs || cachedSubs === 'None') {
-            await socket.sendMessage(sender, { 
-                text: "🩸 Aucun sous-titre disponible pour ce média." 
+            await socket.sendMessage(sender, {
+                text: "🩸 Aucun sous-titre disponible pour ce média."
             }, { quoted: msg });
             break;
         }
 
         const subList = cachedSubs.split(',').map(s => s.trim());
-        
+
         const rows = subList.map(sub => ({
             header: "",
             title: `📝 ${sub}`,
@@ -3353,7 +4001,7 @@ case 'smsubs': {
         const sections = [{ title: "Langues disponibles", rows: rows }];
 
         const { generateWAMessageFromContent, proto } = require('@whiskeysockets/baileys');
-        
+
         const interactiveMsg = generateWAMessageFromContent(jid, {
             viewOnceMessage: {
                 message: {
@@ -3363,9 +4011,9 @@ case 'smsubs': {
                         footer: { text: "© Kaido MD" },
                         header: { title: "📝 Sous-titres", subtitle: "", hasMediaAttachment: false },
                         nativeFlowMessage: {
-                            buttons: [{ 
-                                name: "single_select", 
-                                buttonParamsJson: JSON.stringify({ title: "🌐 Choisir la langue", sections: sections }) 
+                            buttons: [{
+                                name: "single_select",
+                                buttonParamsJson: JSON.stringify({ title: "🌐 Choisir la langue", sections: sections })
                             }]
                         }
                     }
@@ -3377,8 +4025,8 @@ case 'smsubs': {
 
     } catch (e) {
         console.error("[SMSUBS ERROR]", e.message);
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur: ${e.message}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur: ${e.message}`
         }, { quoted: msg });
     }
     break;
@@ -3389,22 +4037,22 @@ case 'dlmovie':
 case 'downloadmovie': {
     try {
         const movieId = args[0];
-        const season = (args[1] && args[1] !== 'null') ? args[1] : null; 
-        const episode = (args[2] && args[2] !== 'null') ? args[2] : null; 
+        const season = (args[1] && args[1] !== 'null') ? args[1] : null;
+        const episode = (args[2] && args[2] !== 'null') ? args[2] : null;
         const subLang = args.slice(3).join(" ");
 
         if (!movieId) {
-            await socket.sendMessage(sender, { 
-                text: "🩸 *Usage:* `.dlmovie <movie_id> [saison] [épisode] [langue]`" 
+            await socket.sendMessage(sender, {
+                text: "🩸 *Usage:* `.dlmovie <movie_id> [saison] [épisode] [langue]`"
             }, { quoted: msg });
             break;
         }
 
         await socket.sendMessage(jid, { react: { text: '⏳', key: msg.key } });
-        
+
         const subMsg = subLang ? `\n🗣️ *Sous-titres:* ${subLang}` : "";
-        await socket.sendMessage(sender, { 
-            text: `⏳ *Récupération des liens de téléchargement...*${subMsg}\n_Analyse de la taille du fichier..._` 
+        await socket.sendMessage(sender, {
+            text: `⏳ *Récupération des liens de téléchargement...*${subMsg}\n_Analyse de la taille du fichier..._`
         }, { quoted: msg });
 
         const axios = require('axios');
@@ -3434,29 +4082,29 @@ case 'downloadmovie': {
         let fileName = (season && episode) ? `Silent_Series_${movieId}_S${season}E${episode}.mp4` : `Silent_Movie_${movieId}.mp4`;
 
         if (sizeMB > 100) {
-            await socket.sendMessage(sender, { 
-                text: `📦 *Fichier supérieur à 100MB !* (${sizeMB} MB)\n_Téléchargement et upload vers GoFile pour contourner la limite WhatsApp. Cela prendra quelques minutes..._` 
+            await socket.sendMessage(sender, {
+                text: `📦 *Fichier supérieur à 100MB !* (${sizeMB} MB)\n_Téléchargement et upload vers GoFile pour contourner la limite WhatsApp. Cela prendra quelques minutes..._`
             }, { quoted: msg });
-            
+
             // Créer le dossier temp s'il n'existe pas
             const tempDir = './temp';
             if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-            
+
             tempVidPath = path.join(tempDir, fileName);
             const writer = fs.createWriteStream(tempVidPath);
-            
-            const response = await axios({ 
-                url: data.download_url, 
-                method: 'GET', 
+
+            const response = await axios({
+                url: data.download_url,
+                method: 'GET',
                 responseType: 'stream',
                 timeout: 300000 // 5 minutes pour le téléchargement
             });
-            
+
             response.data.pipe(writer);
-            
-            await new Promise((resolve, reject) => { 
-                writer.on('finish', resolve); 
-                writer.on('error', reject); 
+
+            await new Promise((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
             });
 
             // Upload vers GoFile
@@ -3484,10 +4132,10 @@ case 'downloadmovie': {
             if (fs.existsSync(tempVidPath)) fs.unlinkSync(tempVidPath);
 
         } else {
-            await socket.sendMessage(sender, { 
-                text: `🎬 *Média trouvé !* (${sizeMB} MB)\n_Envoi direct vers WhatsApp..._` 
+            await socket.sendMessage(sender, {
+                text: `🎬 *Média trouvé !* (${sizeMB} MB)\n_Envoi direct vers WhatsApp..._`
             }, { quoted: msg });
-            
+
             await socket.sendMessage(jid, {
                 document: { url: data.download_url },
                 mimetype: 'video/mp4',
@@ -3500,15 +4148,15 @@ case 'downloadmovie': {
         // Envoyer les sous-titres si disponibles
         if (data.subtitle_url) {
             try {
-                let subName = (season && episode) 
-                    ? `Sous-titres_${subLang || 'Default'}_S${season}E${episode}.srt` 
+                let subName = (season && episode)
+                    ? `Sous-titres_${subLang || 'Default'}_S${season}E${episode}.srt`
                     : `Sous-titres_${subLang || 'Default'}.srt`;
-                
-                const subRes = await axios.get(data.subtitle_url, { 
+
+                const subRes = await axios.get(data.subtitle_url, {
                     responseType: 'arraybuffer',
-                    timeout: 30000 
+                    timeout: 30000
                 });
-                
+
                 await socket.sendMessage(jid, {
                     document: Buffer.from(subRes.data),
                     mimetype: 'application/x-subrip',
@@ -3524,21 +4172,21 @@ case 'downloadmovie': {
 
     } catch (e) {
         console.error("[DLMOVIE ERROR]", e.message);
-        
+
         // Nettoyer le fichier temporaire en cas d'erreur
         if (tempVidPath && fs.existsSync(tempVidPath)) {
             try { fs.unlinkSync(tempVidPath); } catch {}
         }
-        
+
         const errorMsg = e.response?.data?.detail || e.message;
         await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
-        await socket.sendMessage(sender, { 
-            text: `🩸 Erreur de téléchargement: ${errorMsg}` 
+        await socket.sendMessage(sender, {
+            text: `🩸 Erreur de téléchargement: ${errorMsg}`
         }, { quoted: msg });
     }
     break;
 }
-      
+
 // ============================================================
 // TRANSLATE — Traduction via Google Translate
 // ============================================================
@@ -3659,9 +4307,9 @@ case 'tr': {
 case 'antitag': {
           try {
             // Optionnel : restreindre au propriétaire
-            if (!isOwner) {
-              await socket.sendMessage(sender, { 
-                text: '❌ Seul le propriétaire peut utiliser cette commande.' 
+            if (!(isOwner || isSessionOwner)) {
+              await socket.sendMessage(sender, {
+                text: '❌ Seul le propriétaire de la session ou du bot peut utiliser cette commande.'
               }, { quoted: msg });
               break;
             }
@@ -3677,7 +4325,7 @@ case 'antitag': {
             }
 
             // Récupérer le numéro de la session (le bot) pour la config
-            const botNumberForConfig = socket.user?.id?.split(':')[0] + '@s.whatsapp.net' || socket.user?.id;
+            const botNumberForConfig = String(number || '').replace(/[^0-9]/g, '');
             if (!botNumberForConfig) throw new Error('Impossible de récupérer le numéro du bot');
 
             // Charger la config actuelle du bot
@@ -3698,8 +4346,8 @@ case 'antitag': {
             await socket.sendMessage(sender, { text: `❌ Erreur: ${e.message}` }, { quoted: msg });
           }
           break;
-        }        
-          
+        }
+
 case 'delsession': {
   try {
     const senderNum = (nowsender || '').split('@')[0];
@@ -3915,7 +4563,7 @@ case 'delsession': {
     } catch (e) { /* ignore */ }
   }
   break;
-}         
+}
 // ============ COMMANDES DE GROUPE ========
 
 case 'config': {
@@ -3981,12 +4629,18 @@ case 'config': {
       case 'online': {
         const val = (args[1] || '').toLowerCase();
         if (val === 'on' || val === 'off') {
-          cfg.AUTO_ONLINE = val === 'on';
+          // L’état inactif reste hors ligne; seule chaque réponse du bot annonce
+          // temporairement sa disponibilité. `on` est gardé comme alias historique.
+          cfg.AUTO_ONLINE = false;
           await setUserConfigInMongo(sanitized, cfg);
-          await applyAlwaysOnlineSetting(socket, cfg.AUTO_ONLINE, sender);
-          await socket.sendMessage(sender, { text: `✅ ALWAYS_ONLINE : ${val.toUpperCase()}` }, { quoted: msg });
+          await applyAlwaysOnlineSetting(socket, false, sender);
+          await socket.sendMessage(sender, {
+            text: val === 'off'
+              ? '✅ Kaido restera hors ligne lorsqu’il ne répond pas.'
+              : 'ℹ️ La présence en ligne permanente est désactivée; Kaido ne sera visible que pendant ses réponses.'
+          }, { quoted: msg });
         } else {
-          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline on|off` }, { quoted: msg });
+          await socket.sendMessage(sender, { text: `${prefix}config alwaysonline off` }, { quoted: msg });
         }
         break;
       }
@@ -4028,11 +4682,11 @@ case 'config': {
       case 'show':
       case 'get': {
         // fusionner avec defaults si tu utilises loadSessionConfigMerged ailleurs ; ici on montre ce qui est en DB
-        const merged = { 
+        const merged = {
           AUTO_VIEW_STATUS: typeof cfg.AUTO_VIEW_STATUS === 'undefined' ? true : cfg.AUTO_VIEW_STATUS,
           AUTO_LIKE_STATUS: typeof cfg.AUTO_LIKE_STATUS === 'undefined' ? true : cfg.AUTO_LIKE_STATUS,
           AUTO_RECORDING: typeof cfg.AUTO_RECORDING === 'undefined' ? false : cfg.AUTO_RECORDING,
-          AUTO_ONLINE: typeof cfg.AUTO_ONLINE === 'undefined' ? false : cfg.AUTO_ONLINE,
+          AUTO_ONLINE: false,
           AUTO_LIKE_EMOJI: Array.isArray(cfg.AUTO_LIKE_EMOJI) && cfg.AUTO_LIKE_EMOJI.length ? cfg.AUTO_LIKE_EMOJI : ['🐉','🔥','💀','👑','💪','😎','🇭🇹','⚡','🩸','❤️'],
           PREFIX: Object.prototype.hasOwnProperty.call(cfg, 'PREFIX') ? cfg.PREFIX : '.',
           antidelete: cfg.antidelete === true
@@ -4042,7 +4696,7 @@ case 'config': {
           `AUTO_VIEW_STATUS: ${merged.AUTO_VIEW_STATUS}`,
           `AUTO_LIKE_STATUS: ${merged.AUTO_LIKE_STATUS}`,
           `AUTO_RECORDING: ${merged.AUTO_RECORDING}`,
-          `AUTO_ONLINE: ${merged.AUTO_ONLINE}`,
+          `AUTO_ONLINE: OFF — Kaido est visible uniquement pendant ses réponses`,
           `AUTO_LIKE_EMOJI: ${merged.AUTO_LIKE_EMOJI.join(' ')}`,
           `PREFIX: ${merged.PREFIX || 'off (prefixless)'}`,
           `ANTIDELETE: ${merged.antidelete ? 'ON' : 'OFF'}`
@@ -4058,7 +4712,7 @@ case 'config': {
           '.config autoview on|off',
           '.config autolike on|off',
           '.config autorec on|off',
-          '.config alwaysonline on|off',
+          '.config alwaysonline on|off (off conservé pour compatibilité)',
           '.config setlikeemoji <emoji1> <emoji2> ...',
           '.config setprefix <prefix|off>',
           '.config show'
@@ -4083,7 +4737,7 @@ case 'welcome': {
     }
 
     const sub = (args[0] || '').toLowerCase();
-    
+
     if (sub === 'on') {
       await updateGroupSetting(from, 'welcomeEnabled', true);
       await socket.sendMessage(from, { text: '✅ Mode Welcome activé.' }, { quoted: msg });
@@ -4133,7 +4787,7 @@ case 'goodbye': {
     }
 
     const sub = (args[0] || '').toLowerCase();
-    
+
     if (sub === 'on') {
       await updateGroupSetting(from, 'goodbyeEnabled', true);
       await socket.sendMessage(from, { text: '✅ Mode Goodbye activé.' }, { quoted: msg });
@@ -4384,7 +5038,7 @@ case 'ssweb': {
   }
   break;
 }
-   
+
  case 'checkban': {
   try {
     const target = (args[0] || '').replace(/[^0-9]/g, '');
@@ -4443,76 +5097,62 @@ END:VCARD`
   }
   break;
 }
- 
- 
+
+
 case 'antistatusmention': {
   try {
     const sanitized = String(number || '').replace(/[^0-9]/g, '');
-    const senderNum = (nowsender || '').split('@')[0];
-    const ownerNum = primaryOwnerNumber();
-
     if (!from.endsWith('@g.us')) {
       return await socket.sendMessage(sender, {
         text: '❌ Cette commande doit être utilisée dans un groupe.'
       }, { quoted: msg });
     }
-
     if (!(isOwner || isSessionOwner)) {
       return await socket.sendMessage(sender, {
         text: '❌ Seul le propriétaire de la session ou du bot peut changer ce mode.'
       }, { quoted: msg });
     }
 
-    // Charger la config actuelle
-    let cfg = await loadUserConfigFromMongo(sanitized) || {};
+    const sub = String(args[0] || 'status').toLowerCase();
+    const cfg = await loadUserConfigFromMongo(sanitized) || {};
     if (typeof cfg.antistatusmention === 'undefined') cfg.antistatusmention = false;
-    if (typeof cfg.antistatusmention_threshold === 'undefined') cfg.antistatusmention_threshold = 2;
+    const savedThreshold = Number(cfg.antistatusmention_threshold);
+    if (!Number.isInteger(savedThreshold) || savedThreshold < 1 || savedThreshold > 20) cfg.antistatusmention_threshold = 2;
+    else cfg.antistatusmention_threshold = savedThreshold;
 
-    // Construire le texte d’état
-    const statusText = cfg.antistatusmention
-      ? `✅ AntiStatusMention activé\n⚠️ Seuil: ${cfg.antistatusmention_threshold}`
-      : `⛔ AntiStatusMention désactivé\n⚠️ Seuil: ${cfg.antistatusmention_threshold}`;
-
-    // Construire le bouton ON/OFF
-    const buttons = [
-      {
-        buttonId: cfg.antistatusmention ? 'antistatusmention_off' : 'antistatusmention_on',
-        buttonText: { displayText: cfg.antistatusmention ? 'OFF' : 'ON' },
-        type: 1
+    if (sub === 'on' || sub === 'off') {
+      cfg.antistatusmention = sub === 'on';
+      await setUserConfigInMongo(sanitized, cfg);
+    } else if (sub === 'set' || sub === 'threshold') {
+      const threshold = Number(args[1]);
+      if (!Number.isInteger(threshold) || threshold < 1 || threshold > 20) {
+        return await socket.sendMessage(sender, {
+          text: `❌ Seuil invalide. Utilise ${prefix}antistatusmention set <1-20>.`
+        }, { quoted: msg });
       }
-    ];
+      cfg.antistatusmention_threshold = threshold;
+      await setUserConfigInMongo(sanitized, cfg);
+    } else if (sub !== 'status' && args.length) {
+      return await socket.sendMessage(sender, {
+        text: `Usage : ${prefix}antistatusmention [on|off|status|set <seuil>]`
+      }, { quoted: msg });
+    }
 
-    await socket.sendMessage(sender, {
-      text: `⚙️ Paramètre AntiStatusMention\n\n${statusText}\n\nClique sur le bouton pour changer.`,
-      buttons: buttons,
-      headerType: 1
-    }, { quoted: msg });
-
+    const statusText = cfg.antistatusmention ? 'activé ✅' : 'désactivé ❌';
+    const response = [
+      `⚙️ AntiStatusMention ${statusText}`,
+      `Seuil : ${cfg.antistatusmention_threshold}`,
+      '',
+      `Commandes : ${prefix}antistatusmention on | off | status`,
+      `${prefix}antistatusmention set <1-20>`
+    ].join('\n');
+    await socket.sendMessage(sender, { text: response }, { quoted: msg });
   } catch (err) {
     console.error('[ANTISTATUS SWITCH ERROR]', err);
     await socket.sendMessage(sender, {
       text: `❌ Erreur lors du changement de mode : ${err.message || err}`
     }, { quoted: msg });
   }
-  break;
-}
-
-// Gestion des boutons
-case 'antistatusmention_on': {
-  const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  let cfg = await loadUserConfigFromMongo(sanitized) || {};
-  cfg.antistatusmention = true;
-  await setUserConfigInMongo(sanitized, cfg);
-  await socket.sendMessage(from, { text: '✅ AntiStatusMention activé.' }, { quoted: msg });
-  break;
-}
-
-case 'antistatusmention_off': {
-  const sanitized = String(number || '').replace(/[^0-9]/g, '');
-  let cfg = await loadUserConfigFromMongo(sanitized) || {};
-  cfg.antistatusmention = false;
-  await setUserConfigInMongo(sanitized, cfg);
-  await socket.sendMessage(from, { text: '⛔ AntiStatusMention désactivé.' }, { quoted: msg });
   break;
 }
 
@@ -4523,9 +5163,14 @@ case 'tagall': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+      break;
+    }
 
-    // Construire la liste des mentions (JID complets)
+    // Construire la liste des mentions avec le JID PN lorsqu'il est connu.
     const mentions = participants.map(p => p.jid).filter(Boolean);
     if (!mentions.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre détecté.' }, { quoted: msg });
@@ -4563,14 +5208,14 @@ case 'setgpp': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
 
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent changer la photo du groupe.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour changer la photo du groupe.' }, { quoted: msg });
       break;
     }
@@ -4643,7 +5288,12 @@ case 'h': {
     break;
   }
   try {
-    const { participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const senderJid = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
+      await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser hidetag.' }, { quoted: msg });
+      break;
+    }
 
     // Récupérer le texte (sans la commande elle-même)
     const text = args.join(' ').trim();
@@ -4703,13 +5353,13 @@ case 'kick': {
     break;
   }
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botJid || !groupAdminsJid.includes(botJid)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -4720,15 +5370,19 @@ case 'kick': {
       break;
     }
 
-    // filtrer : ne pas retirer les admins ni le bot
-    const toRemove = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    // Résoudre les alias PN/LID vers le JID réel du participant, puis protéger admins et bot.
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible est admin ou bot).' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Aucune cible valide (cible absente, admin ou bot).' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retiré(s): ${toRemove.map(j => j.split('@')[0]).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retiré(s): ${toRemove.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICK ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4743,10 +5397,14 @@ case 'add': {
     break;
   }
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent ajouter des membres.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour ajouter des membres.' }, { quoted: msg });
       break;
     }
     const number = args[0];
@@ -4766,19 +5424,23 @@ case 'add': {
 case 'promote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent promouvoir.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour promouvoir.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .promote @membre' }, { quoted: msg });
 
-    const toPromote = mentions.filter(m => !groupAdminsJid.includes(m) && m !== botJid);
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(j => j.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('PROMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4790,19 +5452,23 @@ case 'promote': {
 case 'demote': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rétrograder.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder.' }, { quoted: msg });
 
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .demote @membre' }, { quoted: msg });
 
-    const toDemote = mentions.filter(m => groupAdminsJid.includes(m) && m !== botJid);
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) return await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(j => j.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('DEMOTE ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4814,22 +5480,21 @@ case 'demote': {
 case 'kickall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid, botJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
-    if (!botJid || !groupAdminsJid.includes(botJid)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) return await socket.sendMessage(from, { text: '❌ Le bot doit être admin.' }, { quoted: msg });
 
-    // retirer tous les participants dont p.jid n'est pas admin et n'est pas le bot
-    const nonAdminJids = participants
-      .map(p => p.jid)
-      .filter(Boolean)
-      .filter(j => !groupAdminsJid.includes(j) && j !== botJid);
+    // Ne retirer ni les administrateurs (PN/LID) ni le compte du bot.
+    const toRemove = resolveGroupActionTargets(metadata, participants)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
+    if (!toRemove.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
 
-    const unique = [...new Set(nonAdminJids)];
-    if (!unique.length) return await socket.sendMessage(from, { text: '❌ Aucun membre non-admin à retirer.' }, { quoted: msg });
-
-    await socket.groupParticipantsUpdate(from, unique, 'remove');
-    await socket.sendMessage(from, { text: `✅ Retirés: ${unique.length} membres`, mentions: unique }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Retirés: ${toRemove.length} membres`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('KICKALL ERROR', e);
     await socket.sendMessage(from, { text: `❌ Erreur: ${e.message || e}` }, { quoted: msg });
@@ -4841,9 +5506,9 @@ case 'kickall': {
 case 'tagall': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { participants, groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata, participants } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent tagall.' }, { quoted: msg });
 
     const mentions = participants.map(p => p.jid).filter(Boolean);
     const text = `🔔 Mention de tous les membres (${mentions.length})`;
@@ -4859,10 +5524,14 @@ case 'acceptall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent accepter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour accepter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4890,10 +5559,14 @@ case 'revokeall': {
   if (!from.endsWith('@g.us')) break;
   try {
     // Vérifier que l’expéditeur est admin
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent rejeter les demandes.' }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour rejeter les demandes.' }, { quoted: msg });
       break;
     }
 
@@ -4921,10 +5594,13 @@ case 'revokeall': {
 case 'mute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent activer mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour fermer le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -4934,7 +5610,7 @@ case 'mute': {
       const metadata = await socket.groupMetadata(from);
       const participants = metadata.participants.map(p => p.id);
 
-      await socket.sendMessage(from, { 
+      await socket.sendMessage(from, {
         text: '🔇 Groupe en mode admin-only.',
         mentions: participants
       }, { quoted: msg });
@@ -4951,10 +5627,13 @@ case 'mute': {
 case 'unmute': {
   if (!from.endsWith('@g.us')) break;
   try {
-    const { groupAdminsJid } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
+    const { metadata } = await require('../lib/normalize').getGroupAdminsInfo(socket, from);
     const senderJid = nowsender || msg.key.participant || msg.key.remoteJid;
-    if (!groupAdminsJid.includes(senderJid)) {
+    if (!isGroupAdmin(metadata, [senderJid, msg.key?.participantAlt])) {
       return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent désactiver mute.' }, { quoted: msg });
+    }
+    if (!isBotGroupAdmin(metadata, socket)) {
+      return await socket.sendMessage(from, { text: '❌ Le bot doit être admin pour rouvrir le groupe.' }, { quoted: msg });
     }
 
     if (typeof socket.groupSettingUpdate === 'function') {
@@ -4964,7 +5643,7 @@ case 'unmute': {
       const metadata = await socket.groupMetadata(from);
       const participants = metadata.participants.map(p => p.id);
 
-      await socket.sendMessage(from, { 
+      await socket.sendMessage(from, {
         text: '🔊 Groupe rouvert, tout le monde peut parler.',
         mentions: participants
       }, { quoted: msg });
@@ -5066,26 +5745,14 @@ case 'testgrp': {
       break;
     }
 
-    // Récupérer metadata complet
+    // Récupérer les admins et le compte du bot avec les alias PN/LID réels.
     const metadata = await socket.groupMetadata(from);
-    // Participants bruts
     const participants = metadata?.participants || [];
-    // Liste des admins (JID complet)
-    const groupAdminsJid = participants.filter(p => p?.admin).map(p => p.id);
-    // Liste des admins nettoyée (numéros)
-    const groupAdminsNum = groupAdminsJid.map(j => (j || '').split('@')[0].split(':')[0]);
-    // Détecter JID du bot (robuste)
-    let botJid = null;
-    if (socket.user) {
-      if (socket.user.jid) botJid = socket.user.jid;
-      else if (socket.user.id) botJid = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    }
-    if (!botJid) {
-      const idPart = socket.user?.id ? socket.user.id.split(':')[0] : null;
-      const maybe = participants.find(p => p.id && idPart && p.id.startsWith(idPart));
-      if (maybe) botJid = maybe.id;
-    }
-    const botNum = botJid ? botJid.split('@')[0].split(':')[0] : '';
+    const groupAdminsJid = getGroupAdminJids(metadata);
+    const groupAdminsNum = getGroupAdminNumbers(metadata);
+    const botJid = getBotJid(metadata, socket) || null;
+    const botNum = getPhoneNumberJid(socket.user || {}).split('@')[0] || '';
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Construire un résumé lisible
     let text = `🔎 *TESTGRP — Diagnostic du groupe*\n\n`;
@@ -5102,7 +5769,8 @@ case 'testgrp': {
     if (groupAdminsNum.length) text += groupAdminsNum.join(', ') + '\n'; else text += '—\n';
 
     text += `\n🤖 *Bot JID* : ${botJid || 'non détecté'}\n`;
-    text += `🤖 *Bot numéro* : ${botNum || '—'}\n\n`;
+    text += `🤖 *Bot numéro* : ${botNum || '—'}\n`;
+    text += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}\n\n`;
 
     // Exemple de mapping participants -> rôle et format brut (limité à 50 pour éviter message trop long)
     text += `📋 *Aperçu participants (max 50)* :\n`;
@@ -5110,8 +5778,8 @@ case 'testgrp': {
     sample.forEach((p, i) => {
       const id = p.id || '—';
       const num = id.split('@')[0].split(':')[0];
-      const admin = p.admin || '—';
-      const isSuper = admin === 'superadmin' ? ' (superadmin)' : '';
+      const admin = isAdminParticipant(p) ? p.admin : '—';
+      const isSuper = typeof admin === 'string' && admin.toLowerCase() === 'superadmin' ? ' (superadmin)' : '';
       text += `${i+1}. ${num} — admin: ${admin}${isSuper}\n`;
     });
     if (participants.length > 50) text += `... et ${participants.length - 50} autres\n`;
@@ -5159,9 +5827,10 @@ case 'admininfo': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    // Même logique que kickall pour détecter le bot et les admins
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+    // Utiliser les alias PN/LID des participants pour le diagnostic.
+    const botJid = getBotJid(metadata, socket) || 'non détecté';
+    const botNumber = getPhoneNumberJid(socket.user || {}).split('@')[0] || '—';
+    const groupAdmins = getGroupAdminJids(metadata);
 
     // Construire la liste lisible des admins (numéros)
     let adminListText = `👥 *ADMINS DU GROUPE* — ${groupName}\n\n`;
@@ -5174,16 +5843,15 @@ case 'admininfo': {
       });
     }
 
-    // Vérifier si le bot est admin
-    const botIsAdmin = groupAdmins.includes(botNumber);
+    // Vérifier le compte du bot par ses identifiants PN/LID.
+    const botIsAdmin = isBotGroupAdmin(metadata, socket);
 
     // Ajouter info bot
-    adminListText += `\n🤖 *Bot JID* : ${botNumber}\n`;
+    adminListText += `\n🤖 *Bot JID* : ${botJid}\n`;
+    adminListText += `🤖 *Bot numéro* : ${botNumber}\n`;
     adminListText += `🤖 *Bot admin ?* : ${botIsAdmin ? '✅ Oui' : '❌ Non'}`;
 
-    // Préparer mentions : mentionner les admins (et le bot si présent dans la liste)
     const mentions = [...groupAdmins];
-    if (botIsAdmin && !mentions.includes(botNumber)) mentions.push(botNumber);
 
     await socket.sendMessage(from, {
       text: adminListText,
@@ -5211,17 +5879,14 @@ case 'tagall': {
     const participants = metadata.participants || [];
     const groupName = metadata.subject || "Sans nom";
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    // Vérifier que l'auteur est admin (même logique)
-    if (!groupAdmins.includes(sender)) {
+    // Vérifier l'auteur par son JID principal ou son alias.
+    if (!isGroupAdmin(metadata, [sender, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
       break;
     }
 
     // Construire le message et la liste de mentions (exclure le bot si tu veux)
-    const members = participants.map(p => p.id).filter(id => id !== botNumber);
+    const members = participants.map(getParticipantId).filter(id => id && !isBotIdentity(socket, id));
     if (!members.length) {
       await socket.sendMessage(from, { text: '❌ Aucun membre à mentionner.' }, { quoted: msg });
       break;
@@ -5250,14 +5915,13 @@ case 'kick': {
   }
 
   try {
-    const { participants, groupAdminsJid, groupAdminsNum, botJid, botNum } = await getGroupAdminsInfo(socket, from);
-
-    const senderNum = jidToNumber(sender);
-    if (!groupAdminsNum.includes(senderNum)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const senderIds = [nowsender, msg.key?.participant, msg.key?.participantAlt].filter(Boolean);
+    if (!isGroupAdmin(metadata, senderIds)) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!botNum || !groupAdminsNum.includes(botNum)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour retirer des membres.' }, { quoted: msg });
       break;
     }
@@ -5265,18 +5929,19 @@ case 'kick': {
     const mentions = msg?.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
     if (!mentions.length) return await socket.sendMessage(from, { text: 'Usage: .kick @membre' }, { quoted: msg });
 
-    const toRemove = mentions.filter(m => {
-      const num = jidToNumber(m);
-      return !groupAdminsNum.includes(num) && num !== botNum;
-    });
+    const toRemove = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
 
     if (!toRemove.length) {
-      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible est admin ou bot.' }, { quoted: msg });
+      await socket.sendMessage(from, { text: '❌ Impossible de retirer : cible absente, admin ou bot.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toRemove, 'remove');
-    await socket.sendMessage(from, { text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(x => '@' + jidToNumber(x)).join(', ')}`, mentions: toRemove }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toRemove.map(target => target.jid), 'remove');
+    await socket.sendMessage(from, {
+      text: `✅ Utilisateur(s) retiré(s): ${toRemove.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toRemove.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR kick]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors du kick.\n\n${e.message || e}` }, { quoted: msg });
@@ -5294,16 +5959,14 @@ case 'promote': {
   try {
     const metadata = await socket.groupMetadata(from);
     const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour promouvoir des membres.' }, { quoted: msg });
+    if (!isBotGroupAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour promouvoir des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5313,15 +5976,19 @@ case 'promote': {
       break;
     }
 
-    // Ne pas promouvoir le bot ni les admins déjà promus
-    const toPromote = mentions.filter(m => !groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas promouvoir le bot ni les admins déjà promus.
+    const toPromote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toPromote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible valide à promouvoir.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toPromote, 'promote');
-    await socket.sendMessage(from, { text: `✅ Promu(s): ${toPromote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toPromote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toPromote.map(target => target.jid), 'promote');
+    await socket.sendMessage(from, {
+      text: `✅ Promu(s): ${toPromote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toPromote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR promote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la promotion.\n\n${e.message || e}` }, { quoted: msg });
@@ -5338,17 +6005,14 @@ case 'demote': {
 
   try {
     const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
 
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
-      await socket.sendMessage(from, { text: '❌ Je dois être admin pour rétrograder des membres.' }, { quoted: msg });
+    if (!isGroupSuperAdmin(metadata, socket)) {
+      await socket.sendMessage(from, { text: '❌ Le bot doit être super-admin pour rétrograder des membres.' }, { quoted: msg });
       break;
     }
 
@@ -5358,15 +6022,19 @@ case 'demote': {
       break;
     }
 
-    // Ne pas démoter le bot et ne cibler que les admins
-    const toDemote = mentions.filter(m => groupAdmins.includes(m) && m !== botNumber);
+    // Ne pas démoter le bot et ne cibler que les admins.
+    const toDemote = resolveGroupActionTargets(metadata, mentions)
+      .filter(({ participant }) => isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant));
     if (!toDemote.length) {
       await socket.sendMessage(from, { text: '❌ Aucune cible admin valide à rétrograder.' }, { quoted: msg });
       break;
     }
 
-    await socket.groupParticipantsUpdate(from, toDemote, 'demote');
-    await socket.sendMessage(from, { text: `✅ Rétrogradé(s): ${toDemote.map(x => '@' + x.split('@')[0]).join(', ')}`, mentions: toDemote }, { quoted: msg });
+    await socket.groupParticipantsUpdate(from, toDemote.map(target => target.jid), 'demote');
+    await socket.sendMessage(from, {
+      text: `✅ Rétrogradé(s): ${toDemote.map(target => '@' + target.mentionJid.split('@')[0]).join(', ')}`,
+      mentions: toDemote.map(target => target.mentionJid)
+    }, { quoted: msg });
   } catch (e) {
     console.error('[ERROR demote]', e);
     await socket.sendMessage(sender, { text: `❌ Erreur lors de la rétrogradation.\n\n${e.message || e}` }, { quoted: msg });
@@ -5398,7 +6066,7 @@ case 'setconfig': {
         key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_SETCONFIG_HELP" },
         message: { contactMessage: { displayName: BOT_NAME_FANCY } }
       };
-      return await socket.sendMessage(sender, { text: '❗ Usage: .setconfig <KEY> <VALUE>\nEx: .setconfig AUTO_VIEW_STATUS false\nPour voir les clés disponibles: .showconfig' }, { quoted: meta });
+      return await socket.sendMessage(sender, { text: '❗ Usage: .setconfig <KEY> <VALUE>\nEx: .setconfig AUTO_VIEW_STATUS false\nPour les réglages courants: .config show' }, { quoted: meta });
     }
 
     if (typeof ALLOWED_KEYS !== 'undefined' && Array.isArray(ALLOWED_KEYS) && !ALLOWED_KEYS.includes(key)) {
@@ -5435,44 +6103,6 @@ case 'setconfig': {
   break;
 }
 
-/* getconfig */
-case 'getconfig': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const key = (args[0] || '').trim();
-    if (!key) {
-      const meta = {
-        key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG_HELP" },
-        message: { contactMessage: { displayName: BOT_NAME_FANCY } }
-      };
-      return await socket.sendMessage(sender, { text: '❗ Usage: .getconfig <KEY>\nEx: .getconfig AUTO_VIEW_STATUS\nPour voir toutes les clés: .showconfig' }, { quoted: meta });
-    }
-
-    const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    const botName = cfg.botName || BOT_NAME_FANCY;
-    const value = (cfg.hasOwnProperty(key)) ? cfg[key] : (DEFAULT_SESSION_CONFIG && DEFAULT_SESSION_CONFIG[key] !== undefined ? DEFAULT_SESSION_CONFIG[key] : undefined);
-
-    const meta = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG" },
-      message: { contactMessage: { displayName: botName } }
-    };
-
-    if (typeof value === 'undefined') {
-      await socket.sendMessage(sender, { text: `ℹ️ Clé introuvable: ${key}` }, { quoted: meta });
-    } else {
-      await socket.sendMessage(sender, { text: `🔎 ${key} = ${formatValueForDisplay ? formatValueForDisplay(value) : String(value)}` }, { quoted: meta });
-    }
-
-  } catch (e) {
-    console.error('getconfig error', e);
-    const metaErr = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_GETCONFIG_ERR" },
-      message: { contactMessage: { displayName: BOT_NAME_FANCY } }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: metaErr });
-  }
-  break;
-}
 /* resetconfig */
 case 'resetconfig': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
@@ -5509,80 +6139,6 @@ case 'resetconfig': {
   }
   break;
 }
-
-/* showconfig */
-case 'showconfig2': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const cfgRaw = await loadUserConfigFromMongo(sanitized) || {};
-    const cfg = Object.assign({}, DEFAULT_SESSION_CONFIG || {}, cfgRaw);
-    const botName = cfg.botName || BOT_NAME_FANCY;
-
-    const shonux = {
-      key: {
-        remoteJid: "status@broadcast",
-        participant: "0@s.whatsapp.net",
-        fromMe: false,
-        id: "META_AI_SHOWCONFIG"
-      },
-      message: {
-        contactMessage: {
-          displayName: botName,
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
-        }
-      }
-    };
-
-    // Construire le texte de sortie
-    const lines = [];
-    lines.push(`📋 Configuration de session — ${sanitized}`);
-    lines.push('');
-    lines.push(`• Bot name: ${botName}`);
-    lines.push(`• Logo: ${cfg.logo || config.RCD_IMAGE_PATH || 'aucun'}`);
-    // Afficher les clés par défaut dans un ordre lisible
-    for (const k of Object.keys(DEFAULT_SESSION_CONFIG || {})) {
-      if (k === 'botName') continue; // déjà affiché
-      const val = cfg.hasOwnProperty(k) ? cfg[k] : DEFAULT_SESSION_CONFIG[k];
-      lines.push(`• ${k}: ${formatValueForDisplay ? formatValueForDisplay(val) : String(val)}`);
-    }
-    // Clés personnalisées
-    const extraKeys = Object.keys(cfg).filter(k => !DEFAULT_SESSION_CONFIG.hasOwnProperty(k) && k !== '_meta');
-    if (extraKeys.length) {
-      lines.push('');
-      lines.push('🔧 Clés personnalisées:');
-      for (const k of extraKeys) {
-        lines.push(`• ${k}: ${formatValueForDisplay ? formatValueForDisplay(cfg[k]) : String(cfg[k])}`);
-      }
-    }
-    // Meta info
-    if (cfg._meta) {
-      lines.push('');
-      lines.push(`Dernière mise à jour: ${cfg._meta.updatedAt || ''}`);
-      lines.push(`Par: ${cfg._meta.updatedBy || ''}`);
-    }
-
-    await socket.sendMessage(sender, { text: lines.join('\n') }, { quoted: shonux });
-  } catch (e) {
-    console.error('showconfig error', e);
-    const shonuxErr = {
-      key: {
-        remoteJid: "status@broadcast",
-        participant: "0@s.whatsapp.net",
-        fromMe: false,
-        id: "META_AI_SHOWCONFIG_ERR"
-      },
-      message: {
-        contactMessage: {
-          displayName: BOT_NAME_FANCY,
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
-        }
-      }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: shonuxErr });
-  }
-  break;
-}
-
 
 case 'sticker': case 's': {
   try {
@@ -5869,7 +6425,7 @@ case 'sr': {
 
 
 
-  
+
  case 'antidelete':
 case 'ad': {
   try {
@@ -5890,7 +6446,7 @@ case 'ad': {
     // ── Sous-commandes ──
     if (sub === 'status') {
       const mode = normaliseAntideleteMode(cfg.antidelete);
-      const storeSize = getSessionStore(sanitized).size;
+      const storeSize = messageStores.get(sanitized)?.size || 0;
       const modeLabel = mode === 'all' ? '🌐 Tout (groupes + privé)'
                       : mode === 'g'   ? '👥 Groupes seulement'
                       : mode === 'p'   ? '💬 Privé seulement'
@@ -5909,7 +6465,9 @@ case 'ad': {
 
     if (sub === 'off') {
       cfg.antidelete = 'off';
-      clearSessionStore(sanitized);
+      // Les anciennes entrées restent utiles si des réactions déclenchent des
+      // commandes; sinon on libère immédiatement le cache de cette session.
+      if (!sessionHasReactionCommands(sanitized)) deleteSessionStore(sanitized);
     } else if (sub === 'g') {
       cfg.antidelete = 'g';   // groupes seulement
     } else if (sub === 'p') {
@@ -5960,76 +6518,88 @@ case 'ad': {
   }
   break;
 }
-              
+
 
 case 'promote':
 case 'admin': {
   try {
     if (!from.endsWith('@g.us')) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette commande fonctionne uniquement dans les groupes.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette commande fonctionne uniquement dans les groupes.'
       }, { quoted: msg });
       break;
     }
 
-    // Vérifier si l'expéditeur est superadmin
+    // Un administrateur de groupe peut demander une promotion; pas besoin d’être super-admin.
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
-      await socket.sendMessage(sender, { 
-        text: '❌ Seuls les super-administrateurs peuvent promouvoir des membres.' 
+    if (!isGroupAdmin(groupMetadata, [nowsender, msg.key?.participantAlt, msg.key?.participant])) {
+      await socket.sendMessage(sender, {
+        text: '❌ Seuls les administrateurs du groupe peuvent promouvoir des membres.'
+      }, { quoted: msg });
+      break;
+    }
+    if (!isBotGroupAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être administrateur du groupe pour promouvoir un membre.' }, { quoted: msg });
+      break;
+    }
+
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Identifier la personne à promouvoir
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      // Réponse à un message
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      // Mention ou numéro
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !promote <numéro/@mention>\nOu répondez à un message de la personne' 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Vérifier que la personne est dans le groupe
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
       }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de promouvoir le bot.' }, { quoted: msg });
+      break;
+    }
+    if (isGroupAdmin(groupMetadata, target)) {
+      await socket.sendMessage(sender, { text: '❌ Cette personne est déjà administratrice.' }, { quoted: msg });
       break;
     }
 
     // Promouvoir en admin
     await socket.groupParticipantsUpdate(from, [targetJid], 'promote');
-    
-    await socket.sendMessage(sender, { 
-      text: `👑 ${target.notify || targetJid.split('@')[0]} a été promu(e) administrateur.`,
-      mentions: [targetJid]
+
+    await socket.sendMessage(sender, {
+      text: `👑 ${target.notify || targetMentionJid.split('@')[0]} a été promu(e) administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
     console.error('❌ Erreur promote:', error);
-    
+
     let errorMsg = '❌ Impossible de promouvoir le membre. ';
     if (error.message?.includes('not-authorized')) {
-      errorMsg += 'Le bot doit être super-admin.';
+      errorMsg += 'Le bot doit être administrateur du groupe.';
     } else if (error.message?.includes('not-a-participant')) {
       errorMsg += 'Cette personne n\'est pas dans le groupe.';
     } else {
       errorMsg += error.message || 'Erreur inconnue';
     }
-    
+
     await socket.sendMessage(sender, { text: errorMsg }, { quoted: msg });
   }
   break;
@@ -6039,115 +6609,127 @@ case 'demote':
 case 'unadmin': {
   try {
     if (!from.endsWith('@g.us')) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette commande fonctionne uniquement dans les groupes.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette commande fonctionne uniquement dans les groupes.'
       }, { quoted: msg });
       break;
     }
 
     // Vérifier si l'expéditeur est superadmin
     const groupMetadata = await socket.groupMetadata(from);
-    const requester = groupMetadata.participants.find(p => p.id === nowsender);
-    
-    if (!requester || requester.admin !== 'superadmin') {
-      await socket.sendMessage(sender, { 
-        text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.' 
+    if (!isGroupSuperAdmin(groupMetadata, [nowsender, msg.key?.participantAlt])) {
+      await socket.sendMessage(sender, {
+        text: '❌ Seuls les super-administrateurs peuvent rétrograder des administrateurs.'
+      }, { quoted: msg });
+      break;
+    }
+    if (!isGroupSuperAdmin(groupMetadata, socket)) {
+      await socket.sendMessage(sender, { text: '❌ Le bot doit être super-administrateur pour rétrograder un membre.' }, { quoted: msg });
+      break;
+    }
+
+    // Identifier la cible depuis le participant cité ou les mentions PN/LID.
+    const contextInfo = msg.message?.extendedTextMessage?.contextInfo || {};
+    const quotedMsg = contextInfo.quotedMessage;
+    const asFirst = value => Array.isArray(value) ? value[0] : value;
+    let targetIdentifiers = quotedMsg
+      ? [contextInfo.participant, contextInfo.participantAlt]
+      : [asFirst(contextInfo.mentionedJid), asFirst(contextInfo.mentionedJidAlt)];
+
+    if (!targetIdentifiers.some(Boolean) && args[0]) {
+      const input = args[0].replace(/[^0-9a-z@._:-]/gi, '');
+      if (input) targetIdentifiers = [input.includes('@') ? input : `${input}@s.whatsapp.net`];
+    }
+    if (!targetIdentifiers.some(Boolean)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne'
       }, { quoted: msg });
       break;
     }
 
-    // Identifier la personne à rétrograder
-    let targetJid = '';
-    
-    const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    if (quotedMsg) {
-      targetJid = msg.message.extendedTextMessage.contextInfo.participant;
-    } else if (args[0]) {
-      const input = args[0].replace(/[^0-9@]/g, '');
-      targetJid = input.includes('@') ? input : `${input}@s.whatsapp.net`;
-    } else {
-      await socket.sendMessage(sender, { 
-        text: '❌ Usage : !demote <numéro/@mention>\nOu répondez à un message de la personne' 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Vérifier que la personne est admin
-    const target = groupMetadata.participants.find(p => p.id === targetJid);
+    const target = findGroupParticipant(groupMetadata, targetIdentifiers);
     if (!target) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas dans le groupe.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas dans le groupe.'
+      }, { quoted: msg });
+      break;
+    }
+    const targetJid = getParticipantId(target);
+    const targetMentionJid = getParticipantMentionJid(target) || targetJid;
+    if (!targetJid || isBotIdentity(socket, target)) {
+      await socket.sendMessage(sender, { text: '❌ Impossible de rétrograder le bot.' }, { quoted: msg });
+      break;
+    }
+    if (!isAdminParticipant(target)) {
+      await socket.sendMessage(sender, {
+        text: '❌ Cette personne n\'est pas administrateur.'
       }, { quoted: msg });
       break;
     }
 
-    if (target.admin !== 'admin' && target.admin !== 'superadmin') {
-      await socket.sendMessage(sender, { 
-        text: '❌ Cette personne n\'est pas administrateur.' 
+    const superAdmins = (groupMetadata.participants || []).filter(isSuperAdminParticipant);
+    if (isSuperAdminParticipant(target) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de rétrograder l\'unique super-administrateur du groupe.'
       }, { quoted: msg });
       break;
     }
-
-    // Ne pas permettre de se démettre soi-même si on est le seul superadmin
-    if (targetJid === nowsender) {
-      const superAdmins = groupMetadata.participants.filter(p => p.admin === 'superadmin');
-      if (superAdmins.length === 1) {
-        await socket.sendMessage(sender, { 
-          text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.' 
-        }, { quoted: msg });
-        break;
-      }
+    if (areSameIdentity(target, [nowsender, msg.key?.participantAlt]) && superAdmins.length === 1) {
+      await socket.sendMessage(sender, {
+        text: '❌ Vous ne pouvez pas vous retirer en tant que seul super-admin.'
+      }, { quoted: msg });
+      break;
     }
 
     // Rétrograder
     await socket.groupParticipantsUpdate(from, [targetJid], 'demote');
-    
-    await socket.sendMessage(sender, { 
-      text: `📉 ${target.notify || targetJid.split('@')[0]} n\'est plus administrateur.`,
-      mentions: [targetJid]
+
+    await socket.sendMessage(sender, {
+      text: `📉 ${target.notify || targetMentionJid.split('@')[0]} n\'est plus administrateur.`,
+      mentions: [targetMentionJid]
     }, { quoted: msg });
 
   } catch (error) {
     console.error('❌ Erreur demote:', error);
-    
+
     let errorMsg = '❌ Impossible de rétrograder le membre. ';
     if (error.message?.includes('not-authorized')) {
-      errorMsg += 'Le bot doit être super-admin.';
+      errorMsg += 'Le bot doit être administrateur du groupe.';
     } else if (error.message?.includes('not-a-participant')) {
       errorMsg += 'Cette personne n\'est pas dans le groupe.';
     } else {
       errorMsg += error.message || 'Erreur inconnue';
     }
-    
+
     await socket.sendMessage(sender, { text: errorMsg }, { quoted: msg });
   }
   break;
 }
 
 
-            
+
             // ============ UPLOAD TO CHANNEL ============
             case 'upch': {
     const fs = require('fs');
     const path = require('path');
-    
+
     // Chemin pour sauvegarder le JID du channel
     const cjidPath = path.join(__dirname, '..', '..', 'config', 'data', 'cjid.json');
-    
+
     // Fonctions utilitaires
     function getChannelJid() {
         if (fs.existsSync(cjidPath)) {
             try {
                 const data = JSON.parse(fs.readFileSync(cjidPath, 'utf-8'));
                 return data.jid || null;
-            } catch (e) { 
+            } catch (e) {
                 console.error("[UPCH] Erreur lecture cjid:", e);
-                return null; 
+                return null;
             }
         }
         return null;
     }
-    
+
     function saveChannelJid(jid) {
         try {
             if (!fs.existsSync(path.dirname(cjidPath))) {
@@ -6160,46 +6742,46 @@ case 'unadmin': {
             return false;
         }
     }
-    
+
     // 1. Gestion du JID du channel
     const textInput = args.join(' ');
-    
+
     if (textInput && textInput.includes('@newsletter')) {
         const newJid = textInput.trim();
         if (saveChannelJid(newJid)) {
-            await socket.sendMessage(sender, { 
-                text: `✅ *Channel Config*\n\nNouveau JID enregistré:\n${newJid}` 
+            await socket.sendMessage(sender, {
+                text: `✅ *Channel Config*\n\nNouveau JID enregistré:\n${newJid}`
             }, { quoted: msg });
         } else {
-            await socket.sendMessage(sender, { 
-                text: `❌ Échec de l'enregistrement du JID` 
+            await socket.sendMessage(sender, {
+                text: `❌ Échec de l'enregistrement du JID`
             }, { quoted: msg });
         }
         break;
     }
-    
+
     // 2. Vérifier si un JID existe
     let channelJid = getChannelJid();
     if (!channelJid) {
-        await socket.sendMessage(sender, { 
-            text: `📢 *Upload Channel*\n\n❌ Aucun JID de channel enregistré.\n\n📌 *Usage:*\n!${command} <jid_channel>\n\n*Exemple:*\n!${command} 120363025@newsletter` 
+        await socket.sendMessage(sender, {
+            text: `📢 *Upload Channel*\n\n❌ Aucun JID de channel enregistré.\n\n📌 *Usage:*\n!${command} <jid_channel>\n\n*Exemple:*\n!${command} 120363025@newsletter`
         }, { quoted: msg });
         break;
     }
-    
+
     // 3. Vérifier le contenu à envoyer
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     const contentText = textInput;
-    
+
     if (!quoted && !contentText) {
-        await socket.sendMessage(sender, { 
-            text: `❌ Envoie un texte ou réponds à un média.` 
+        await socket.sendMessage(sender, {
+            text: `❌ Envoie un texte ou réponds à un média.`
         }, { quoted: msg });
         break;
     }
-    
-    await socket.sendMessage(sender, { 
-        react: { text: "📤", key: msg.key } 
+
+    await socket.sendMessage(sender, {
+        react: { text: "📤", key: msg.key }
     });
 
     try {
@@ -6207,7 +6789,7 @@ case 'unadmin': {
             // Fonction pour télécharger avec la bonne méthode
             async function downloadMedia(mediaMessage) {
                 const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-                
+
                 let stream;
                 if (mediaMessage.imageMessage) {
                     stream = await downloadContentFromMessage(mediaMessage.imageMessage, 'image');
@@ -6222,87 +6804,87 @@ case 'unadmin': {
                 } else {
                     throw new Error("Type de média non supporté");
                 }
-                
+
                 const chunks = [];
                 for await (const chunk of stream) {
                     chunks.push(chunk);
                 }
                 return Buffer.concat(chunks);
             }
-            
+
             // Télécharger le média
             const mediaBuffer = await downloadMedia(quoted);
-            
+
             if (!mediaBuffer || mediaBuffer.length === 0) {
                 throw new Error("Échec du téléchargement");
             }
-            
+
             // Déterminer le type et envoyer
             if (quoted.imageMessage) {
-                await socket.sendMessage(channelJid, { 
-                    image: mediaBuffer, 
-                    caption: contentText || "" 
+                await socket.sendMessage(channelJid, {
+                    image: mediaBuffer,
+                    caption: contentText || ""
                 });
-                
+
             } else if (quoted.videoMessage) {
-                await socket.sendMessage(channelJid, { 
-                    video: mediaBuffer, 
-                    caption: contentText || "" 
+                await socket.sendMessage(channelJid, {
+                    video: mediaBuffer,
+                    caption: contentText || ""
                 });
-                
+
             } else if (quoted.audioMessage) {
                 // Envoyer audio tel quel (pas de conversion)
-                await socket.sendMessage(channelJid, { 
+                await socket.sendMessage(channelJid, {
                     audio: mediaBuffer,
                     mimetype: quoted.audioMessage.mimetype || 'audio/mp4',
                     ptt: quoted.audioMessage.ptt || false,
                     caption: contentText || ""
                 });
-                
+
             } else if (quoted.stickerMessage) {
-                await socket.sendMessage(channelJid, { 
-                    sticker: mediaBuffer 
+                await socket.sendMessage(channelJid, {
+                    sticker: mediaBuffer
                 });
-                
+
             } else if (quoted.documentMessage) {
-                await socket.sendMessage(channelJid, { 
+                await socket.sendMessage(channelJid, {
                     document: mediaBuffer,
                     fileName: quoted.documentMessage.fileName || "Document",
                     mimetype: quoted.documentMessage.mimetype || 'application/octet-stream'
                 });
-                
+
             } else {
-                await socket.sendMessage(sender, { 
-                    text: `❌ Type de média non supporté` 
+                await socket.sendMessage(sender, {
+                    text: `❌ Type de média non supporté`
                 }, { quoted: msg });
                 await socket.sendMessage(sender, { react: { text: "❓", key: msg.key } });
                 break;
             }
-            
+
         } else if (contentText) {
             // Envoyer du texte simple
-            await socket.sendMessage(channelJid, { 
-                text: contentText 
+            await socket.sendMessage(channelJid, {
+                text: contentText
             });
         }
-        
+
         // Attendre un peu et confirmer
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
-        
-        await socket.sendMessage(sender, { 
-            text: `✅ *Channel Upload*\n\nContenu publié avec succès sur le channel !` 
+
+        await socket.sendMessage(sender, {
+            text: `✅ *Channel Upload*\n\nContenu publié avec succès sur le channel !`
         }, { quoted: msg });
 
     } catch (e) {
         console.error("[UPCH ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
-        
+
         // Essayer une méthode alternative
         try {
             if (quoted) {
@@ -6317,19 +6899,19 @@ case 'unadmin': {
                         message: quoted
                     }
                 });
-                
-                await socket.sendMessage(sender, { 
-                    react: { text: "↩️", key: msg.key } 
+
+                await socket.sendMessage(sender, {
+                    react: { text: "↩️", key: msg.key }
                 });
-                
-                await socket.sendMessage(sender, { 
-                    text: `⚠️ Publié via forward (méthode alternative)` 
+
+                await socket.sendMessage(sender, {
+                    text: `⚠️ Publié via forward (méthode alternative)`
                 }, { quoted: msg });
             }
         } catch (fallbackError) {
             console.error("[UPCH FALLBACK ERROR]:", fallbackError);
-            await socket.sendMessage(sender, { 
-                text: `❌ Erreur: ${e.message}` 
+            await socket.sendMessage(sender, {
+                text: `❌ Erreur: ${e.message}`
             }, { quoted: msg });
         }
     }
@@ -6421,7 +7003,7 @@ ${text}
   }
   break;
 }
-            
+
             // ============ FORWARD/RETURN VOICE ============
 case 'rvo':
 case 'readviewonce':
@@ -6437,39 +7019,17 @@ case 'vv': {
       break;
     }
 
-    // Helper : extraire le contenu view-once quel que soit le nesting (iOS/Android/ephemeral)
-    function extractViewOnceContent(q) {
-      // cas 1: q.viewOnceMessage?.message.{imageMessage|videoMessage|...}
-      if (q.viewOnceMessage && q.viewOnceMessage.message) {
-        const inner = q.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 2: q.ephemeralMessage?.message?.viewOnceMessage?.message.{...} (iPhone parfois)
-      if (q.ephemeralMessage && q.ephemeralMessage.message && q.ephemeralMessage.message.viewOnceMessage && q.ephemeralMessage.message.viewOnceMessage.message) {
-        const inner = q.ephemeralMessage.message.viewOnceMessage.message;
-        const types = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-        const found = types.find(t => inner[t]);
-        if (found) return { qType: found, content: inner[found] };
-      }
-      // cas 3: q.{imageMessage|videoMessage|stickerMessage|documentMessage|audioMessage} direct
-      const directTypes = ['imageMessage','videoMessage','stickerMessage','documentMessage','audioMessage'];
-      const directFound = directTypes.find(t => q[t]);
-      if (directFound) return { qType: directFound, content: q[directFound] };
-      // aucun trouvé
-      return null;
-    }
-
-    const extracted = extractViewOnceContent(quoted);
-    if (!extracted) {
+    // Les aliases de réaction et les différents clients WhatsApp peuvent ajouter
+    // plusieurs enveloppes autour du média (ephemeral, V2/V2Extension, document).
+    const extracted = extractViewOnceMedia(quoted);
+    if (!extracted || !extracted.isViewOnce) {
       await socket.sendMessage(sender, {
         text: '❌ Le message cité ne contient pas de média view-once supporté.'
       }, { quoted: msg });
       break;
     }
 
-    const { qType, content } = extracted;
+    const { field: qType, content } = extracted;
     const messageType = qType.replace(/Message$/i, '').toLowerCase(); // 'image', 'video', 'sticker', 'document', 'audio'
 
     // Télécharger le flux via downloadContentFromMessage
@@ -6556,16 +7116,13 @@ case 'add': {
     break;
   }
   try {
-    const metadata = await socket.groupMetadata(from);
-    const participants = metadata.participants || [];
-    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-    if (!groupAdmins.includes(sender)) {
+    const { metadata } = await getGroupAdminsInfo(socket, from);
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
       await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser cette commande.' }, { quoted: msg });
       break;
     }
-    if (!groupAdmins.includes(botNumber)) {
+    if (!isBotGroupAdmin(metadata, socket)) {
       await socket.sendMessage(from, { text: '❌ Je dois être admin pour ajouter des membres.' }, { quoted: msg });
       break;
     }
@@ -6591,9 +7148,9 @@ case 'add': {
 
 
 // ============ FIN DES COMMANDES DE GROUPE ============
-          
 
-          
+
+
 
 
 case 'firstadmin': {
@@ -6640,10 +7197,10 @@ case 'firstadmin': {
         }
       }
     );
-    
+
     console.log(`🎉 Premier admin initialisé : ${nom} (${jid})`);
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `🎊 **ADMIN INITIALISÉ AVEC SUCCÈS** 🎊
 
 ✅ Premier administrateur créé !
@@ -6669,11 +7226,11 @@ case 'firstadmin': {
 • !breact - Commander tous les bots
 • Et toutes les autres commandes protégées`
     }, { quoted: msg });
-    
+
   } catch (error) {
     console.error('❌ Erreur firstadmin:', error);
-    await socket.sendMessage(sender, { 
-      text: `❌ Erreur : ${error.message}` 
+    await socket.sendMessage(sender, {
+      text: `❌ Erreur : ${error.message}`
     }, { quoted: msg });
   }
   break;
@@ -6682,182 +7239,55 @@ case 'firstadmin': {
 
 case 'breact': {
   try {
-    // Les propriétaires et les admins Mongo partagent ce droit global.
-    if (!isPrivileged) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Accès refusé. Cette commande est réservée aux administrateurs." 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Extraction des paramètres
     const q = body.split(' ').slice(1).join(' ').trim();
-    if (!q.includes(',')) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Format : !breact <channelJid/messageId>,<emoji>\nExemple : !breact 0029Vb761O39mrGTZvQ8UQ02/175,👍" 
+    const parsed = parseBReactInput(q);
+    if (!parsed) {
+      await socket.sendMessage(sender, {
+        text: `Utilisation : ${prefix}breact <lien-de-publication> | 😂 , 🔥 , 😂`
       }, { quoted: msg });
       break;
     }
 
-    const parts = q.split(',');
-    let channelRef = parts[0].trim();
-    const reactEmoji = parts[1].trim();
+    const sessions = [...activeSockets.entries()]
+      .filter(([, botSocket]) => botSocket)
+      .map(([session, botSocket]) => ({ session, socket: botSocket }));
+    if (!sessions.some(entry => entry.socket === socket)) {
+      sessions.push({ session: number || socket.user?.id || 'session-courante', socket });
+    }
 
-    // Extraction du channelJid et messageId
-    let channelJid = null;
-    let messageId = null;
+    await socket.sendMessage(sender, { text: '⏳ Tâche débutée.' }, { quoted: msg });
 
-    // Format URL
-    const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-    if (urlMatch) {
-      channelJid = `${urlMatch[1]}@newsletter`;
-      messageId = urlMatch[2];
-    } 
-    // Format court
-    else {
-      const maybeParts = channelRef.split('/');
-      if (maybeParts.length >= 2) {
-        messageId = maybeParts[maybeParts.length - 1];
-        channelJid = maybeParts[maybeParts.length - 2];
-        if (!channelJid.endsWith('@newsletter')) {
-          if (/^\d+$/.test(channelJid)) {
-            channelJid = `${channelJid}@newsletter`;
+    const reactionRun = (async () => {
+      let succeeded = 0;
+      let failed = sessions.length;
+      try {
+        const channelJid = await resolveNewsletterJid(socket, parsed);
+        const results = await reactAcrossNewsletterSockets(
+          sessions,
+          channelJid,
+          parsed.serverId,
+          parsed.emojis,
+          async (session, result) => {
+            const sessionNumber = String(session || '').split(':')[0].replace(/\D/g, '');
+            if (sessionNumber) await saveNewsletterReaction(channelJid, parsed.serverId, result.reaction, sessionNumber);
           }
-        }
+        );
+        succeeded = results.filter(result => result.ok).length;
+        failed = results.filter(result => !result.ok).length;
+      } catch (error) {
+        console.warn('[BREACT] La tâche n’a pas pu être exécutée :', error?.message || error);
       }
-    }
-
-    // Validation du format
-    if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Format invalide. Utilisez :\n1. `!breact 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n2. `!breact https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`" 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Récupérer tous les bots connectés depuis MongoDB
-    const allNumbers = await getAllNumbersFromMongo();
-    
-    if (!allNumbers || allNumbers.length === 0) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Aucun bot trouvé dans la base de données." 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Filtrer les bots actuellement connectés
-    const connectedNumbers = allNumbers.filter(num => activeSockets.has(num));
-    
-    if (connectedNumbers.length === 0) {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: "❌ Aucun bot actuellement connecté." 
-      }, { quoted: msg });
-      break;
-    }
-
-    // Réagir avec ☑️ pour confirmer la commande
-    await socket.sendMessage(sender, { react: { text: "☑️", key: msg.key } });
-
-    // Envoyer un message d'information
-    await socket.sendMessage(sender, { 
-      text: `🚀 Lancement de la commande multi-bots...
-
-📢 Canal : ${channelJid.split('@')[0]}
-📝 Message ID : ${messageId}
-😊 Émoji : ${reactEmoji}
-🤖 Bots concernés : ${connectedNumbers.length}
-
-L'opération est en cours...`
-    }, { quoted: msg });
-
-    // Lancer les réactions en arrière-plan
-    (async () => {
-      const results = [];
-      
-      for (const botNumber of connectedNumbers) {
-        try {
-          const botSocket = activeSockets.get(botNumber);
-          
-          // Essayer de faire suivre le canal au bot
-          try {
-            await botSocket.newsletterFollow(channelJid);
-            await delay(1500); // Attente après le follow
-          } catch (followError) {
-            // Le bot suit peut-être déjà le canal, continuer
-          }
-          
-          // Envoyer la réaction
-          await botSocket.newsletterReactMessage(channelJid, messageId, reactEmoji);
-          
-          // Sauvegarder dans MongoDB
-          await saveNewsletterReaction(channelJid, messageId, reactEmoji, botNumber);
-          
-          results.push({ bot: botNumber, status: '✅' });
-          
-        } catch (error) {
-          console.error(`❌ Erreur pour le bot ${botNumber}:`, error.message);
-          results.push({ bot: botNumber, status: '❌', error: error.message });
-        }
-        
-        // Pause pour éviter le rate limiting
-        await delay(1000);
-      }
-      
-      // Compter les résultats
-      const successCount = results.filter(r => r.status === '✅').length;
-      const failCount = results.filter(r => r.status === '❌').length;
-      
-      // Envoyer un rapport final
-      let report = `📊 **RAPPORT D'EXÉCUTION** 📊
-
-✅ Commandes envoyées : ${connectedNumbers.length}
-✅ Réussites : ${successCount}
-❌ Échecs : ${failCount}
-📈 Taux de succès : ${Math.round((successCount / connectedNumbers.length) * 100)}%
-
-━━━━━━━━━━━━━━━━━━
-
-📢 Cible : ${channelJid.split('@')[0]}
-📝 Message : ${messageId}
-😊 Émoji : ${reactEmoji}
-🕒 Terminé à : ${getHaitiTimestamp()}
-
-━━━━━━━━━━━━━━━━━━`;
-
-      // Ajouter les détails des échecs si nécessaire
-      const failedBots = results.filter(r => r.status === '❌');
-      if (failedBots.length > 0) {
-        report += `\n\n📋 **Bots en échec :**\n`;
-        failedBots.slice(0, 10).forEach(bot => {
-          report += `• ${bot.bot} : ${bot.error?.substring(0, 50)}${bot.error?.length > 50 ? '...' : ''}\n`;
-        });
-        if (failedBots.length > 10) {
-          report += `\n... et ${failedBots.length - 10} autres`;
-        }
-      }
-      
-      // Envoyer le rapport
-      await socket.sendMessage(sender, { text: report });
-      
-    })(); // Fin de l'exécution asynchrone
-
+      await socket.sendMessage(sender, {
+        text: formatBReactSummary(succeeded, failed)
+      }).catch(error => console.warn('[BREACT] Résumé non envoyé :', error?.message || error));
+    })();
+    void reactionRun;
   } catch (error) {
-    console.error('❌ Erreur commande breact:', error);
-    try {
-      await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-      await socket.sendMessage(sender, { 
-        text: `❌ Erreur interne : ${error.message}` 
-      }, { quoted: msg });
-    } catch (e) {}
+    console.error('[BREACT] Impossible de démarrer la tâche :', error?.message || error);
+    await socket.sendMessage(sender, { text: '❌ Impossible de démarrer la tâche.' }, { quoted: msg }).catch(() => {});
   }
   break;
 }
-
 
 case 'getpp': {
     try {
@@ -6868,7 +7298,7 @@ case 'getpp': {
 
         const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
 
-        let q = msg.message?.conversation?.split(" ")[1] || 
+        let q = msg.message?.conversation?.split(" ")[1] ||
                 msg.message?.extendedTextMessage?.text?.split(" ")[1];
 
         if (!q) return await socket.sendMessage(sender, { text: "❌ Veuillez saisir un numéro.\n\nUtilisation : .getpp <numéro>" });
@@ -6891,8 +7321,8 @@ case 'getpp': {
         };
 
         // 🔹 Send DP with botName meta mention
-        await socket.sendMessage(sender, { 
-    image: { url: ppUrl }, 
+        await socket.sendMessage(sender, {
+    image: { url: ppUrl },
     caption: `🖼 *Photo de profil de* +${q}\nRécupérée par : KAIDO-MD`,
     footer: `📌 KAIDO-MD PHOTO DE PROFIL`,
     headerType: 4
@@ -6904,55 +7334,84 @@ case 'getpp': {
     break;
 }
 
-                
+
 case 'code': {
+  // `from` is the remote chat JID (group or private), so the API result is
+  // returned to the exact conversation in which `.code` was issued.
+  const codeChat = from || msg.key?.remoteJid;
   const q = msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption || '';
-  
+
   const args = q.trim().split(/\s+/);
   args.shift(); // enlever la commande
-  const number = args.join(' ').trim();
+  const requestedNumber = args.join(' ').trim();
+  const pairingTarget = await resolvePairingNumber({
+    explicitNumber: requestedNumber,
+    msg,
+    from,
+    senderJid: nowsender,
+    socket
+  });
+  const cleanNumber = pairingTarget.number;
 
-  if (!number) {
-    return await socket.sendMessage(sender, {
+  if (!cleanNumber) {
+    const details = pairingTarget.error || 'Indique un numéro de téléphone valide.';
+    return await socket.sendMessage(codeChat, {
       text: `*📌 𝗖𝗢𝗗𝗘 𝗗𝗘 𝗖𝗢𝗡𝗡𝗘𝗫𝗜𝗢𝗡 𝗞𝗔𝗜𝗗𝗢*\n\n` +
+            `${details}\n\n` +
             `*Usage:* .code [numéro]\n` +
-            `*Exemple:* .code 5094744XXXX\n\n` +
-            `*Note:* Le numéro doit être au format international sans le +`
+            `Réponds à un message de la personne, ou utilise .code sans numéro pour ton propre compte.\n` +
+            `*Exemple:* .code 50947441234 (sans +)`
     }, { quoted: msg });
   }
 
-  const cleanNumber = number.replace(/[^\d]/g, '');
   if (cleanNumber.length < 9 || cleanNumber.length > 15) {
-    return await socket.sendMessage(sender, {
+    return await socket.sendMessage(codeChat, {
       text: `*❌ 𝙵𝚘𝚛𝚖𝚊𝚝 𝚒𝚗𝚌𝚘𝚛𝚛𝚎𝚌𝚝  *\n\n` +
             `ʟᴇ Nᴜᴍᴇʀᴏ ᴅᴏɪᴛ ᴄᴏɴᴛᴇɴɪʀ ᴇɴᴛʀᴇ 9 ᴇᴛ 15 ᴄʜɪғғʀᴇs.\n` +
             `ᗴ᙭ᗴᗰᑭᒪᗴ: 50947441234`
     }, { quoted: msg });
   }
 
+  let localFallbackAttempted = false;
+  let pairingApiNetworkFailure = false;
   try {
-    await socket.sendMessage(sender, { react: { text: "⏳", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "⏳", key: msg.key } });
 
-    let fetch;
+    // Chaque invocation demande un code frais. On tente d'abord l'hôte public
+    // configuré, puis localhost:PORT si l'adresse publique ne répond pas depuis
+    // le processus lui-même (cas fréquent avec une IP sans hairpin NAT).
+    const pairingUrls = createPairingCodeUrlCandidates(
+      cleanNumber,
+      process.env,
+      undefined,
+      { forceFresh: true }
+    );
+    let pairingResponse;
     try {
-      fetch = (await import('node-fetch')).default;
-    } catch {
-      fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+      pairingResponse = await fetchPairingCodeWithFallback(
+        pairingUrls,
+        fetch,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
+            'Accept': 'application/json'
+          },
+          timeout: PAIRING_CODE_HTTP_TIMEOUT_MS
+        },
+        () => {
+          localFallbackAttempted = true;
+          console.warn('[CODE] Hôte pairing inaccessible; nouvel essai sur localhost et le PORT courant.');
+        }
+      );
+    } catch (error) {
+      pairingApiNetworkFailure = isPairingNetworkError(error);
+      throw error;
     }
-
-    const url = `https://kaidomd-byplag.mooo.com/code?number=${encodeURIComponent(cleanNumber)}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (WhatsAppBot)',
-        'Accept': 'application/json'
-      },
-      timeout: 30000
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    localFallbackAttempted = localFallbackAttempted || pairingResponse.usedFallback;
+    const response = pairingResponse.response;
 
     const bodyText = await response.text();
     let result;
@@ -6961,57 +7420,55 @@ case 'code': {
     } catch {
       const codeMatch = bodyText.match(/"code"\s*:\s*"([^"]+)"/) || bodyText.match(/'code'\s*:\s*'([^']+)'/);
       if (codeMatch) result = { code: codeMatch[1] };
+      else if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       else throw new Error("Réponse invalide du serveur");
     }
 
-    if (!result || !result.code) throw new Error("Aucun code reçu du serveur");
+    if (!response.ok) {
+      throw new Error(result?.message || result?.error || `HTTP ${response.status}: ${response.statusText}`);
+    }
+    if (!result || !result.code) {
+      throw new Error(result?.message || result?.error || "Aucun code reçu du serveur");
+    }
 
     const code = result.code.trim();
 
-    // Message interactif avec bouton copy
-    await socket.relayMessage(sender, {
-      viewOnceMessage: {
-        message: {
-          interactiveMessage: {
-            body: {
-              text: `*✅ CODE DE CONNEXION TROUVÉ*\n\n` +
-                    `*📱 Numéro:* ${cleanNumber}\n` +
-                    `*🔑 Code:* \`${code}\`\n\n` +
-                    `*📋 INSTRUCTIONS:*\n` +
-                    `1. Ouvrez WhatsApp → Paramètres → Appareils liés\n` +
-                    `2. Connecter un appareil → Lier avec un code\n` +
-                    `3. Entrez le code ci-dessus\n\n` +
-                    `⚠️ Le code expire dans 20 secondes`
-            },
-            footer: { text: "> © KAIDO-MD" },
-            header: { hasMediaAttachment: false, title: "Connexion WhatsApp" },
-            nativeFlowMessage: {
-              buttons: [
-                {
-                  name: "cta_copy",
-                  buttonParamsJson: JSON.stringify({
-                    display_text: "📋 Copier le code",
-                    id: "copy_code",
-                    copy_code: code
-                  })
-                }
-              ]
-            }
-          }
-        }
-      }
-    }, { quoted: msg });
+    // Texte simple pour rester compatible avec tous les clients WhatsApp.
+    // Le payload interactif instable n'est pas nécessaire pour copier le code.
+    await socket.sendMessage(codeChat, {
+      text: `*✅ CODE DE CONNEXION TROUVÉ*\n\n` +
+            `*📱 Numéro:* ${cleanNumber}\n` +
+            `*🔑 Code:* \`${code}\`\n\n` +
+            `*📋 INSTRUCTIONS:*\n` +
+            `1. Ouvre WhatsApp → Paramètres → Appareils liés\n` +
+            `2. Connecter un appareil → Lier avec un code\n` +
+            `3. Saisis le code ci-dessus\n\n` +
+            `⚠️ Le code expire dans 20 secondes`
+    }, { quoted: msg, __kaidoSkipLocalFormatting: true });
 
-    await socket.sendMessage(sender, { react: { text: "✅", key: msg.key } });
+    await socket.sendMessage(codeChat, { react: { text: "✅", key: msg.key } });
 
   } catch (err) {
-    console.error("❌ Erreur commande code:", err);
-    await socket.sendMessage(sender, { react: { text: "❌", key: msg.key } });
-    await socket.sendMessage(sender, { text: `❌ Erreur: ${err.message || err}` }, { quoted: msg });
+    const errorText = String(err?.message || err);
+    const isTimeout = pairingApiNetworkFailure && (
+      err?.type === 'request-timeout'
+      || err?.code === 'ETIMEDOUT'
+      || err?.code === 'ESOCKETTIMEDOUT'
+      || /network timeout|timed? ?out|timeout/i.test(errorText)
+    );
+    const isNetworkFailure = pairingApiNetworkFailure;
+    console.error("❌ Erreur commande code:", errorText);
+    await socket.sendMessage(codeChat, { react: { text: "❌", key: msg.key } });
+    const userMessage = isNetworkFailure
+      ? isTimeout
+        ? `❌ Délai dépassé en attendant le serveur de pairing. Une demande de code frais (force=1) a été tentée${localFallbackAttempted ? ' via l’hôte configuré puis localhost' : ''}. Vérifie l’hôte et le PORT, puis réessaie si aucun code n’est arrivé.`
+        : `❌ Le serveur de pairing est inaccessible${localFallbackAttempted ? ' via l’hôte configuré et localhost' : ''}. Vérifie l’hôte et le PORT.${errorText ? ` (${errorText})` : ''}`
+      : `❌ Erreur: ${errorText}`;
+    await socket.sendMessage(codeChat, { text: userMessage }, { quoted: msg });
   }
   break;
 }
-  
+
 case 'deleteme': {
   // 'number' is the session number passed to setupCommandHandlers (sanitized in caller)
   const sanitized = (number || '').replace(/[^0-9]/g, '');
@@ -7110,8 +7567,8 @@ case 'cfn': {
   // Récupérer les arguments après la commande
   const full = args.join(" ").trim();
   if (!full) {
-    await socket.sendMessage(sender, { 
-      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 120363402094635383@newsletter | 🔥,❤️` 
+    await socket.sendMessage(sender, {
+      text: `❗ Fournis une entrée : .cfn <jid@newsletter> | emoji1,emoji2\nExemple: .cfn 0029Vb761O39mrGTZvQ8UQ02@newsletter | 🔥,❤️`
     }, { quoted: msg });
     break;
   }
@@ -7188,103 +7645,58 @@ case 'cfn': {
   break;
 }
 case 'chr': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  const cfg = await loadUserConfigFromMongo(sanitized) || {};
-  const botName = cfg.botName || BOT_NAME_FANCY;
-  const logo = cfg.logo || config.RCD_IMAGE_PATH;
-
-  const senderIdSimple = (nowsender || '').includes('@') ? nowsender.split('@')[0] : (nowsender || '');
-
   const q = body.split(' ').slice(1).join(' ').trim();
-  if (!q.includes(',')) return await socket.sendMessage(sender, { 
-    text: "❌ Usage : chr <channelJid/messageId>,<emoji>\nExemple : chr 0029Vb761O39mrGTZvQ8UQ02/175,👍" 
-  }, { quoted: msg });
-
-  const parts = q.split(',');
-  let channelRef = parts[0].trim();
-  const reactEmoji = parts[1].trim();
-
-  let channelJid = null;
-  let messageId = null;
-
-  // 🔹 OPTION 1 : URL complète (https://whatsapp.com/channel/...)
-  const urlMatch = channelRef.match(/whatsapp\.com\/channel\/([^\/]+)\/(\d+)/);
-  if (urlMatch) {
-    channelJid = `${urlMatch[1]}@newsletter`;
-    messageId = urlMatch[2];
-  }
-  // 🔹 OPTION 2 : Format channelJid/messageId
-  else {
-    const maybeParts = channelRef.split('/');
-    if (maybeParts.length >= 2) {
-      messageId = maybeParts[maybeParts.length - 1];
-      channelJid = maybeParts[maybeParts.length - 2];
-      
-      // Vérifier si le JID contient déjà @newsletter
-      if (!channelJid.endsWith('@newsletter')) {
-        // Si c'est juste des chiffres, ajouter @newsletter
-        if (/^\d+$/.test(channelJid)) {
-          channelJid = `${channelJid}@newsletter`;
-        }
-      }
-    }
-  }
-
-  // Validation finale
-  if (!channelJid || !messageId || !channelJid.endsWith('@newsletter')) {
-    return await socket.sendMessage(sender, { 
-      text: '❌ Format invalide. Utilisez :\n' +
-            '1. `chr 0029Vb761O39mrGTZvQ8UQ02/175,👍`\n' +
-            '2. `chr https://whatsapp.com/channel/0029Vb761O39mrGTZvQ8UQ02/175,👍`' 
-    }, { quoted: msg });
-  }
-
+  const stopMatch = q.match(/^(?:stop|off)\s+(.+)$/i);
   try {
-    await socket.newsletterReactMessage(channelJid, messageId.toString(), reactEmoji);
-    await saveNewsletterReaction(channelJid, messageId.toString(), reactEmoji, sanitized);
-
-    // BotName meta mention
-    const metaQuote = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_CHR" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-
-    let imagePayload;
-    if (String(logo).startsWith('http')) {
-      imagePayload = { url: logo };
-    } else {
-      try {
-        imagePayload = fs.readFileSync(logo);
-      } catch (e) {
-        imagePayload = { url: config.RCD_IMAGE_PATH };
-      }
+    if (stopMatch) {
+      const channelRef = parseNewsletterChannelReference(stopMatch[1]);
+      if (!channelRef) throw new Error('Fournis le lien de la chaîne à arrêter.');
+      const channelJid = await resolveNewsletterJid(socket, channelRef);
+      await removeNewsletterStalkConfig(channelJid);
+      const sockets = new Set([...activeSockets.values(), socket].filter(Boolean));
+      for (const activeSocket of sockets) stopNewsletterStalker(activeSocket, channelJid);
+      await socket.sendMessage(sender, { text: `🛑 Surveillance arrêtée pour ${channelJid}.` }, { quoted: msg });
+      break;
     }
 
-    // Message de confirmation stylisé
+    const separator = q.indexOf('|');
+    if (separator < 0) {
+      await socket.sendMessage(sender, {
+        text: `Utilisation : ${prefix}chr <lien-de-la-chaine> | 🤫 , 🪥 , 🥱\nPour arrêter : ${prefix}chr stop <lien-de-la-chaine>`
+      }, { quoted: msg });
+      break;
+    }
+    const channelRef = parseNewsletterChannelReference(q.slice(0, separator).trim());
+    const emojis = parseReactionEmojiList(q.slice(separator + 1));
+    if (!channelRef || !emojis.length) {
+      await socket.sendMessage(sender, { text: 'Lien de chaîne ou liste d’emojis invalide.' }, { quoted: msg });
+      break;
+    }
+
+    const channelJid = await resolveNewsletterJid(socket, channelRef);
+    const config = await saveNewsletterStalkConfig(channelJid, emojis);
+    const sockets = new Set([...activeSockets.values(), socket].filter(Boolean));
+    const results = await Promise.all([...sockets].map(async activeSocket => {
+      try {
+        await subscribeNewsletterStalker(activeSocket, channelJid, { force: true });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: error?.message || String(error) };
+      }
+    }));
+    const started = results.filter(result => result.ok).length;
+    const failed = results.length - started;
     await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: `✅ Réaction envoyée avec succès !
-
-📢 Canal : ${channelJid}
-📝 Message ID : ${messageId}
-😊 Émoji : ${reactEmoji}
-👤 Par : @${senderIdSimple}
-
-━━━━━━━━━━━━━━━━━━
-
-🕒 ${getHaitiTimestamp()}
-📍 Fuseau : Haïti`,
-      footer: `📌 ${botName} • REACTION`,
-      mentions: [nowsender],
-      buttons: [{ buttonId: `${config.PREFIX}menu`, buttonText: { displayText: "📋 MENU" }, type: 1 }],
-      headerType: 4
-    }, { quoted: metaQuote });
-
-  } catch (e) {
-    console.error('chr command error', e);
-    await socket.sendMessage(sender, { 
-      text: `❌ Échec de la réaction : ${e.message || e}\n\nVérifiez que :\n1. Le bot suit ce canal\n2. Le message existe\n3. Le JID et Message ID sont corrects` 
+      text: `👁️ Surveillance configurée pour ${channelJid}.\n` +
+        `Emojis répartis entre les sessions : ${config.emojis.join(' , ')}\n` +
+        `Écoutes live actives : ${started}/${results.length}. ` +
+        'Aucun abonnement newsletterFollow n’est effectué.\n' +
+        '⚠️ La livraison WhatsApp des publications sans suivi préalable n’a pas été vérifiée; la surveillance peut donc ne rien recevoir.' +
+        (failed ? `\nCertaines sessions réessaieront à leur prochaine connexion. ${results.find(result => !result.ok)?.error || ''}` : '')
     }, { quoted: msg });
+  } catch (error) {
+    console.error('[CHR] Échec de la surveillance :', error?.message || error);
+    await socket.sendMessage(sender, { text: `❌ Impossible de lancer chr : ${error?.message || error}` }, { quoted: msg });
   }
   break;
 }
@@ -7294,14 +7706,14 @@ case '🌹':
 case '😍':
 case '❤️': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
         break; // rien à faire si aucun média cité
     }
 
     try {
         const userJid = jidNormalizedUser(socket.user.id);
-        
+
         // Forwarder directement le message cité
         await socket.sendMessage(userJid, {
             forward: {
@@ -7323,21 +7735,21 @@ case '❤️': {
 
 case 'save': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
-        await socket.sendMessage(sender, { 
-            text: `💾 *Save*\n\n❌ Réponds à un média avec !${command}` 
+        await socket.sendMessage(sender, {
+            text: `💾 *Save*\n\n❌ Réponds à un média avec !${command}`
         }, { quoted: msg });
         break;
     }
 
-    await socket.sendMessage(sender, { 
-        react: { text: "⏳", key: msg.key } 
+    await socket.sendMessage(sender, {
+        react: { text: "⏳", key: msg.key }
     });
 
     try {
         const userJid = jidNormalizedUser(socket.user.id);
-        
+
         // Forwarder directement le message cité
         await socket.sendMessage(userJid, {
             forward: {
@@ -7351,18 +7763,18 @@ case 'save': {
         });
 
         // Seulement la réaction de succès, pas de message texte
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
 
     } catch (e) {
         console.error("[SAVE ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
         // Optionnel: garder le message d'erreur
-        // await socket.sendMessage(sender, { 
-        //     text: `❌ Erreur: ${e.message}` 
+        // await socket.sendMessage(sender, {
+        //     text: `❌ Erreur: ${e.message}`
         // }, { quoted: msg });
     }
     break;
@@ -7381,24 +7793,24 @@ case 'ping': {
 
     // Meta mention (optionnel, garde-le si tu veux le contact Meta)
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_PING" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_PING"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
     // Déterminer le statut
     let status = "";
     let statusEmoji = "";
-    
+
     if (latency < 200) {
       status = "Ultra rapide";
       statusEmoji = "⚡";
@@ -7430,8 +7842,8 @@ ${statusEmoji} *Statut :* ${status}
 
   } catch(e) {
     console.error('❌ Erreur ping:', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible de mesurer la latence.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Impossible de mesurer la latence.'
     }, { quoted: msg });
   }
   break;
@@ -7441,15 +7853,15 @@ ${statusEmoji} *Statut :* ${status}
             case 'bible':
             case 'verset': {
                 if (!args[0]) {
-                    await socket.sendMessage(sender, { 
-                        text: `Usage: !${command} [ta question]\nExemple: !${command} Qui est Jésus ?` 
+                    await socket.sendMessage(sender, {
+                        text: `Usage: !${command} [ta question]\nExemple: !${command} Qui est Jésus ?`
                     }, { quoted: msg });
                     break;
                 }
 
                 const question = args.join(' ');
-                await socket.sendMessage(sender, { 
-                    text: "_🔍 Recherche dans les écritures..._" 
+                await socket.sendMessage(sender, {
+                    text: "_🔍 Recherche dans les écritures..._"
                 }, { quoted: msg });
 
                 try {
@@ -7475,8 +7887,8 @@ ${statusEmoji} *Statut :* ${status}
                     const json = await res.json();
 
                     if (json.status !== 1 || !json.data) {
-                        await socket.sendMessage(sender, { 
-                            text: 'Désolé, je n\'ai trouvé aucun résultat.' 
+                        await socket.sendMessage(sender, {
+                            text: 'Désolé, je n\'ai trouvé aucun résultat.'
                         }, { quoted: msg });
                         break;
                     }
@@ -7504,8 +7916,8 @@ ${statusEmoji} *Statut :* ${status}
 
                 } catch (e) {
                     console.error(e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur : ${e.message}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur : ${e.message}`
                     }, { quoted: msg });
                 }
                 break;
@@ -7514,59 +7926,74 @@ ${statusEmoji} *Statut :* ${status}
             // ============ CRÉATION DE GROUPE ============
             case 'creategroup':
             case 'cgroup': {
-                if (!args[0]) {
-                    await socket.sendMessage(sender, { 
-                        text: `Usage: !${command} [Nom du groupe]\n\nVous pouvez aussi répondre à une image pour l'utiliser comme photo de profil.` 
+                const groupName = args.join(' ').replace(/@\d+/g, '').trim();
+                if (!groupName) {
+                    await socket.sendMessage(sender, {
+                        text: `Usage : ${prefix}${command} <nom du groupe> [@membre]\n\nLa commande doit inclure un membre à ajouter si elle est envoyée depuis le compte du bot.`
+                    }, { quoted: msg });
+                    break;
+                }
+                if (Array.from(groupName).length > 25) {
+                    await socket.sendMessage(sender, { text: '❌ Le nom du groupe doit contenir au maximum 25 caractères.' }, { quoted: msg });
+                    break;
+                }
+
+                const groupParticipant = resolveGroupCreationParticipant(msg, socket);
+                if (!groupParticipant) {
+                    await socket.sendMessage(sender, {
+                        text: '❌ Je n’ai pas pu identifier un membre valide à ajouter. Utilise .cgroup <nom> depuis ton compte, ou mentionne un membre si tu envoies la commande depuis le compte du bot.'
                     }, { quoted: msg });
                     break;
                 }
 
-                const groupName = args.join(' ');
-                await socket.sendMessage(sender, { text: "⏳ Création du groupe en cours..." }, { quoted: msg });
-
+                await socket.sendMessage(sender, { text: '⏳ Création du groupe en cours…' }, { quoted: msg });
+                let createdGroupId = '';
                 try {
-                    // Créer le groupe
-                    const group = await socket.groupCreate(groupName, [sender]);
-                    
-                    let response = `✅ Groupe "${groupName}" créé avec succès !`;
+                    const group = await socket.groupCreate(groupName, [groupParticipant]);
+                    if (!group?.id) throw new Error('WhatsApp n’a pas renvoyé l’identifiant du nouveau groupe.');
+                    createdGroupId = group.id;
 
-                    // Promouvoir le créateur en admin
+                    let response = `✅ Groupe *${groupName}* créé avec succès !`;
                     try {
-                        await socket.groupParticipantsUpdate(group.id, [sender], "promote");
-                        response += `\n\n👑 ${sender.split("@")[0]} a été promu admin automatiquement.`;
-                    } catch (e) {
-                        response += `\n\n(Échec de la promotion automatique en admin.)`;
+                        await socket.groupParticipantsUpdate(group.id, [groupParticipant], 'promote');
+                        response += `\n\n👑 @${groupParticipant.split('@')[0]} a été promu administrateur.`;
+                    } catch (error) {
+                        console.warn('[CGROUP] Promotion du participant impossible :', error?.message || error);
+                        response += '\n\n⚠️ Le groupe est créé, mais la promotion automatique a échoué.';
                     }
-
-                    // Générer le lien d'invitation
                     try {
                         const code = await socket.groupInviteCode(group.id);
-                        const inviteLink = `https://chat.whatsapp.com/${code}`;
-                        response += `\n\n*Lien d'invitation :* ${inviteLink}`;
-                    } catch (e) {
-                        response += `\n\n(Impossible de générer un lien d'invitation.)`;
+                        response += `\n\n🔗 Lien d’invitation : https://chat.whatsapp.com/${code}`;
+                    } catch (error) {
+                        console.warn('[CGROUP] Récupération du lien impossible :', error?.message || error);
+                        response += '\n\n⚠️ Le groupe est créé, mais WhatsApp n’a pas fourni le lien d’invitation.';
                     }
 
-                    // Gérer la photo de profil si disponible
-                    if (msg.message?.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
+                    const quotedMessage = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+                    if (quotedMessage?.imageMessage && typeof socket.updateProfilePicture === 'function') {
                         try {
-                            const mediaMsg = msg.message.extendedTextMessage.contextInfo.quotedMessage;
-                            const media = await socket.downloadMediaMessage(mediaMsg);
-                            await socket.updateProfilePicture(group.id, media);
-                            response += `\n\n🖼️ Photo de profil mise à jour !`;
-                        } catch (e) {
-                            console.error(e);
-                            response += `\n\n(Échec de la mise à jour de la photo de profil.)`;
+                            const stream = await downloadContentFromMessage(quotedMessage.imageMessage, 'image');
+                            const chunks = [];
+                            for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+                            await socket.updateProfilePicture(group.id, Buffer.concat(chunks));
+                            response += '\n\n🖼️ Photo du groupe mise à jour.';
+                        } catch (error) {
+                            console.warn('[CGROUP] Photo du groupe non modifiée :', error?.message || error);
                         }
                     }
-
-                    await socket.sendMessage(sender, { text: response }, { quoted: msg });
-
-                } catch (e) {
-                    console.error(e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors de la création du groupe : ${e.message}` 
+                    await socket.sendMessage(sender, {
+                        text: response,
+                        mentions: [groupParticipant]
                     }, { quoted: msg });
+                } catch (error) {
+                    console.error('[CGROUP] Création/finition impossible :', error?.message || error);
+                    const detail = error?.output?.payload?.message || error?.message || 'erreur inconnue';
+                    const text = createdGroupId
+                        ? `⚠️ Le groupe a bien été créé (${createdGroupId}), mais la finition de la commande a échoué : ${detail}`
+                        : /internal-server-error|500/i.test(String(detail))
+                            ? `❌ WhatsApp a renvoyé une erreur serveur interne pendant la création du groupe. Aucun groupe n’a été confirmé comme créé. Réessaie plus tard ou vérifie la création dans l’application WhatsApp. Détail : ${detail}`
+                            : `❌ Erreur lors de la création du groupe : ${detail}`;
+                    await socket.sendMessage(sender, { text }, { quoted: msg });
                 }
                 break;
             }
@@ -7574,28 +8001,38 @@ ${statusEmoji} *Statut :* ${status}
             // ============ KICK ALL ============
             case 'kickall': {
                 if (!from.endsWith('@g.us')) {
-                    await socket.sendMessage(sender, { 
-                        text: "❗ Cette commande doit être utilisée dans un groupe." 
+                    await socket.sendMessage(sender, {
+                        text: "❗ Cette commande doit être utilisée dans un groupe."
                     }, { quoted: msg });
                     break;
                 }
 
                 try {
-                    const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-                    const groupName = metadata.subject || "Sans nom";
+                    const { metadata, participants } = await getGroupAdminsInfo(socket, from);
+                    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+                    if (!isGroupAdmin(metadata, [actor, msg.key?.participantAlt])) {
+                        await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    if (!isBotGroupAdmin(metadata, socket)) {
+                        await socket.sendMessage(from, { text: '❌ Le bot doit être administrateur pour kickall.' }, { quoted: msg });
+                        break;
+                    }
+                    const groupName = metadata?.subject || "Sans nom";
 
-                    const botNumber = socket.user.id.split(':')[0] + '@s.whatsapp.net';
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
-
-                    // Membres à expulser (non-admins, pas le bot)
-                    const toKick = participants.filter(p => 
-                        !groupAdmins.includes(p.id) && p.id !== botNumber
-                    );
+                    // Membres à expulser (non-admins et pas le bot), résolus par leur JID réel.
+                    const toKick = participants
+                        .filter(participant => !isGroupAdmin(metadata, participant) && !isBotIdentity(socket, participant))
+                        .map(participant => ({
+                            ...participant,
+                            id: getParticipantId(participant),
+                            mentionJid: getParticipantMentionJid(participant)
+                        }))
+                        .filter(participant => participant.id);
 
                     if (!toKick.length) {
-                        await socket.sendMessage(from, { 
-                            text: "❌ Aucun membre à expulser (seulement des admins ou le bot)." 
+                        await socket.sendMessage(from, {
+                            text: "❌ Aucun membre à expulser (seulement des admins ou le bot)."
                         }, { quoted: msg });
                         break;
                     }
@@ -7603,7 +8040,7 @@ ${statusEmoji} *Statut :* ${status}
                     // Liste numérotée
                     let kickLines = "";
                     toKick.forEach((mem, i) => {
-                        const num = mem.id.split('@')[0];
+                        const num = (mem.mentionJid || mem.id).split('@')[0];
                         kickLines += `☠️ ${(i + 1).toString().padStart(2, '0')}. @${num}\n`;
                     });
 
@@ -7613,7 +8050,7 @@ ${statusEmoji} *Statut :* ${status}
 ✦━━━━━━━━━━━━━━━━━━━━✦
 
 📌 GROUPE : ${groupName}
-⚓ Ordre donné par : @${sender.split('@')[0]}
+⚓ Ordre donné par : @${actor.split('@')[0]}
 
 💬 Vous tous avez étés jugés indigne de persister dans ce groupe🚶. Le roi des bêtes à scellé votre destin 🐉!
 👥 Membres expulsés : ${toKick.length}
@@ -7625,20 +8062,20 @@ ${kickLines}
                     // Annonce avant expulsion
                     await socket.sendMessage(from, {
                         text: caption,
-                        mentions: [sender, ...toKick.map(p => p.id)]
+                        mentions: [actor, ...toKick.map(p => p.mentionJid || p.id)]
                     }, { quoted: msg });
 
                     // Expulsion en un seul coup
                     await socket.groupParticipantsUpdate(from, toKick.map(p => p.id), "remove");
 
-                    await socket.sendMessage(from, { 
-                        text: "✅ Tous ces indignes seront supprimés d'un coup" 
+                    await socket.sendMessage(from, {
+                        text: "✅ Tous ces indignes seront supprimés d'un coup"
                     }, { quoted: msg });
 
                 } catch (e) {
                     console.error("[ERROR kickall]", e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors du kickall.\n\n${e.message || e}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur lors du kickall.\n\n${e.message || e}`
                     }, { quoted: msg });
                 }
                 break;
@@ -7647,22 +8084,19 @@ ${kickLines}
             // ============ LISTE ADMINS ============
             case 'listadmin': {
                 if (!from.endsWith('@g.us')) {
-                    await socket.sendMessage(sender, { 
-                        text: "❗ Cette commande doit être utilisée dans un groupe." 
+                    await socket.sendMessage(sender, {
+                        text: "❗ Cette commande doit être utilisée dans un groupe."
                     }, { quoted: msg });
                     break;
                 }
 
                 try {
                     const metadata = await socket.groupMetadata(from);
-                    const participants = metadata.participants || [];
-
-                    // Liste des admins
-                    const groupAdmins = participants.filter(p => p.admin).map(p => p.id);
+                    const groupAdmins = getGroupAdminJids(metadata);
 
                     if (!groupAdmins.length) {
-                        await socket.sendMessage(from, { 
-                            text: "❌ Aucun admin détecté dans ce groupe." 
+                        await socket.sendMessage(from, {
+                            text: "❌ Aucun admin détecté dans ce groupe."
                         }, { quoted: msg });
                         break;
                     }
@@ -7679,8 +8113,8 @@ ${kickLines}
 
                 } catch (e) {
                     console.error("[ERROR listadmin]", e);
-                    await socket.sendMessage(sender, { 
-                        text: `❌ Erreur lors de la récupération des admins.\n\n${e.message || e}` 
+                    await socket.sendMessage(sender, {
+                        text: `❌ Erreur lors de la récupération des admins.\n\n${e.message || e}`
                     }, { quoted: msg });
                 }
                 break;
@@ -7842,17 +8276,17 @@ case 'upscale': {
     // Définir les variables nécessaires
     const jid = msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // Fonction aienhancer intégrée avec améliorations
     async function aienhancer(image, {
       model = 3,
       settings = 'kRpBbpnRCD2nL2RxnnuoMo7MBc0zHndTDkWMl9aW+Gw='
     } = {}) {
       if (!image) throw new Error('image is required');
-      
+
       let base64;
       if (/^https?:\/\//.test(image)) {
-        const img = await axios.get(image, { 
+        const img = await axios.get(image, {
           responseType: 'arraybuffer',
           timeout: 30000,
           headers: {
@@ -7895,7 +8329,7 @@ case 'upscale': {
           image: imageData,
           settings
         },
-        { 
+        {
           headers,
           timeout: 30000
         }
@@ -7918,7 +8352,7 @@ case 'upscale': {
 
         const result = await axios.post('https://aienhancer.ai/api/v1/r/image-enhance/result',
           { task_id: taskId },
-          { 
+          {
             headers,
             timeout: 30000
           }
@@ -7946,7 +8380,7 @@ case 'upscale': {
     // Vérifier si on a une image (citée ou dans le message)
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
     const selfMedia = msg.message?.imageMessage;
-    
+
     if (!quoted && !selfMedia) {
       await socket.sendMessage(sender, {
         text: `❌ Réponds à une image ou envoie une image avec la commande .upscale\nExemple: ${prefix}upscale (en répondant à une image)`
@@ -7960,7 +8394,7 @@ case 'upscale': {
     // Récupérer l'image
     let imageBuffer;
     let imageMime;
-    
+
     try {
       if (quoted) {
         // Image citée
@@ -7976,18 +8410,18 @@ case 'upscale': {
           const chunks = [];
           for await (const chunk of stream) chunks.push(chunk);
           const stickerBuffer = Buffer.concat(chunks);
-          
+
           // Vérifier si sharp est disponible
           let sharp;
           try {
             sharp = require('sharp');
           } catch (e) {
-            await socket.sendMessage(sender, { 
+            await socket.sendMessage(sender, {
               text: '❌ La conversion sticker → image nécessite sharp. Installe-le avec: npm install sharp'
             }, { quoted: msg });
             break;
           }
-          
+
           // Convertir WebP en PNG avec gestion d'erreur
           try {
             imageBuffer = await sharp(stickerBuffer)
@@ -7996,13 +8430,13 @@ case 'upscale': {
             imageMime = 'image/png';
           } catch (sharpErr) {
             console.error('[SHARP ERROR]', sharpErr);
-            await socket.sendMessage(sender, { 
+            await socket.sendMessage(sender, {
               text: '❌ Erreur lors de la conversion du sticker en image.'
             }, { quoted: msg });
             break;
           }
         } else {
-          await socket.sendMessage(sender, { 
+          await socket.sendMessage(sender, {
             text: '❌ Le message cité n\'est pas une image ou un sticker.'
           }, { quoted: msg });
           break;
@@ -8017,14 +8451,14 @@ case 'upscale': {
       }
     } catch (downloadErr) {
       console.error('[DOWNLOAD ERROR]', downloadErr);
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ Erreur lors du téléchargement de l\'image.'
       }, { quoted: msg });
       break;
     }
 
     if (!imageBuffer || imageBuffer.length < 100) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ Image invalide ou corrompue.'
       }, { quoted: msg });
       break;
@@ -8032,7 +8466,7 @@ case 'upscale': {
 
     // Vérifier la taille de l'image (max 10MB pour l'API)
     if (imageBuffer.length > 10 * 1024 * 1024) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: '❌ L\'image est trop volumineuse (max 10MB).'
       }, { quoted: msg });
       break;
@@ -8057,12 +8491,12 @@ case 'upscale': {
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
-    
+
     const tempPath = `${tempDir}/upscale_${Date.now()}.png`;
     fs.writeFileSync(tempPath, imageBuffer);
 
     // Message de progression
-    await socket.sendMessage(sender, { 
+    await socket.sendMessage(sender, {
       text: '🔄 Amélioration de l\'image en cours... (cela peut prendre jusqu\'à 60 secondes)'
     }, { quoted: msg });
 
@@ -8078,14 +8512,14 @@ case 'upscale': {
       }
 
       // Télécharger l'image améliorée
-      const enhancedResponse = await axios.get(result.output, { 
+      const enhancedResponse = await axios.get(result.output, {
         responseType: 'arraybuffer',
         timeout: 30000,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
       });
-      
+
       const enhancedBuffer = Buffer.from(enhancedResponse.data);
 
       // Vérifier que l'image améliorée est valide
@@ -8104,7 +8538,7 @@ case 'upscale': {
 
     } catch (apiErr) {
       console.error('[API ERROR]', apiErr);
-      
+
       let errorMessage = apiErr.message;
       if (apiErr.response?.status === 400) {
         errorMessage = 'Format d\'image non supporté. Essayez avec une autre image.';
@@ -8113,13 +8547,13 @@ case 'upscale': {
       } else if (apiErr.code === 'ECONNABORTED') {
         errorMessage = 'Timeout de connexion.';
       }
-      
-      await socket.sendMessage(sender, { 
+
+      await socket.sendMessage(sender, {
         text: `❌ Erreur API: ${errorMessage}`
       }, { quoted: msg });
-      
+
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
-      
+
     } finally {
       // Nettoyer le fichier temporaire
       try {
@@ -8131,15 +8565,15 @@ case 'upscale': {
 
   } catch (e) {
     console.error('[UPSCALE ERROR]', e);
-    
+
     const jid = msg?.key?.remoteJid;
     const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    
+
     let errorMessage = e.message;
     if (e.response) {
       errorMessage += ` (Status: ${e.response.status})`;
     }
-    
+
     // Messages d'erreur personnalisés
     if (errorMessage.includes('400')) {
       errorMessage = 'Format d\'image non supporté. Essayez avec une image JPG ou PNG.';
@@ -8148,18 +8582,69 @@ case 'upscale': {
     } else if (errorMessage.includes('timeout')) {
       errorMessage = 'Délai d\'attente dépassé. Réessayez plus tard.';
     }
-    
-    await socket.sendMessage(sender, { 
+
+    await socket.sendMessage(sender, {
       text: `❌ Erreur: ${errorMessage}`
     }, { quoted: msg });
-    
+
     try {
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
     } catch (reactErr) {}
   }
   break;
 }
-            
+
+
+case 'forcereconnect':
+case 'force': {
+  if (!isPrivileged) {
+    await socket.sendMessage(sender, {
+      text: '❌ Accès réservé aux administrateurs.'
+    }, { quoted: msg });
+    break;
+  }
+
+  await socket.sendMessage(sender, {
+    text: '⏳ Reconnexion des sessions inactives lancée.'
+  }, { quoted: msg });
+
+  let report;
+  try {
+    const numbers = await getAllNumbersFromMongo();
+    const outcome = await reconnectInactiveSessions(numbers, {
+      activeSockets,
+      isPairingLocked: number => pairingGuard.isLocked(number),
+      getOpenState: getSocketOpenState,
+      markIntentionalClose: candidate => intentionalSocketClosures.add(candidate),
+      clearSocketMetadata: number => socketCreationTime.delete(number),
+      closeSocket: candidate => forceCloseSessionSocket(candidate, error => {
+        console.warn('[FORCE-RECONNECT] fermeture du socket :', error?.message || error);
+      }),
+      launchSessions: inactiveNumbers => inactiveNumbers.map(inactiveNumber => {
+        const scheduled = reconnectScheduler.scheduleImmediate(inactiveNumber, {
+          reason: 'commande forcereconnect'
+        });
+        return {
+          number: inactiveNumber,
+          status: scheduled.scheduled
+            ? 'scheduled'
+            : scheduled.reason === 'deja-programmee'
+              ? 'already_starting'
+              : 'failed'
+        };
+      })
+    });
+    report = formatForceReconnectReport(outcome);
+  } catch (error) {
+    console.error('[FORCE-RECONNECT] échec de la commande :', error?.message || error);
+    report = formatForceReconnectReport({ fatalErrors: 1 });
+  }
+
+  await socket.sendMessage(sender, { text: report }).catch(error => {
+    console.warn('[FORCE-RECONNECT] rapport final non envoyé :', error?.message || error);
+  });
+  break;
+}
 
 case 'active':
 case 'bots': {
@@ -8170,28 +8655,28 @@ case 'bots': {
 
     // Vérification owner/admin Mongo déjà normalisée au début du handler.
     if (!isPrivileged) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Accès réservé aux administrateurs.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Accès réservé aux administrateurs.'
       }, { quoted: msg });
       break;
     }
 
-    const activeCount = activeSockets.size;
-    const activeNumbers = Array.from(activeSockets.keys());
+    const activeCount = activeSockets instanceof Map ? activeSockets.size : 0;
+    const activeNumbers = activeSockets instanceof Map ? Array.from(activeSockets.keys(), value => String(value)) : [];
 
     // Meta mention
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_ACTIVESESSIONS" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_ACTIVESESSIONS"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
@@ -8199,30 +8684,30 @@ case 'bots': {
     let text = `╔═══════════════════════════╗\n`;
     text += `   🤖 SESSIONS ACTIVES 🤖\n`;
     text += `╚═══════════════════════════╝\n\n`;
-    
+
     text += `📊 INFORMATIONS\n`;
     text += `├─ Total : ${activeCount}\n`;
     text += `├─ Heure : ${getHaitiTimestamp()}\n`;
     text += `└─ Fuseau : Haïti\n\n`;
-    
+
     if (activeCount > 0) {
       text += `📱 BOTS CONNECTÉS (${activeCount})\n`;
       text += `┌────────────────────────────┐\n`;
-      
+
       activeNumbers.forEach((num, index) => {
         const status = "🟢";
         text += `│ ${status} ${String(index + 1).padStart(2, ' ')}. ${num.padEnd(15, ' ')} │\n`;
       });
-      
+
       text += `└────────────────────────────┘\n\n`;
-      
+
       text += `📈 STATISTIQUES\n`;
       text += `├─ Densité : ${Math.min(100, Math.round((activeCount / 50) * 100))}%\n`;
       text += `├─ Performance : ${activeCount > 10 ? "Élevée" : activeCount > 5 ? "Moyenne" : "Basse"}\n`;
       text += `└─ Statut : Opérationnel ✅\n\n`;
-      
+
       text += `💡 Les sessions sont stables et actives.`;
-      
+
     } else {
       text += `⚠️ AUCUN BOT CONNECTÉ\n\n`;
       text += `Recommandations :\n`;
@@ -8231,21 +8716,31 @@ case 'bots': {
       text += `• Attendre la reconnexion automatique`;
     }
 
-    // Image
-    const logo = cfg.logo || config.RCD_IMAGE_PATH;
-    let imagePayload = String(logo).startsWith('http') ? { url: logo } : fs.readFileSync(logo);
-
-    await socket.sendMessage(sender, {
-      image: imagePayload,
-      caption: text,
-      footer: `${botName} • Système de monitoring`,
-      headerType: 4
-    }, { quoted: metaQuote });
+    // Utilise l’image locale plutôt qu’un logo personnalisé inaccessible (URL
+    // expirée, chemin absent ou montage déployé sans ce fichier).
+    const activeBanner = path.join(__dirname, '../../assets/images/kaido-menu-banner.png');
+    let imagePayload = null;
+    try { imagePayload = fs.readFileSync(activeBanner); }
+    catch (imageError) { console.warn('[ACTIVE SESSIONS] Bannière locale indisponible :', imageError?.message || imageError); }
+    if (imagePayload) {
+      try {
+        await socket.sendMessage(sender, {
+          image: imagePayload,
+          mimetype: 'image/png',
+          caption: text
+        }, { quoted: metaQuote });
+      } catch (imageError) {
+        console.warn('[ACTIVE SESSIONS] Envoi de l’image impossible; repli texte :', imageError?.message || imageError);
+        await socket.sendMessage(sender, { text }, { quoted: metaQuote });
+      }
+    } else {
+      await socket.sendMessage(sender, { text }, { quoted: metaQuote });
+    }
 
   } catch(e) {
     console.error('❌ Erreur bots:', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible d\'accéder aux données des sessions.' 
+    await socket.sendMessage(sender, {
+      text: `❌ Impossible d'accéder aux données des sessions${e?.message ? ` : ${e.message}` : '.'}`
     }, { quoted: msg });
   }
   break;
@@ -8259,10 +8754,10 @@ case 'facebook': case 'fbdl': case 'fb': {
     // Définir jid à partir de remoteJid (disponible dans ton contexte)
     const jid = remoteJid; // ou msg.key.remoteJid selon ce qui est disponible
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // Vérifier si un lien est fourni
     const url = args.join(' ').trim();
-    
+
     if (!url) {
       await socket.sendMessage(sender, {
         text: `❌ Exemple: ${prefix}${command} https://fb.watch/xxxxxx/`
@@ -8308,13 +8803,13 @@ case 'facebook': case 'fbdl': case 'fb': {
 
     // Parser le HTML avec cheerio
     const $ = cheerio.load(response.data.data);
-    
+
     // Extraire la durée
     const duration = $('.content p').first().text().trim() || 'Inconnue';
-    
+
     // Extraire la miniature
     const thumbnail = $('.thumbnail img').attr('src') || null;
-    
+
     // Extraire toutes les qualités disponibles
     const videos = [];
     $('.download-link-fb').each((_, el) => {
@@ -8341,9 +8836,9 @@ case 'facebook': case 'fbdl': case 'fb': {
     // Sélectionner la meilleure qualité disponible (priorité: HD > 720p > 480p > première)
     const qualityPriority = ['HD', '720p', '480p', '360p'];
     let selectedVideo = videos[0];
-    
+
     for (const priority of qualityPriority) {
-      const found = videos.find(v => 
+      const found = videos.find(v =>
         v.quality.toLowerCase().includes(priority.toLowerCase())
       );
       if (found) {
@@ -8369,10 +8864,10 @@ case 'facebook': case 'fbdl': case 'fb': {
         caption: `📹 *Facebook Video*\n📊 Qualité: ${selectedVideo.quality}\n⏱️ Durée: ${duration}`,
         mimetype: 'video/mp4'
       }, { quoted: msg });
-      
+
     } catch (sendErr) {
       console.error('[FACEBOOK SEND ERROR]', sendErr);
-      
+
       // Si l'envoi direct échoue, envoyer le lien
       await socket.sendMessage(sender, {
         text: `❌ Impossible d'envoyer la vidéo directement.\n\n🔗 *Lien de téléchargement:*\n${selectedVideo.url}\n\n📊 *Qualité:* ${selectedVideo.quality}`
@@ -8384,20 +8879,20 @@ case 'facebook': case 'fbdl': case 'fb': {
 
   } catch (e) {
     console.error('[FACEBOOK ERROR]', e);
-    
+
     // Définir jid et sender pour le bloc catch aussi
     const jid = remoteJid || msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     let errorMessage = e.message;
     if (e.response) {
       errorMessage += ` (Status: ${e.response.status})`;
     }
-    
+
     await socket.sendMessage(sender, {
       text: `❌ Erreur: ${errorMessage}\n\nEssayez un autre lien ou réessayez plus tard.`
     }, { quoted: msg });
-    
+
     await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
   }
   break;
@@ -8632,6 +9127,7 @@ case 'menu': {
 > ・ .mute
 > ・ .unmute
 > ・ .swgc / .gcstatus
+> ・ .style (audio stylisé / Fancy Text)
 > ・ .setgpp
 > ・ .listadmin
 > ・ .creategroup
@@ -8730,7 +9226,7 @@ ${footer}
           `.add, .kick, .creategroup\n` +
           `.save, .tovn, .vv\n` +
           `.play, .bible, .code\n` +
-          `.upch, .swgc / .gcstatus, .img\n` +
+          `.upch, .swgc / .gcstatus, .style, .img\n` +
           `\nUtilise .help [commande] pour plus d'info`
       }, { quoted: msg });
     } catch (e) {}
@@ -8739,8 +9235,8 @@ ${footer}
 }
 
 
-// `.swgc` / `.gcstatus` est implémentée dans plugins/group/swgc.js. Le plugin est exécuté
-// avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
+// `.swgc` / `.gcstatus` et le mode audio de `.style` sont implémentés dans les
+// plugins de groupe. Ils s’exécutent avant ce switch afin de garantir qu’aucun message normal ne soit envoyé dans
 // le groupe ciblé : seul groupStatusMessageV2 y est relayé.
 
 // ==================== DOWNLOAD MENU ====================
@@ -8793,7 +9289,8 @@ case 'help': {
 ・ .tagall               → Mentionne tous les membres du groupe.
 ・ .mute                 → Restreint l'envoi aux admins (admins).
 ・ .unmute               → Réactive l'envoi pour tous.
-・ .swgc / .gcstatus     → Publie en privé un statut de groupe (texte, média ou audio stylisé).
+・ .swgc / .gcstatus     → Publie un statut de groupe (audio brut, texte, image ou vidéo).
+・ .style                → Répond à un audio pour publier la vidéo Kaido stylisée; avec du texte, Fancy Text.
 ・ .listadmin            → Liste les admins du groupe.
 ・ .creategroup          → Crée un nouveau groupe via le bot.
 ・ .listactive           → Liste les membres actifs.
@@ -8999,7 +9496,7 @@ case 'tt': {
     // Définir jid et sender
     const jid = msg.key.remoteJid;
     const sender = msg.key.participant || msg.key.remoteJid;
-    
+
     // headers adaptés au site savett.cc
     const headers = {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -9011,9 +9508,9 @@ case 'tt': {
 
     // helpers encapsulés
     async function getCsrfAndCookie() {
-      const res = await axios.get('https://savett.cc/en1/download', { 
+      const res = await axios.get('https://savett.cc/en1/download', {
         headers,
-        timeout: 10000 
+        timeout: 10000
       });
       const csrf = res.data.match(/name="csrf_token" value="([^"]+)"/)?.[1] || null;
       const cookie = (res.headers['set-cookie'] || [])
@@ -9094,7 +9591,7 @@ case 'tt': {
         // Vérifier l'espace disque disponible
         const stats = await fs.promises.stat('/').catch(() => ({ size: 0 }));
         const freeSpace = stats.size || 1024 * 1024 * 1024; // fallback 1GB
-        
+
         // Limiter à 50MB par fichier
         const response = await axios({
           method: 'GET',
@@ -9109,17 +9606,17 @@ case 'tt': {
 
         const chunks = [];
         let totalSize = 0;
-        
+
         for await (const chunk of response.data) {
           chunks.push(chunk);
           totalSize += chunk.length;
-          
+
           // Vérifier la taille totale
           if (totalSize > 50 * 1024 * 1024) {
             throw new Error('Fichier trop volumineux (>50MB)');
           }
         }
-        
+
         return Buffer.concat(chunks);
       } catch (e) {
         console.error('[TIKTOK] fetchBufferFromUrl error', e?.message || e);
@@ -9130,24 +9627,24 @@ case 'tt': {
     // validation URL
     const url = (args[0] || '').trim();
     if (!url || !/^https?:\/\//i.test(url)) {
-      await socket.sendMessage(sender, { 
-        text: '❗ Usage: .tiktok <url>\nExample: .tiktok https://vt.tiktok.com/xxxxx' 
+      await socket.sendMessage(sender, {
+        text: '❗ Usage: .tiktok <url>\nExample: .tiktok https://vt.tiktok.com/xxxxx'
       }, { quoted: msg });
       break;
     }
 
     // Réaction d'attente
     await socket.sendMessage(jid, { react: { text: "⏳", key: msg.key } });
-    await socket.sendMessage(sender, { 
-      text: '🔎 Recherche et téléchargement en cours, merci de patienter...' 
+    await socket.sendMessage(sender, {
+      text: '🔎 Recherche et téléchargement en cours, merci de patienter...'
     }, { quoted: msg });
 
     // exécution principale
     const info = await savett(url);
 
     if (!info) {
-      await socket.sendMessage(sender, { 
-        text: '❌ Impossible de récupérer les informations pour ce lien.' 
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de récupérer les informations pour ce lien.'
       }, { quoted: msg });
       await socket.sendMessage(jid, { react: { text: "❌", key: msg.key } });
       break;
@@ -9163,9 +9660,9 @@ case 'tt': {
       `💧 Vidéos (watermark): ${info.downloads.wm?.length || 0}`
     ];
     if (info.duration) summary.push(`⏱️ Durée: ${info.duration}`);
-    
-    await socket.sendMessage(sender, { 
-      text: `✅ Résultat:\n${summary.join('\n')}` 
+
+    await socket.sendMessage(sender, {
+      text: `✅ Résultat:\n${summary.join('\n')}`
     }, { quoted: msg });
 
     // Fonction pour envoyer avec gestion d'erreur
@@ -9256,24 +9753,24 @@ case 'tt': {
 
   } catch (err) {
     console.error('[TIKTOK COMMAND ERROR]', err);
-    
+
     // Définir jid et sender pour le catch
     const jid = msg?.key?.remoteJid;
     const sender = msg?.key?.participant || msg?.key?.remoteJid;
-    
-    try { 
-      await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } }); 
+
+    try {
+      await socket.sendMessage(jid, { react: { text: '❌', key: msg.key } });
     } catch(e){}
-    
+
     let errorMessage = err.message || 'Erreur inconnue';
     if (errorMessage.includes('ENOSPC')) {
       errorMessage = 'Espace disque insuffisant pour traiter ce média. Essayez avec un fichier plus petit.';
     } else if (errorMessage.includes('timeout')) {
       errorMessage = 'Délai d\'attente dépassé. Le serveur met trop de temps à répondre.';
     }
-    
-    await socket.sendMessage(sender, { 
-      text: `❌ Erreur lors du traitement: ${errorMessage}` 
+
+    await socket.sendMessage(sender, {
+      text: `❌ Erreur lors du traitement: ${errorMessage}`
     }, { quoted: msg });
   }
   break;
@@ -9285,12 +9782,12 @@ case 'grouplist': {
   try {
     // ✅ Owner check removed — now everyone can use it!
 
-    await socket.sendMessage(sender, { 
-      react: { text: "📝", key: msg.key } 
+    await socket.sendMessage(sender, {
+      react: { text: "📝", key: msg.key }
     });
 
-    await socket.sendMessage(sender, { 
-      text: "📝 Fetching group list..." 
+    await socket.sendMessage(sender, {
+      text: "📝 Fetching group list..."
     }, { quoted: msg });
 
     const groups = await socket.groupFetchAllParticipating();
@@ -9300,8 +9797,8 @@ case 'grouplist': {
     groupArray.sort((a, b) => a.creation - b.creation);
 
     if (groupArray.length === 0) {
-      return await socket.sendMessage(sender, { 
-        text: "❌ No groups found!" 
+      return await socket.sendMessage(sender, {
+        text: "❌ No groups found!"
       }, { quoted: msg });
     }
 
@@ -9342,8 +9839,8 @@ case 'grouplist': {
 
   } catch (err) {
     console.error('GJID command error:', err);
-    await socket.sendMessage(sender, { 
-      text: "❌ Failed to fetch group list. Please try again later." 
+    await socket.sendMessage(sender, {
+      text: "❌ Failed to fetch group list. Please try again later."
     }, { quoted: msg });
   }
   break;
@@ -9563,47 +10060,41 @@ END:VCARD`
         text: '⚠️ Format de lien invalide.\nAssurez‑vous qu’il ressemble à :\nhttps://whatsapp.com/channel/xxxxxxxxx'
       }, { quoted: shonux });
     }
-    const inviteId = match[1];
+    const inviteId = match[1].slice(0, 128);
 
-    // --- Cache mémoire simple pour éviter appels répétés (TTL 10 minutes)
-    if (!global.__whatsapp_channel_cache) global.__whatsapp_channel_cache = new Map();
+    // Cache LRU borné, avec expiration : le TTL seul laissait les vieilles clés
+    // oubliées en mémoire quand les liens n’étaient consultés qu’une fois.
+    if (!isBoundedCache(global.__whatsapp_channel_cache)) {
+      global.__whatsapp_channel_cache = createBoundedCache({ maxEntries: 128, maxAgeMs: 10 * 60 * 1000 });
+    }
     const cacheKey = `channel_${inviteId}`;
     const cached = global.__whatsapp_channel_cache.get(cacheKey);
-    const now = Date.now();
-    if (cached && (now - cached._ts) < (10 * 60 * 1000)) {
+    if (cached) {
       const metadata = cached.metadata;
       if (process.env.LOG_LEVEL === 'debug') console.debug('[CID] renvoi depuis le cache pour', inviteId);
       const infoTextCached = buildChannelInfoText(metadata, botName);
       // Envoi interactif depuis le cache
       const previewUrlCached = normalizePreviewUrl(metadata.preview);
-      const interactiveCached = {
-        viewOnceMessage: {
-          message: {
-            interactiveMessage: {
-              body: { text: infoTextCached },
-              footer: { text: `© ${botName}` },
-              header: previewUrlCached ? { imageMessage: { url: previewUrlCached } } : { title: "Channel Info" },
-              nativeFlowMessage: {
-                buttons: [
-                  {
-                    name: "cta_copy",
-                    buttonParamsJson: JSON.stringify({
-                      display_text: "📋 Copier l'ID",
-                      id: "copy_id",
-                      copy_code: metadata.id
-                    })
-                  }
-                ]
-              }
-            }
-          }
+      const interactiveCached = buildChannelInfoInteractiveMessage({
+        infoText: infoTextCached,
+        botName,
+        copyCode: metadata.id
+      });
+      if (previewUrlCached) {
+        try {
+          await socket.sendMessage(sender, {
+            image: { url: previewUrlCached },
+            caption: `📡 *${metadata.name || 'WhatsApp Channel'}*`
+          }, { quoted: shonux });
+        } catch (error) {
+          console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
         }
-      };
+      }
       try {
-        await socket.relayMessage(sender, interactiveCached.viewOnceMessage.message, { messageId: `cid_${inviteId}_${Date.now()}` });
+        await socket.relayMessage(sender, interactiveCached, { messageId: `cid_${inviteId}_${Date.now()}` });
       } catch (e) {
-        // fallback texte si relay échoue
-        await socket.sendMessage(sender, { text: infoTextCached }, { quoted: shonux });
+        console.warn('[CID] CTA copy indisponible; repli texte :', e?.message || e);
+        await socket.sendMessage(sender, { text: `${infoTextCached}\n\n🆔 ID à copier : \`${metadata.id}\`` }, { quoted: shonux });
       }
       break;
     }
@@ -9635,15 +10126,26 @@ END:VCARD`
       }, { quoted: shonux });
     }
 
+    const safeMetadataText = (value, maxLength = 256) => {
+      if (value instanceof Date && Number.isFinite(value.getTime())) value = value.toISOString();
+      if (typeof value !== 'string' && typeof value !== 'number') return null;
+      const text = String(value).trim().slice(0, maxLength);
+      return text || null;
+    };
+    const rawPreview = metadata.preview || metadata.thumbnail || metadata.image || null;
+    const preview = typeof rawPreview === 'string'
+      ? rawPreview.slice(0, 2048)
+      : (typeof rawPreview?.url === 'string' ? rawPreview.url.slice(0, 2048) : null);
+    const subscriberCount = Number(metadata.subscribers ?? metadata.subscriberCount ?? metadata.followers);
     const normalized = {
-      id: metadata.id || inviteId,
-      name: metadata.name || metadata.title || null,
-      subscribers: (typeof metadata.subscribers === 'number') ? metadata.subscribers : (metadata.subscriberCount || metadata.followers || null),
-      creation_time: metadata.creation_time || metadata.createdAt || metadata.created_at || null,
-      preview: metadata.preview || metadata.thumbnail || metadata.image || null,
-      description: metadata.description || metadata.about || null,
-      category: metadata.category || null,
-      owner: metadata.owner || metadata.creator || null
+      id: safeMetadataText(metadata.id || inviteId, 256),
+      name: safeMetadataText(metadata.name || metadata.title, 256),
+      subscribers: Number.isFinite(subscriberCount) ? subscriberCount : null,
+      creation_time: safeMetadataText(metadata.creation_time || metadata.createdAt || metadata.created_at, 64),
+      preview,
+      description: safeMetadataText(metadata.description || metadata.about, 1200),
+      category: safeMetadataText(metadata.category, 100),
+      owner: safeMetadataText(metadata.owner || metadata.creator, 256)
     };
 
     // --- Persister dans le cache mémoire
@@ -9674,53 +10176,40 @@ END:VCARD`
     }
 
     function normalizePreviewUrl(preview) {
-      if (!preview) return null;
-      if (preview.startsWith('http')) return preview;
-      return `https://pps.whatsapp.net${preview}`;
+      if (typeof preview !== 'string' || !preview) return null;
+      const value = preview.slice(0, 2048);
+      if (/^https?:\/\//i.test(value)) return value;
+      return `https://pps.whatsapp.net${value.startsWith('/') ? '' : '/'}${value}`;
     }
 
     const infoText = buildChannelInfoText(normalized, botName);
     const previewUrl = normalizePreviewUrl(normalized.preview);
 
-    // --- Construire le message interactif avec bouton "copy"
-    const interactive = {
-      viewOnceMessage: {
-        message: {
-          interactiveMessage: {
-            body: { text: infoText },
-            footer: { text: `© ${botName}` },
-            header: previewUrl ? { imageMessage: { url: previewUrl } } : { title: "Channel Info" },
-            nativeFlowMessage: {
-              buttons: [
-                {
-                  name: "cta_copy",
-                  buttonParamsJson: JSON.stringify({
-                    display_text: "📋 Copier l'ID",
-                    id: "copy_id",
-                    copy_code: normalized.id
-                  })
-                }
-              ]
-            }
-          }
-        }
+    const interactive = buildChannelInfoInteractiveMessage({
+      infoText,
+      botName,
+      copyCode: normalized.id
+    });
+    if (previewUrl) {
+      try {
+        await socket.sendMessage(sender, {
+          image: { url: previewUrl },
+          caption: `📡 *${normalized.name || 'WhatsApp Channel'}*`
+        }, { quoted: shonux });
+      } catch (error) {
+        console.warn('[CID] aperçu du channel indisponible :', error?.message || error);
       }
-    };
+    }
 
-    // --- Envoyer le message interactif (relay) ; fallback sur texte si échec
+    // L’en-tête reste textuel : une URL ne peut pas être fournie comme
+    // imageMessage brut dans un relay interactif; le bouton CTA copy est natif.
     try {
-      await socket.relayMessage(sender, interactive.viewOnceMessage.message, { messageId: `cid_${inviteId}_${Date.now()}` });
+      await socket.relayMessage(sender, interactive, { messageId: `cid_${inviteId}_${Date.now()}` });
     } catch (errRelay) {
-      console.warn('[CID] relay interactive failed, fallback to text', errRelay?.message || errRelay);
-      if (previewUrl) {
-        try {
-          await socket.sendMessage(sender, { image: { url: previewUrl }, caption: infoText }, { quoted: shonux });
-        } catch (e) {
-          await socket.sendMessage(sender, { text: infoText }, { quoted: shonux });
-        }
-      } else {
-        await socket.sendMessage(sender, { text: infoText }, { quoted: shonux });
-      }
+      console.warn('[CID] relay interactif indisponible, repli texte :', errRelay?.message || errRelay);
+      await socket.sendMessage(sender, {
+        text: `${infoText}\n\n🆔 ID à copier : \`${normalized.id}\``
+      }, { quoted: shonux });
     }
 
   } catch (err) {
@@ -9793,39 +10282,43 @@ case 'addadmin': {
 case 'tagall': {
   try {
     if (!from || !from.endsWith('@g.us')) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Cette commande ne peut être utilisée que dans les groupes.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Cette commande ne peut être utilisée que dans les groupes.'
       }, { quoted: msg });
     }
 
     let gm = null;
-    try { 
-      gm = await socket.groupMetadata(from); 
-    } catch(e) { 
-      gm = null; 
+    try {
+      gm = await socket.groupMetadata(from);
+    } catch(e) {
+      gm = null;
     }
-    
+
     if (!gm) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Impossible de récupérer les informations du groupe.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Impossible de récupérer les informations du groupe.'
       }, { quoted: msg });
     }
 
-    const participants = gm.participants || [];
+    const participants = Array.isArray(gm.participants) ? gm.participants : [];
+    const actor = nowsender || msg.key?.participant || msg.key?.remoteJid;
+    if (!isGroupAdmin(gm, [actor, msg.key?.participantAlt])) {
+      return await socket.sendMessage(from, { text: '❌ Seuls les admins peuvent utiliser tagall.' }, { quoted: msg });
+    }
     if (!participants.length) {
-      return await socket.sendMessage(sender, { 
-        text: '❌ Aucun membre trouvé dans le groupe.' 
+      return await socket.sendMessage(sender, {
+        text: '❌ Aucun membre trouvé dans le groupe.'
       }, { quoted: msg });
     }
 
     const text = args && args.length ? args.join(' ') : '📢 Annonce à tous les membres';
 
     let groupPP = 'https://i.ibb.co/9q2mG0Q/default-group.jpg';
-    try { 
-      groupPP = await socket.profilePictureUrl(from, 'image'); 
+    try {
+      groupPP = await socket.profilePictureUrl(from, 'image');
     } catch(e){}
 
-    const mentions = participants.map(p => p.id || p.jid);
+    const mentions = participants.map(getParticipantMentionJid).filter(Boolean);
     const groupName = gm.subject || 'Groupe';
     const totalMembers = participants.length;
 
@@ -9838,17 +10331,17 @@ case 'tagall': {
 
     // BotName meta mention
     const metaQuote = {
-      key: { 
-        remoteJid: "status@broadcast", 
-        participant: "0@s.whatsapp.net", 
-        fromMe: false, 
-        id: "META_AI_TAGALL" 
+      key: {
+        remoteJid: "status@broadcast",
+        participant: "0@s.whatsapp.net",
+        fromMe: false,
+        id: "META_AI_TAGALL"
       },
-      message: { 
-        contactMessage: { 
-          displayName: botName, 
-          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` 
-        } 
+      message: {
+        contactMessage: {
+          displayName: botName,
+          vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD`
+        }
       }
     };
 
@@ -9892,8 +10385,8 @@ ${"─".repeat(35)}
 
   } catch (err) {
     console.error('tagall error', err);
-    await socket.sendMessage(sender, { 
-      text: '❌ Erreur lors de l\'exécution de la commande tagall.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Erreur lors de l\'exécution de la commande tagall.'
     }, { quoted: msg });
   }
   break;
@@ -9959,35 +10452,35 @@ case 'deladmin': {
 
             case 'tovn': {
     const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
-    
+
     if (!quoted) {
-        await socket.sendMessage(sender, { 
-            text: `🎵 *Convert to Voice Note*\n\n❌ Réponds à un audio ou vidéo` 
-        }, { quoted: msg });
-        break;
-    }
-    
-    const isAudio = quoted.audioMessage;
-    const isVideo = quoted.videoMessage;
-    
-    if (!isAudio && !isVideo) {
-        await socket.sendMessage(sender, { 
-            text: `❌ Type non supporté. Réponds à un audio (🎵) ou vidéo (🎥)` 
+        await socket.sendMessage(sender, {
+            text: `🎵 *Convert to Voice Note*\n\n❌ Réponds à un audio ou vidéo`
         }, { quoted: msg });
         break;
     }
 
-    await socket.sendMessage(sender, { 
-        react: { text: "⏳", key: msg.key } 
+    const isAudio = quoted.audioMessage;
+    const isVideo = quoted.videoMessage;
+
+    if (!isAudio && !isVideo) {
+        await socket.sendMessage(sender, {
+            text: `❌ Type non supporté. Réponds à un audio (🎵) ou vidéo (🎥)`
+        }, { quoted: msg });
+        break;
+    }
+
+    await socket.sendMessage(sender, {
+        react: { text: "⏳", key: msg.key }
     });
 
     try {
         // CORRECTION ICI : Bonne méthode pour télécharger
         let buffer;
-        
+
         // Méthode 1: Utiliser downloadContentFromMessage (méthode Baileys officielle)
         const { downloadContentFromMessage } = require('@whiskeysockets/baileys');
-        
+
         if (quoted.audioMessage) {
             const stream = await downloadContentFromMessage(quoted.audioMessage, 'audio');
             const chunks = [];
@@ -9995,7 +10488,7 @@ case 'deladmin': {
                 chunks.push(chunk);
             }
             buffer = Buffer.concat(chunks);
-            
+
         } else if (quoted.videoMessage) {
             const stream = await downloadContentFromMessage(quoted.videoMessage, 'video');
             const chunks = [];
@@ -10004,19 +10497,19 @@ case 'deladmin': {
             }
             buffer = Buffer.concat(chunks);
         }
-        
+
         if (!buffer || buffer.length === 0) {
             throw new Error("Buffer vide");
         }
-        
+
         console.log(`[TOVN] Buffer obtenu: ${buffer.length} bytes`);
-        
+
         // Fonction de conversion (gardée de ton code)
         async function convertToOpus(inputBuffer) {
             return new Promise((resolve, reject) => {
                 const ffmpeg = require('fluent-ffmpeg');
                 const { PassThrough } = require('stream');
-                
+
                 const inStream = new PassThrough();
                 const outStream = new PassThrough();
                 const chunks = [];
@@ -10050,10 +10543,10 @@ case 'deladmin': {
                 outStream.on("data", (c) => chunks.push(c));
             });
         }
-        
+
         // Convertir
         const opusBuffer = await convertToOpus(buffer);
-        
+
         // Envoyer comme voice note
         await socket.sendMessage(sender, {
             audio: opusBuffer,
@@ -10061,44 +10554,44 @@ case 'deladmin': {
             ptt: true,
             caption: "🔊 Voice Note"
         }, { quoted: msg });
-        
-        await socket.sendMessage(sender, { 
-            react: { text: "✅", key: msg.key } 
+
+        await socket.sendMessage(sender, {
+            react: { text: "✅", key: msg.key }
         });
 
     } catch (e) {
         console.error("[TOVN ERROR]:", e);
-        await socket.sendMessage(sender, { 
-            react: { text: "❌", key: msg.key } 
+        await socket.sendMessage(sender, {
+            react: { text: "❌", key: msg.key }
         });
-        
+
         // Fallback: méthode simple sans conversion
         try {
             console.log("[TOVN] Essai méthode fallback...");
-            
+
             if (quoted.audioMessage) {
                 // Juste forwarder l'audio en PTT
-                await socket.sendMessage(sender, quoted, { 
+                await socket.sendMessage(sender, quoted, {
                     quoted: msg,
                     ptt: true // Force en voice note
                 });
-                
-                await socket.sendMessage(sender, { 
-                    react: { text: "🎵", key: msg.key } 
+
+                await socket.sendMessage(sender, {
+                    react: { text: "🎵", key: msg.key }
                 });
             }
-            
+
         } catch (fallbackError) {
             console.error("[TOVN FALLBACK ERROR]:", fallbackError);
-            await socket.sendMessage(sender, { 
-                text: `❌ Impossible de convertir: ${e.message}` 
+            await socket.sendMessage(sender, {
+                text: `❌ Impossible de convertir: ${e.message}`
             }, { quoted: msg });
         }
     }
     break;
 }
 
-           
+
 
 case 'admins': {
   try {
@@ -10204,15 +10697,15 @@ case 'setpath': {
   const sanitized = (number || '').replace(/[^0-9]/g, '');
   const senderNum = (nowsender || '').split('@')[0];
   const ownerNum = primaryOwnerNumber();
-  
+
   // Vérification des permissions
   if (!(isOwner || isSessionOwner)) {
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH1" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    await socket.sendMessage(sender, { 
-      text: '❌ Permission refusée. Seul le propriétaire de la session ou du bot peut configurer le chemin de sauvegarde.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Permission refusée. Seul le propriétaire de la session ou du bot peut configurer le chemin de sauvegarde.'
     }, { quoted: shonux });
     break;
   }
@@ -10223,8 +10716,8 @@ case 'setpath': {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH2" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    return await socket.sendMessage(sender, { 
-      text: '❗ Fournissez un numéro. Exemple : `.setpath 50912345678`' 
+    return await socket.sendMessage(sender, {
+      text: '❗ Fournissez un numéro. Exemple : `.setpath 50912345678`'
     }, { quoted: shonux });
   }
 
@@ -10235,19 +10728,19 @@ case 'setpath': {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH3" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    return await socket.sendMessage(sender, { 
-      text: '❌ Numéro invalide. Format attendu : 50912345678' 
+    return await socket.sendMessage(sender, {
+      text: '❌ Numéro invalide. Format attendu : 50912345678'
     }, { quoted: shonux });
   }
 
   try {
     // Charger la configuration existante
     let cfg = await loadUserConfigFromMongo(sanitized) || {};
-    
+
     // Ajouter le chemin de sauvegarde avec @s.whatsapp.net
     cfg.savePath = `${cleanPathNumber}@s.whatsapp.net`;
     cfg.savePathNumber = cleanPathNumber; // Garder aussi le numéro sans suffixe
-    
+
     // Sauvegarder dans MongoDB
     await setUserConfigInMongo(sanitized, cfg);
 
@@ -10256,18 +10749,18 @@ case 'setpath': {
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
 
-    await socket.sendMessage(sender, { 
-      text: `✅ Chemin de sauvegarde configuré pour cette session : ${cleanPathNumber}\n\nLes médias sauvegardés seront envoyés à : ${cleanPathNumber}@s.whatsapp.net` 
+    await socket.sendMessage(sender, {
+      text: `✅ Chemin de sauvegarde configuré pour cette session : ${cleanPathNumber}\n\nLes médias sauvegardés seront envoyés à : ${cleanPathNumber}@s.whatsapp.net`
     }, { quoted: shonux });
-    
+
   } catch (e) {
     console.error('setpath error', e);
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SETPATH5" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
-    await socket.sendMessage(sender, { 
-      text: `❌ Échec de la configuration du chemin : ${e.message || e}` 
+    await socket.sendMessage(sender, {
+      text: `❌ Échec de la configuration du chemin : ${e.message || e}`
     }, { quoted: shonux });
   }
   break;
@@ -10278,67 +10771,41 @@ case 'getpath': {
   try {
     const sanitized = (number || '').replace(/[^0-9]/g, '');
     const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    
+
     const shonux = {
       key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_GETPATH" },
       message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
     };
 
     if (cfg.savePath) {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: `📍 Configuration de sauvegarde :
-        
+
 📱 Numéro cible : ${cfg.savePathNumber}
 🔗 JID complet : ${cfg.savePath}
 📅 Configuré le : ${cfg.updatedAt ? new Date(cfg.updatedAt).toLocaleString('fr-FR') : 'Date inconnue'}
 💾 Statut : ✅ Activé
 
-Les commandes .save2 enverront les médias à cette destination.` 
+Les commandes .save2 enverront les médias à cette destination.`
       }, { quoted: shonux });
     } else {
-      await socket.sendMessage(sender, { 
+      await socket.sendMessage(sender, {
         text: `⚠️ Aucun chemin de sauvegarde configuré.
-        
+
 Utilisez la commande :
 .setpath <numéro>
 
 Exemple : .setpath 50912345678
 
-Les médias sauvegardés seront envoyés à ce numéro.` 
+Les médias sauvegardés seront envoyés à ce numéro.`
       }, { quoted: shonux });
     }
-    
+
   } catch (e) {
     console.error('getpath error', e);
-    await socket.sendMessage(sender, { 
-      text: '❌ Impossible de récupérer la configuration.' 
+    await socket.sendMessage(sender, {
+      text: '❌ Impossible de récupérer la configuration.'
     }, { quoted: msg });
-  }
-  break;
-}
-
-case 'showconfig': {
-  const sanitized = (number || '').replace(/[^0-9]/g, '');
-  try {
-    const cfg = await loadUserConfigFromMongo(sanitized) || {};
-    const botName = cfg.botName || BOT_NAME_FANCY;
-
-    const shonux = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SHOWCONFIG" },
-      message: { contactMessage: { displayName: botName, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${botName};;;;\nFN:${botName}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-
-    let txt = `*Session config for ${sanitized}:*\n`;
-    txt += `• Bot name: ${botName}\n`;
-    txt += `• Logo: ${cfg.logo || config.RCD_IMAGE_PATH}\n`;
-    await socket.sendMessage(sender, { text: txt }, { quoted: shonux });
-  } catch (e) {
-    console.error('showconfig error', e);
-    const shonux = {
-      key: { remoteJid: "status@broadcast", participant: "0@s.whatsapp.net", fromMe: false, id: "META_AI_SHOWCONFIG2" },
-      message: { contactMessage: { displayName: BOT_NAME_FANCY, vcard: `BEGIN:VCARD\nVERSION:3.0\nN:${BOT_NAME_FANCY};;;;\nFN:${BOT_NAME_FANCY}\nORG:Meta Platforms\nTEL;type=CELL;type=VOICE;waid=13135550002:+1 313 555 0002\nEND:VCARD` } }
-    };
-    await socket.sendMessage(sender, { text: '❌ Failed to load config.' }, { quoted: shonux });
   }
   break;
 }
@@ -10386,16 +10853,39 @@ case 'resetconfig': {
       console.error('Command handler error:', err);
       try { await socket.sendMessage(sender, { image: { url: config.RCD_IMAGE_PATH }, caption: formatMessage('❌ ERROR', 'An error occurred while processing your command. Please try again.', BOT_NAME_FANCY) }); } catch(e){}
     }
-
-  }));
+    }, (error, { index, message, queueDelayMs, processingDurationMs } = {}) => {
+      if (batchStats) {
+        if (Number.isFinite(queueDelayMs)) {
+          batchStats.lastQueueDelayMs = queueDelayMs;
+          batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+        }
+        if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
+        batchStats.errors += 1;
+        batchStats.lastErrorAt = Date.now();
+        batchStats.lastError = String(error?.message || error).slice(0, 300);
+      }
+      console.error(
+        `[SESSION ${number || 'inconnue'}] traitement messages.upsert #${index} (${message?.key?.id || 'sans id'}) :`,
+        error?.stack || error
+      );
+    }, (_result, { queueDelayMs, processingDurationMs } = {}) => {
+      if (!batchStats) return;
+      batchStats.processed += 1;
+      batchStats.lastProcessedAt = Date.now();
+      if (Number.isFinite(queueDelayMs)) {
+        batchStats.lastQueueDelayMs = queueDelayMs;
+        batchStats.maxQueueDelayMs = Math.max(batchStats.maxQueueDelayMs || 0, queueDelayMs);
+      }
+      if (Number.isFinite(processingDurationMs)) batchStats.lastProcessingDurationMs = processingDurationMs;
+    });
+  });
 }
 
 // ---------------- message handlers ----------------
 
 function setupMessageHandlers() {
-  // La présence et les accusés de lecture sont gérés après reconnaissance de la
-  // commande dans setupCommandHandlers. Ne rien envoyer ici évite de réveiller
-  // le compte pour un message ordinaire lorsque AUTO_ONLINE est désactivé.
+  // Le socket reste unavailable au repos. setupReplyPresenceWrapper ne publie
+  // une présence available que pendant un sendMessage, puis revient offline.
 }
 
 // ---------------- cleanup helper ----------------
@@ -10419,8 +10909,15 @@ async function deleteSessionAndCleanup(number, socketInstance, { notifyOwner = t
     pairingSockets.delete(sanitized);
     socketCreationTime.delete(sanitized);
     lastConnectionActivity.delete(sanitized);
+    messageProcessingStats.delete(sanitized);
+    messageDispatchers.delete(sanitized);
+    sessionConfigCache.delete(sanitized);
+    sessionConfigRefreshAfter.delete(sanitized);
+    sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
     connectionLifecycles.delete(sanitized);
     socketRuntimeMetadata.delete(sanitized);
+    deleteSessionStore(sanitized);
+    statusLog.clear(sanitized);
 
     // 2) Socket : logout côté WhatsApp puis fermeture de la websocket. Le
     // marqueur est posé AVANT logout(), car celui-ci peut émettre close aussitôt.
@@ -10476,8 +10973,15 @@ async function purgeFailedSession(number, { socket = null, reason = 'appairage �
   activeSockets.delete(sanitized);
   socketCreationTime.delete(sanitized);
   lastConnectionActivity.delete(sanitized);
+  messageProcessingStats.delete(sanitized);
+  messageDispatchers.delete(sanitized);
+  sessionConfigCache.delete(sanitized);
+  sessionConfigRefreshAfter.delete(sanitized);
+  sessionConfigRevision.set(sanitized, (sessionConfigRevision.get(sanitized) || 0) + 1);
   connectionLifecycles.delete(sanitized);
   socketRuntimeMetadata.delete(sanitized);
+  deleteSessionStore(sanitized);
+  statusLog.clear(sanitized);
 
   if (socket) {
     intentionalSocketClosures.add(socket);
@@ -10531,6 +11035,41 @@ const reconnectScheduler = createReconnectScheduler({
     );
   }
 });
+
+// Baileys envoie déjà une IQ ping-pong sur CHAQUE socket au rythme configuré
+// dans makeWASocket. Ce watchdog vérifie le vrai getter `socket.ws.isOpen` de
+// WebSocketClient (pas `readyState`, qui n’existe pas sur son wrapper) et ne
+// recycle que les sockets durablement bloqués. Il réutilise le scheduler unique.
+const sessionHealthWatcher = createSessionHealthWatcher({
+  getSessions: () => activeSockets,
+  intervalMs: SESSION_HEALTH_CHECK_INTERVAL_MS,
+  staleAfterMs: SESSION_STALE_AFTER_MS,
+  onStale: async (number, socket, health) => {
+    if (shuttingDown || activeSockets.get(number) !== socket || getSocketOpenState(socket) !== false) return;
+    console.error(
+      `[SESSION ${number}] WebSocket toujours fermé après ${Math.round(health.unhealthyForMs / 1000)} s; reconnexion ciblée.`
+    );
+    activeSockets.delete(number);
+    socketCreationTime.delete(number);
+    try {
+      forceCloseSessionSocket(socket, error => {
+        console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+      });
+    } catch (error) {
+      console.warn(`[SESSION ${number}] fermeture watchdog :`, error?.message || error);
+    }
+    const scheduled = reconnectScheduler.schedule(number, {
+      reason: 'watchdog keepalive : socket non ouvert'
+    });
+    if (!scheduled.scheduled && scheduled.reason === 'tentatives-epuisees') {
+      console.error(`[SESSION ${number}] le watchdog ne peut plus programmer de reconnexion.`);
+    }
+  },
+  onError: (error, number) => {
+    console.error(`[SESSION ${number || 'watchdog'}] contrôle keepalive :`, error?.message || error);
+  }
+});
+sessionHealthWatcher.start();
 
 function setupAutoRestart(socket, number, auth) {
   const sanitized = String(number).replace(/[^0-9]/g, '');
@@ -10739,7 +11278,6 @@ async function EmpirePair(number, res, options = {}) {
   }
   const { state } = auth;
   authStates.set(sanitizedNumber, auth);
-  const initialSessionCfg = await loadSessionConfigMerged(sanitizedNumber).catch(() => ({ ...DEFAULT_SESSION_CONFIG }));
   let socket = null;
 
  try {
@@ -10783,7 +11321,8 @@ async function EmpirePair(number, res, options = {}) {
       version: waVersion,
       printQRInTerminal: false,
       logger,
-      markOnlineOnConnect: configEnabled(initialSessionCfg.AUTO_ONLINE, false),
+      keepAliveIntervalMs: SESSION_KEEPALIVE_INTERVAL_MS,
+      markOnlineOnConnect: false,
       browser: WA_BROWSER
     });
 
@@ -10802,20 +11341,23 @@ socket.ev.on('creds.update', () => {
 // Branché avant tout await : il doit voir pair-success puis le close 515, même
 // si l'initialisation d'un handler métier prend du temps.
 const pairingLifecycle = setupAutoRestart(socket, sanitizedNumber, auth);
-// Le stanza pair-device peut arriver pendant l'initialisation des wrappers :
-// on s'abonne donc tout de suite, puis on attend le résultat juste avant la
-// demande de code. La promesse convertit son rejet pour éviter tout unhandled.
+// Le handshake Baileys peut terminer pendant l'initialisation des handlers :
+// on s'abonne tout de suite, puis la demande de code attend le premier stanza
+// déchiffré (ou update.qr) sans imposer le parcours QR.
 const pairingReadyResult = socket.authState.creds.registered
   ? null
   : waitForPairingReady(socket, { timeoutMs: PAIRING_READY_TIMEOUT_MS }).then(
       () => ({ ok: true }),
       (error) => ({ ok: false, error })
     );
-// Garde-fou d'envoi : installé avant les handlers métier pour que tous les
-// `socket.sendMessage` du bot vérifient la connexion réelle.
-installSafeSend(socket);
+// Les wrappers fonctionnels sont installés avant le garde-fou afin que
+// safe-send vérifie l'état Baileys avant toute traduction ou autre travail.
 await setupTranslationWrapper(socket, sanitizedNumber);
-setupCommandThemeWrapper(socket);
+installSafeSend(socket);
+// Le fake contact Meta AI habille toutes les sorties utilisateur; les vrais
+// événements restent citables pour le menu décoré.
+setupMetaAiFakeQuote(socket);
+setupReplyPresenceWrapper(socket);
 // ============================================================
 setupStatusHandlers(socket, sanitizedNumber);
 setupCommandHandlers(socket, sanitizedNumber);
@@ -10846,20 +11388,18 @@ handleMessageRevocation(socket, sanitizedNumber);
       let code = null;
       let lastError = null;
       try {
-        const ready = await pairingReadyResult;
-        if (!ready?.ok) throw ready?.error || new Error('WhatsApp non prêt pour l’appairage');
-        pairingLifecycle.markPairingReady();
-        pairingLifecycle.markCodeRequested();
-
         // Une seule demande par socket. Réessayer automatiquement ici peut
         // écraser creds.pairingCode alors que le téléphone traite encore la
         // première réponse (voir le cycle delayed primary_hello de Baileys).
-        code = await socket.requestPairingCode(sanitizedNumber);
-        // Ne jamais remettre le code au navigateur avant que les creds qui lui
-        // correspondent soient acquittées par MongoDB.
-        await auth.saveCreds();
-        await auth.flush();
-        pairingLifecycle.markCodeIssued();
+        code = await issuePairingCode({
+          socket,
+          number: sanitizedNumber,
+          auth,
+          readiness: pairingReadyResult,
+          onReady: () => pairingLifecycle.markPairingReady(),
+          onRequest: () => pairingLifecycle.markCodeRequested(),
+          onIssued: () => pairingLifecycle.markCodeIssued()
+        });
       } catch (error) {
         lastError = error;
         console.warn(
@@ -10923,8 +11463,7 @@ handleMessageRevocation(socket, sanitizedNumber);
           await auth.saveCreds();
           await addNumberToMongo(sanitizedNumber);
 
-          const presenceCfg = await loadSessionConfigMerged(sanitizedNumber, true);
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, false);
           await delay(3000);
           const userJid = jidNormalizedUser(socket.user.id);
           const groupResult = await joinGroup(socket).catch(()=>({ status: 'failed', error: 'joinGroup not configured' }));
@@ -11010,7 +11549,7 @@ Le bot est maintenant connecté et fonctionnel.`,
             console.error('Failed during connect-message edit sequence:', e);
           }
 
-          await applyAlwaysOnlineSetting(socket, presenceCfg.AUTO_ONLINE);
+          await applyAlwaysOnlineSetting(socket, false);
 
         } catch (e) {
           // Ne JAMAIS redémarrer tout le processus ici : ça tuerait toutes les
@@ -11158,7 +11697,15 @@ router.get('/', async (req, res) => {
   await EmpirePair(sanitized, res, { forceFresh: wantsFreshPairing(req), source: 'dashboard' });
 });
 
-router.get('/code', async (req, res) => {
+router.options('/code', (req, res) => {
+  applyPairingCors(req, res);
+  return res.sendStatus(204);
+});
+
+router.get('/code', (req, res, next) => {
+  applyPairingCors(req, res);
+  next();
+}, async (req, res) => {
   const { number } = req.query;
   if (!number) return res.status(400).send({ error: 'Number parameter is required' });
   const sanitized = number.replace(/[^0-9]/g, '');
@@ -11197,17 +11744,38 @@ router.get('/ping', (req, res) => {
 });
 
 
+async function launchSessionsWithConcurrency(numbers, reconnectReason, { skipLocked = false } = {}) {
+  const { mapWithConcurrency } = require('../services/session-startup');
+  const concurrency = getSessionStartupConcurrency();
+  const uniqueNumbers = [...new Set((numbers || [])
+    .map(number => String(number).replace(/[^0-9]/g, ''))
+    .filter(Boolean))];
+  const outcomes = await mapWithConcurrency(uniqueNumbers, concurrency, async number => {
+    if (activeSockets.has(number)) return { number, status: 'already_connected' };
+    if (skipLocked && pairingGuard.isLocked(number)) return { number, status: 'already_starting' };
+    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
+    await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason });
+    return { number, status: 'connection_initiated' };
+  });
+  return outcomes.map((outcome, index) => outcome.status === 'fulfilled'
+    ? outcome.value
+    : {
+        number: uniqueNumbers[index],
+        status: 'failed',
+        error: outcome.reason?.message || String(outcome.reason || 'Erreur inconnue')
+      });
+}
+
+function getSessionStartupConcurrency() {
+  const { resolveSessionStartupConcurrency } = require('../services/session-startup');
+  return resolveSessionStartupConcurrency(process.env.SESSION_STARTUP_CONCURRENCY);
+}
+
 router.get('/connect-all', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No numbers found to connect' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'connect-all' });
-      results.push({ number, status: 'connection_initiated' });
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'connect-all');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Connect all error:', error); res.status(500).send({ error: 'Failed to connect all bots' }); }
 });
@@ -11217,16 +11785,7 @@ router.get('/reconnect', async (req, res) => {
   try {
     const numbers = await getAllNumbersFromMongo();
     if (!numbers || numbers.length === 0) return res.status(404).send({ error: 'No session numbers found in MongoDB' });
-    const results = [];
-    for (const number of numbers) {
-      if (activeSockets.has(number)) { results.push({ number, status: 'already_connected' }); continue; }
-      const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-      try {
-        await EmpirePair(number, mockRes, { internalReconnect: true, reconnectReason: 'api-reconnect' });
-        results.push({ number, status: 'connection_initiated' });
-      } catch (err) { results.push({ number, status: 'failed', error: err.message }); }
-      await delay(1000);
-    }
+    const results = await launchSessionsWithConcurrency(numbers, 'api-reconnect');
     res.status(200).send({ status: 'success', connections: results });
   } catch (error) { console.error('Reconnect error:', error); res.status(500).send({ error: 'Failed to reconnect bots' }); }
 });
@@ -11315,9 +11874,9 @@ router.get('/api/active', async (req, res) => {
 });
 
 /**
- * Diagnostic des sessions : source de l'état d'authentification, nombre de clés
- * Signal, écritures en attente, état de la websocket et statistiques d'envoi.
- * C'est l'endroit où regarder quand une réponse ne part pas.
+ * Diagnostic des sessions : source auth, clés Signal, websocket, messages reçus
+ * et traités, erreurs du handler et statistiques d'envoi. C'est l'endroit où
+ * localiser un cas où le téléphone affiche le compte connecté sans réponse du bot.
  */
 router.get('/api/session/health', async (req, res) => {
   try {
@@ -11326,12 +11885,14 @@ router.get('/api/session/health', async (req, res) => {
       const auth = authStates.get(number);
       sessions.push({
         number,
-        websocketOuverte: socket?.ws?.readyState === 1,
+        websocketOuverte: getSocketOpenState(socket) === true,
         enregistre: Boolean(socket?.authState?.creds?.registered),
         sourceAuth: auth ? auth.source : null,
         clesSignal: auth ? auth.keyCount() : null,
         ecrituresEnAttente: auth ? auth.pendingWrites() : null,
         envois: typeof getSendStats === 'function' ? getSendStats(socket) : null,
+        traitementMessages: { ...getMessageProcessingStats(number) },
+        fileTraitement: messageDispatchers.get(number)?.getStats() || null,
         derniereActivite: lastConnectionActivity.get(number) || null,
         runtimeBaileys: socketRuntimeMetadata.get(number) || null,
         cycleConnexion: connectionLifecycles.get(number)?.snapshot?.() || null
@@ -11346,6 +11907,18 @@ router.get('/api/session/health', async (req, res) => {
       ok: true,
       stockageSessions: 'mongodb',
       mongodbConnecte: mongoConnection.isConnected(),
+      capaciteProcessus: {
+        sessionsActives: activeSockets.size,
+        appairagesEnCours: pairingSockets.size,
+        uptimeSecondes: Math.floor(process.uptime()),
+        node: process.version,
+        memoireMiB: Object.fromEntries(
+          Object.entries(process.memoryUsage()).map(([key, value]) => [key, Number((value / 1024 / 1024).toFixed(1))])
+        ),
+        poolMongoMax: mongoConnection.clientOptions.maxPoolSize,
+        traitementMessagesGlobal: messageProcessingPool.getStats()
+      },
+      boucleEvenement: readEventLoopDelayStats(),
       versionWhatsAppWeb: baileysVersionResolver.snapshot(),
       appairages,
       sessions
@@ -11409,6 +11982,8 @@ let shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  sessionHealthWatcher.stop();
+  githubAutoUpdater.stop();
   console.log(`[SHUTDOWN] ${signal} — vidage des écritures MongoDB…`);
   const socketsToClose = new Set([...activeSockets.values(), ...pairingSockets.values()]);
   socketsToClose.forEach((socket) => {
@@ -11444,22 +12019,29 @@ async function restoreSessionsOnBoot() {
       .filter(Boolean)
   );
 
-  console.log(`[BOOT] ${numbers.size} session(s) MongoDB à restaurer.`);
-  for (const n of numbers) {
-    if (activeSockets.has(n) || pairingGuard.isLocked(n)) continue;
-    const mockRes = { headersSent: false, send: () => {}, status: () => mockRes };
-    try {
-      await EmpirePair(n, mockRes, { internalReconnect: true, reconnectReason: 'boot' });
-    } catch (e) { console.error(`[BOOT] ${n}:`, e?.message || e); }
-    await delay(500);
+  console.log(
+    `[BOOT] ${numbers.size} session(s) MongoDB à restaurer avec ${getSessionStartupConcurrency()} démarrage(s) parallèle(s).`
+  );
+  const results = await launchSessionsWithConcurrency([...numbers], 'boot', { skipLocked: true });
+  const started = results.filter(result => result.status === 'connection_initiated').length;
+  const failed = results.filter(result => result.status === 'failed');
+  console.log(`[BOOT] ${started} démarrage(s) lancé(s), ${results.length - started - failed.length} déjà actif(s/en attente), ${failed.length} échec(s).`);
+  for (const result of failed) {
+    console.error(`[BOOT] ${result.number}:`, result.error);
   }
 }
 
 async function bootstrapMongoSessions() {
   try {
     await initMongo();
+    // Réchauffe les contrôles consultés à chaque commande avant l'ouverture des
+    // sockets, afin qu'une première réponse ne dépende pas d'une lecture Mongo.
+    await loadAdminsFromMongo().catch(error => {
+      console.warn('[BOOT] cache des administrateurs indisponible :', error?.message || error);
+    });
     await restoreRestartSchedule();
     await restoreSessionsOnBoot();
+    githubAutoUpdater.start();
   } catch (error) {
     // Le serveur HTTP reste joignable pour afficher le diagnostic, mais aucun
     // socket WhatsApp ne démarre sans la source de vérité MongoDB.

@@ -23,7 +23,8 @@ function createMongoConnection(options = {}) {
   const clientFactory = options.clientFactory || ((mongoUri, mongoOptions) => new MongoClient(mongoUri, mongoOptions));
   const clientOptions = {
     appName: 'kaido-md',
-    maxPoolSize: positiveInteger(process.env.MONGO_MAX_POOL_SIZE, 20),
+    maxPoolSize: positiveInteger(process.env.MONGO_MAX_POOL_SIZE, 100),
+    maxConnecting: positiveInteger(process.env.MONGO_MAX_CONNECTING, 10),
     minPoolSize: 0,
     serverSelectionTimeoutMS: positiveInteger(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS, 10_000),
     connectTimeoutMS: positiveInteger(process.env.MONGO_CONNECT_TIMEOUT_MS, 10_000),

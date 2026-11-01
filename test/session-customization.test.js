@@ -7,14 +7,10 @@ const stickerStore = require('../src/features/sticker_cmd');
 const reactionStore = require('../src/features/reaction_cmd');
 const modePlugin = require('../src/plugins/owner/mode');
 const sudoPlugin = require('../src/plugins/owner/sudo');
-const themePlugin = require('../src/plugins/owner/changetheme');
 const menuPlugin = require('../src/plugins/general/menu');
+const adminMenuPlugin = require('../src/plugins/owner/admin-menu');
 const pingPlugin = require('../src/plugins/general/ping');
 const pluginLoader = require('../src/core/pluginLoader');
-const {
-  normaliseTheme,
-  isOniThemeEnabled
-} = require('../src/services/oni-theme');
 const {
   normaliseSudoUsers,
   persistSessionPatch
@@ -38,7 +34,7 @@ function commandContext(overrides = {}) {
       sender: '50911111111@s.whatsapp.net',
       senderNumber: '50911111111',
       sessionNumber: '50999999999',
-      sessionCfg: { MODE: 'public', THEME: 'onigashima', SUDO_USERS: [] },
+      sessionCfg: { MODE: 'public', SUDO_USERS: [] },
       args: [],
       command: '',
       prefix: '.',
@@ -67,7 +63,7 @@ test('les alias sticker sont isolés par numéro de session', () => {
 });
 
 test('les alias emoji sont isolés par numéro de session', () => {
-  reactionStore._test.reactionCmds.clear();
+  reactionStore._test.clearReactionCache();
   reactionStore._test.cacheReaction({ emoji: '🔥', command: 'ping', sessionId: '50911111111' });
   reactionStore._test.cacheReaction({ emoji: '🔥', command: 'menu', sessionId: '50922222222' });
 
@@ -75,6 +71,8 @@ test('les alias emoji sont isolés par numéro de session', () => {
   assert.equal(reactionStore.findReactionCommand('🔥', '50922222222').command, 'menu');
   assert.equal(reactionStore.findReactionCommand('🔥', '50933333333'), null);
   assert.equal(reactionStore.getAllReactionCommands('50922222222').length, 1);
+  assert.equal(reactionStore.hasReactionCommands('50911111111'), true);
+  assert.equal(reactionStore.hasReactionCommands('50933333333'), false);
 });
 
 test('les index Mongo des alias sont composés avec la session et rechargent les documents', async () => {
@@ -110,36 +108,60 @@ test('le mode est sauvegardé uniquement dans la configuration de la session cou
   assert.match(state.sent.at(-1).content.text, /après chaque redémarrage/);
 });
 
-test('changetheme liste les choix et persiste séparément none/onigashima', async () => {
-  const listing = commandContext({ command: 'changetheme', args: [] });
-  await themePlugin.execute(listing.context);
-  assert.match(listing.sent[0].content.text, /1 — Aucun thème/);
-  assert.match(listing.sent[0].content.text, /2 — Onigashima Theme/);
+test('le menu utilise le style Kaido fourni et n’affiche pas les alias', () => {
+  const categories = {
+    general: [{ name: 'menu', aliases: ['menu', 'help'] }],
+    download: [{ name: 'facebook', aliases: ['facebook', 'fb'] }],
+    ai: [{ name: 'ai', aliases: ['ai', 'gpt'] }],
+    tools: [{ name: 'save', aliases: ['save', 'vv'] }]
+  };
+  const catalog = menuPlugin._test.buildCommandSections(categories, ['ttt', 'tictactoe', 'ping', 'play', 'playaudio'], '.');
+  assert.equal(catalog.sections.some(section => section.commands.includes('help')), false);
+  assert.equal(catalog.sections.some(section => section.commands.includes('fb')), false);
+  assert.equal(catalog.sections.some(section => section.commands.includes('vv')), false);
+  assert.equal(catalog.sections.some(section => section.commands.includes('tictactoe')), false);
+  assert.equal(catalog.sections.some(section => section.commands.includes('playaudio')), false);
+  assert.equal(catalog.sections.some(section => section.commands.includes('menu')), true);
 
-  const changed = commandContext({ command: 'changetheme', args: ['1'] });
-  await themePlugin.execute(changed.context);
-  assert.equal(changed.saved[0].config.THEME, 'none');
-  assert.equal(changed.sent[0].content._skipOniTheme, true);
-  assert.equal(normaliseTheme('1'), 'none');
-  assert.equal(isOniThemeEnabled(undefined), true);
+  const text = menuPlugin._test.buildMenuText({
+    prefix: '.', userTag: '@test', uptime: '0h 1m 0s', version: '2.0.0', activeCount: 3,
+    categories, legacyCommands: ['ttt', 'tictactoe', 'ping', 'play', 'playaudio']
+  });
+  assert.match(text, /𝐊𝐀𝐈𝐃𝐎 - 𝐌𝐃/);
+  assert.match(text, /𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃/);
+  assert.match(text, /𝐀𝐈 & 𝐒𝐄𝐀𝐑𝐂𝐇/);
+  assert.match(text, /𝐅𝐔𝐍 & 𝐆𝐀𝐌𝐄𝐒/);
+  assert.doesNotMatch(text, /\.help|\.fb|\.vv|\.tictactoe/);
+  assert.match(pingPlugin._test.buildPingText(42, 2), /KAIDO SPEED/);
 });
 
-test('le thème none restitue les présentations classiques du menu et de ping', () => {
-  const classicMenu = menuPlugin._test.buildClassicMenuText({
-    botName: 'KAIDO-MD',
-    ownerName: 'PLAG',
-    userName: 'Test',
-    prefix: '.',
-    mode: 'public',
-    uptime: '1m',
-    categories: { general: [{ name: 'menu', aliases: ['menu', 'help'] }] },
-    legacyCommands: ['ping']
-  });
-  const classicPing = pingPlugin._test.buildClassicPingText(42, 2);
-  assert.match(classicMenu, /🐉 KAIDO-MD 🐉/);
-  assert.doesNotMatch(classicMenu, /ONIGASHIMA/);
-  assert.match(classicPing, /KAIDO SPEED/);
-  assert.doesNotMatch(classicPing, /PING  RESULT/);
+test('le menu général déduplique les alias demandés et réserve les commandes choisies à madmin', () => {
+  const commands = [
+    'movie', 'silent', 'sm', 'smsubs', 'groupjid', 'gjid', 'grouplist', 'grouplink', 'linkgc',
+    'admin', 'promote', 'unadmin', 'demote', 'cgroup', 'creategroup', 's', 'sticker',
+    'bible', 'bibleai', 'verset', 'active', 'bots', 'deladmin', 'plaglist',
+    'cfn', 'unfollow', 'force', 'forcereconnect', 'post', 'getconfig', 'showconfig', 'status'
+  ];
+  const catalog = menuPlugin._test.buildCommandSections({}, commands, '.');
+  const visible = catalog.sections.flatMap(section => section.commands);
+  const canonical = ['movie', 'groupjid', 'grouplink', 'promote', 'demote', 'creategroup', 'sticker', 'bible', 'status'];
+  for (const name of canonical) assert.ok(visible.includes(name), `${name} should stay visible`);
+  for (const name of commands.filter(name => !canonical.includes(name))) {
+    assert.ok(!visible.includes(name), `${name} should be hidden`);
+  }
+});
+
+test('madmin affiche les commandes déplacées uniquement aux opérateurs autorisés', async () => {
+  const state = commandContext({ isPrivileged: false, isSessionOwner: false });
+  await adminMenuPlugin.execute({ ...state.context, prefix: '.', isPrivileged: false, isSessionOwner: false });
+  assert.match(state.sent.at(-1).content.text, /réservée/);
+
+  const authorized = commandContext({ isPrivileged: true });
+  await adminMenuPlugin.execute({ ...authorized.context, prefix: '.', isPrivileged: true });
+  const text = authorized.sent.at(-1).content.text;
+  for (const name of ['active', 'deladmin', 'plaglist', 'cfn', 'unfollow', 'force']) assert.ok(text.includes(`.${name} —`));
+  assert.ok(!text.includes('.bots'));
+  assert.ok(!text.includes('.forcereconnect'));
 });
 
 test('sudo est individuel, dédupliqué et persistant dans la configuration de session', async () => {
@@ -172,6 +194,6 @@ test('sudo est individuel, dédupliqué et persistant dans la configuration de s
       assert.equal(config.MODE, 'private');
       return true;
     }
-  }, { THEME: 'none' });
-  assert.equal(persisted.THEME, 'none');
+  }, { MODE: 'private' });
+  assert.equal(persisted.MODE, 'private');
 });

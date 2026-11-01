@@ -8,6 +8,7 @@ const {
   normalisePrefix,
   resolveSessionPrefix,
   parseCommandInput,
+  shouldRouteToChatbot,
   extractLegacyCommands,
   extractMainCommandNames,
   formatPrefix
@@ -37,6 +38,18 @@ test('mode prefixless: exécute uniquement un premier mot répertorié comme com
   assert.equal(parseCommandInput('salut', '', isKnown), null);
   assert.equal(parseCommandInput('salut menu', '', isKnown), null);
   assert.equal(parseCommandInput('menu du restaurant', '', isKnown)?.command, 'menu');
+});
+
+test('le chatbot laisse les commandes connues prioritaires et prend les textes inconnus seulement quand il est ON', () => {
+  const knownCommand = { command: 'menu' };
+  const unknownPrefixed = { command: 'bonjour' };
+  const isKnownCommand = command => command === 'menu';
+
+  assert.equal(shouldRouteToChatbot({ enabled: true, parsedCommand: knownCommand, isKnownCommand }), false);
+  assert.equal(shouldRouteToChatbot({ enabled: true, parsedCommand: unknownPrefixed, isKnownCommand }), true);
+  assert.equal(shouldRouteToChatbot({ enabled: true, parsedCommand: null, isKnownCommand }), true);
+  assert.equal(shouldRouteToChatbot({ enabled: false, parsedCommand: null, isKnownCommand }), false);
+  assert.equal(shouldRouteToChatbot({ enabled: true, fromMe: true, parsedCommand: null, isKnownCommand }), false);
 });
 
 test('setprefix off est normalisé en préfixe vide sans perdre la valeur', () => {

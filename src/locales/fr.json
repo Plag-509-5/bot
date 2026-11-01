@@ -1,0 +1,27 @@
+{
+  "languageName": "Français",
+  "responses": {
+    "Configuration réussie !": "Configuration réussie !",
+    "Aucun quiz n’est en cours dans ce salon.": "Aucun quiz n’est en cours dans ce salon.",
+    "Aucun quiz en cours. Lance-en un avec .quiz.": "Aucun quiz en cours. Lance-en un avec .quiz.",
+    "La question actuelle est toujours ouverte. Attends le verdict avant de continuer.": "La question actuelle est toujours ouverte. Attends le verdict avant de continuer.",
+    "Aucun score pour le moment.": "Aucun score pour le moment.",
+    "Réponse directe : écris ta réponse dans le groupe.": "Réponse directe : écris ta réponse dans le groupe.",
+    "Vote dans le sondage ci-dessous. Le vote se ferme dans 30 secondes.": "Vote dans le sondage ci-dessous. Le vote se ferme dans 30 secondes.",
+    "Statut publié, visible par": "Statut publié, visible par",
+    "Publication annulée :": "Publication annulée :",
+    "Impossible de générer la question :": "Impossible de générer la question :",
+    "Impossible de générer le quiz :": "Impossible de générer le quiz :",
+    "Les API IA sont temporairement limitées. Réessaie dans quelques instants.": "Les API IA sont temporairement limitées. Réessaie dans quelques instants.",
+    "Pose une question après la commande.": "Pose une question après la commande.",
+    "Téléchargement YouTube impossible :": "Téléchargement YouTube impossible :",
+    "Aucun résultat trouvé sur YouTube.": "Aucun résultat trouvé sur YouTube.",
+    "Sessions actives :": "Sessions actives :",
+    "Aucun bot actuellement connecté.": "Aucun bot actuellement connecté.",
+    "Aucun abonnement préalable n'est nécessaire.": "Aucun abonnement préalable n'est nécessaire.",
+    "Les réponses statiques utilisent désormais le catalogue local": "Les réponses statiques utilisent désormais le catalogue local",
+    "L’IA et les quiz répondront dans cette langue.": "L’IA et les quiz répondront dans cette langue.",
+    "Langue manquante ou non prise en charge.": "Langue manquante ou non prise en charge.",
+    "Catalogues locaux disponibles :": "Catalogues locaux disponibles :"
+  }
+}

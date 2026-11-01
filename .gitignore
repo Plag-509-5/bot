@@ -1,4 +1,5 @@
 node_modules/
+.kaido-update-git/
 .env
 .npm
 npm-debug.log*
