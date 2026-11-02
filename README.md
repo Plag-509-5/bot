@@ -14,7 +14,7 @@
 - **🌐 Tableau de Bord Web Complet :**
   - Gestion des sessions actives et archivées (`/dashboard/sessions.html`).
   - Gestion des newsletters WhatsApp et auto-réactions (`/dashboard/newsletters.html`).
-  - `.bpoll 1` ou `.bpoll 1 (75), 3 (25)` répartit les votes du sondage de chaîne cité entre les sessions actives; l’arrondi utilise la méthode du plus fort reste.
+  - `.bpoll https://whatsapp.com/channel/<code>/<server_id> | 1` vote pour l’option du post ciblé; `.bpoll <lien> | 1 (75), 3 (25)` répartit les sessions selon les pourcentages avec arrondi au plus fort reste.
   - Gestion des administrateurs (`/dashboard/admins.html`).
   - Statut en temps réel et métriques système (`/dashboard/active.html`).
 - **🛡️ Sécurité & Modération de Groupe :**

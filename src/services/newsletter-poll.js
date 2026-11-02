@@ -1,21 +1,37 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
-const { normaliseNewsletterJid } = require('./newsletter-config');
+const {
+  normaliseNewsletterJid,
+  parseNewsletterMessageReference,
+  resolveNewsletterJid
+} = require('./newsletter-config');
 
 const PERCENT_EPSILON = 1e-8;
 
 function parseBPollInput(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
-  const pieces = raw.split(',').map(piece => piece.trim());
+
+  // Forme recommandée : <lien-de-publication> | <options>. La forme sans lien
+  // reste acceptée pour compatibilité avec le vote en répondant à un sondage.
+  let reference = null;
+  let choiceInput = raw;
+  const separator = raw.indexOf('|');
+  if (separator >= 0) {
+    reference = parseNewsletterMessageReference(raw.slice(0, separator).trim());
+    choiceInput = raw.slice(separator + 1).trim();
+    if (!reference) return null;
+  }
+
+  const pieces = choiceInput.split(',').map(piece => piece.trim());
   if (pieces.some(piece => !piece)) return null;
 
   const choices = [];
   if (pieces.length === 1 && /^\d+$/.test(pieces[0])) {
     const option = Number(pieces[0]);
     if (!Number.isSafeInteger(option) || option < 1) return null;
-    return { choices: [{ option, percent: 100 }] };
+    return { ...(reference || {}), choices: [{ option, percent: 100 }] };
   }
 
   for (const piece of pieces) {
@@ -32,7 +48,7 @@ function parseBPollInput(value) {
 
   const total = choices.reduce((sum, choice) => sum + choice.percent, 0);
   if (Math.abs(total - 100) > PERCENT_EPSILON) return null;
-  return { choices };
+  return { ...(reference || {}), choices };
 }
 
 /**
@@ -98,6 +114,91 @@ function getPollOptionNames(pollMessage) {
       : [];
   // Preserve the exact option bytes: WhatsApp hashes optionName as UTF-8 without trimming.
   return options.map(option => String(option?.optionName ?? '')).filter(name => name.length > 0);
+}
+
+function collectNewsletterMessages(value, serverId, matched = [], inheritedMatch = false, seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value) || Buffer.isBuffer(value) || value instanceof Uint8Array) return matched;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const child of value) collectNewsletterMessages(child, serverId, matched, inheritedMatch, seen);
+    return matched;
+  }
+
+  const currentId = value.attrs?.server_id ?? value.server_id ?? value.serverId;
+  const isMatch = inheritedMatch || (currentId !== undefined && String(currentId) === String(serverId));
+  if (isMatch && (value.tag === 'message' || value.message || value.pollCreationMessage || value.pollResultSnapshotMessage)) {
+    matched.push(value);
+  }
+  if (Array.isArray(value.content)) {
+    for (const child of value.content) collectNewsletterMessages(child, serverId, matched, isMatch, seen);
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'attrs' || key === 'content') continue;
+    if (child && typeof child === 'object') collectNewsletterMessages(child, serverId, matched, isMatch, seen);
+  }
+  return matched;
+}
+
+function findPlaintextPayloads(value, payloads = [], seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value) || Buffer.isBuffer(value) || value instanceof Uint8Array) return payloads;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const child of value) findPlaintextPayloads(child, payloads, seen);
+    return payloads;
+  }
+  if (value.tag === 'plaintext' && (Buffer.isBuffer(value.content) || value.content instanceof Uint8Array)) {
+    payloads.push(Buffer.from(value.content));
+  }
+  if (Array.isArray(value.content)) {
+    for (const child of value.content) findPlaintextPayloads(child, payloads, seen);
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === 'attrs' || key === 'content') continue;
+    if (child && typeof child === 'object') findPlaintextPayloads(child, payloads, seen);
+  }
+  return payloads;
+}
+
+function getNewsletterPollOptionsFromHistory(history, serverId, decodeMessage) {
+  const candidates = collectNewsletterMessages(history, serverId);
+  for (const candidate of candidates) {
+    const direct = getPollOptionNames(candidate.message || candidate);
+    if (direct.length) return direct;
+    for (const payload of findPlaintextPayloads(candidate)) {
+      try {
+        const decoded = decodeMessage(payload);
+        const names = getPollOptionNames(decoded);
+        if (names.length) return names;
+      } catch (_) {
+        // Une publication non-poll ou une enveloppe inconnue; tenter les autres.
+      }
+    }
+  }
+  return [];
+}
+
+async function fetchNewsletterPollOptions(socket, reference, decodeMessage) {
+  if (typeof socket?.newsletterFetchMessages !== 'function') {
+    throw new Error('newsletterFetchMessages indisponible sur le socket Baileys');
+  }
+  if (typeof decodeMessage !== 'function') throw new Error('Décodeur protobuf Baileys indisponible');
+  const target = {
+    jid: await resolveNewsletterJid(socket, reference),
+    serverId: String(reference?.serverId || '').trim()
+  };
+  if (!/^\d+$/.test(target.serverId)) throw new Error('Le server_id du lien doit être numérique');
+
+  const after = String(Math.max(0, Number(target.serverId) - 1));
+  const responses = [
+    await socket.newsletterFetchMessages(target.jid, 10, undefined, after)
+  ];
+  let optionNames = getNewsletterPollOptionsFromHistory(responses[0], target.serverId, decodeMessage);
+  if (!optionNames.length) {
+    responses.push(await socket.newsletterFetchMessages(target.jid, 100, undefined, undefined));
+    optionNames = getNewsletterPollOptionsFromHistory(responses[1], target.serverId, decodeMessage);
+  }
+  if (!optionNames.length) throw new Error('La publication liée est introuvable ou ne contient pas de sondage lisible');
+  return { ...target, optionNames };
 }
 
 function findForwardedNewsletterInfo(...values) {
@@ -208,6 +309,8 @@ module.exports = {
   allocateBPollVotes,
   findPollContent,
   getPollOptionNames,
+  getNewsletterPollOptionsFromHistory,
+  fetchNewsletterPollOptions,
   findForwardedNewsletterInfo,
   resolveBPollTarget,
   hashPollOption,

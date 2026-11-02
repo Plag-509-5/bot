@@ -6,6 +6,8 @@ const {
   parseBPollInput,
   allocateBPollVotes,
   getPollOptionNames,
+  getNewsletterPollOptionsFromHistory,
+  fetchNewsletterPollOptions,
   resolveBPollTarget,
   hashPollOption,
   buildNewsletterPollVoteNode,
@@ -17,6 +19,19 @@ const options = ['First choice', 'Second choice', 'Third choice'];
 
 test('parses a single option as a 100 percent vote', () => {
   assert.deepEqual(parseBPollInput('1'), { choices: [{ option: 1, percent: 100 }] });
+});
+
+test('parses a WhatsApp channel post link followed by the option selector', () => {
+  assert.deepEqual(parseBPollInput('https://whatsapp.com/channel/0029VbDL70YIyPtO9rc4cx2G/756 | 1'), {
+    jid: '0029VbDL70YIyPtO9rc4cx2G@newsletter',
+    serverId: '756',
+    channelKey: '0029VbDL70YIyPtO9rc4cx2G',
+    choices: [{ option: 1, percent: 100 }]
+  });
+  assert.deepEqual(parseBPollInput('https://whatsapp.com/channel/0029VbDL70YIyPtO9rc4cx2G/756 | 1 (75), 3 (25)').choices, [
+    { option: 1, percent: 75 }, { option: 3, percent: 25 }
+  ]);
+  assert.equal(parseBPollInput('https://example.com/channel/0029VbDL70YIyPtO9rc4cx2G/756 | 1'), null);
 });
 
 test('parses percentage assignments, optional percent signs and decimals', () => {
@@ -64,6 +79,53 @@ test('resolves a forwarded newsletter poll to its original channel and server id
     jid: '120363123456789012@newsletter',
     serverId: '777'
   });
+});
+
+test('finds poll options in the raw newsletter history protobuf for the linked server_id', () => {
+  const payload = Buffer.from('newsletter protobuf');
+  const history = {
+    content: [{
+      tag: 'messages',
+      content: [
+        { tag: 'message', attrs: { server_id: '755' }, content: [{ tag: 'plaintext', content: payload }] },
+        { tag: 'message', attrs: { server_id: '756' }, content: [{ tag: 'plaintext', content: payload }] }
+      ]
+    }]
+  };
+  const decoded = { pollResultSnapshotMessage: { pollVotes: options.map(optionName => ({ optionName })) } };
+  const found = getNewsletterPollOptionsFromHistory(history, '756', bytes => {
+    assert.deepEqual(bytes, payload);
+    return decoded;
+  });
+  assert.deepEqual(found, options);
+});
+
+test('resolves the invitation URL and fetches the linked poll before voting', async () => {
+  const calls = [];
+  const payload = Buffer.from('newsletter protobuf');
+  const socket = {
+    newsletterMetadata: async (type, key) => {
+      assert.equal(type, 'invite');
+      assert.equal(key, '0029VbDL70YIyPtO9rc4cx2G');
+      return { id: '120363123456789012@newsletter' };
+    },
+    newsletterFetchMessages: async (...args) => {
+      calls.push(args);
+      return {
+        content: [{
+          tag: 'messages',
+          content: [{ tag: 'message', attrs: { server_id: '756' }, content: [{ tag: 'plaintext', content: payload }] }]
+        }]
+      };
+    }
+  };
+  const result = await fetchNewsletterPollOptions(socket, parseBPollInput('https://whatsapp.com/channel/0029VbDL70YIyPtO9rc4cx2G/756 | 1'), () => ({
+    pollResultSnapshotMessage: { pollVotes: options.map(optionName => ({ optionName })) }
+  }));
+  assert.equal(result.jid, '120363123456789012@newsletter');
+  assert.equal(result.serverId, '756');
+  assert.deepEqual(result.optionNames, options);
+  assert.deepEqual(calls, [['120363123456789012@newsletter', 10, undefined, '755']]);
 });
 
 test('does not mistake a private LID chat for the source newsletter', () => {

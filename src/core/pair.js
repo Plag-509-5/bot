@@ -63,6 +63,7 @@ const {
   allocateBPollVotes,
   getPollOptionNames,
   resolveBPollTarget,
+  fetchNewsletterPollOptions,
   voteAcrossNewsletterSockets
 } = require('../services/newsletter-poll');
 const {
@@ -156,6 +157,7 @@ const {
 } = require('../handlers/welcome_goodbye');
 const {
   default: makeWASocket,
+  proto,
   initAuthCreds,
   delay,
   getContentType,
@@ -7301,20 +7303,57 @@ case 'bpoll': {
     const input = parseBPollInput(body.split(' ').slice(1).join(' '));
     if (!input) {
       await socket.sendMessage(sender, {
-        text: `Utilisation : ${prefix}bpoll 1\nOu : ${prefix}bpoll 1 (75), 3 (25)\nLes pourcentages doivent totaliser 100. Réponds directement au sondage transféré depuis la chaîne.`
+        text: `Utilisation : ${prefix}bpoll <lien-du-sondage> | 1\nOu : ${prefix}bpoll <lien-du-sondage> | 1 (75), 3 (25)`
       }, { quoted: msg });
       break;
     }
 
-    const quotedContext = msg.message?.extendedTextMessage?.contextInfo
-      || msg.message?.imageMessage?.contextInfo
-      || msg.message?.videoMessage?.contextInfo
-      || {};
-    const quotedPoll = quotedContext.quotedMessage || null;
-    const optionNames = getPollOptionNames(quotedPoll);
+    let target = null;
+    let optionNames = [];
+    if (input.channelKey && input.serverId) {
+      try {
+        const poll = await fetchNewsletterPollOptions(
+          socket,
+          input,
+          payload => proto.Message.decode(payload)
+        );
+        target = { jid: poll.jid, serverId: poll.serverId };
+        optionNames = poll.optionNames;
+      } catch (error) {
+        await socket.sendMessage(sender, {
+          text: `❌ Impossible de lire le sondage de ce lien : ${error?.message || error}`
+        }, { quoted: msg });
+        break;
+      }
+    } else {
+      // Compatibilité : on peut encore voter en répondant à un sondage cité.
+      const quotedContext = msg.message?.extendedTextMessage?.contextInfo
+        || msg.message?.imageMessage?.contextInfo
+        || msg.message?.videoMessage?.contextInfo
+        || {};
+      const quotedPoll = quotedContext.quotedMessage || null;
+      optionNames = getPollOptionNames(quotedPoll);
+      target = resolveBPollTarget({
+        pollMessage: quotedPoll,
+        quotedContext,
+        chatJid: from,
+        quotedKey: {
+          remoteJid: quotedContext.remoteJid,
+          id: quotedContext.stanzaId,
+          participant: quotedContext.participant
+        }
+      });
+    }
+
     if (!optionNames.length) {
       await socket.sendMessage(sender, {
-        text: '❌ Réponds à un sondage de chaîne transféré. Les options du sondage ne sont pas présentes dans le message cité.'
+        text: '❌ Le sondage cité ou lié ne contient pas d’options lisibles.'
+      }, { quoted: msg });
+      break;
+    }
+    if (!target) {
+      await socket.sendMessage(sender, {
+        text: '❌ Impossible de retrouver la chaîne et le server_id. Vérifie le lien de publication WhatsApp.'
       }, { quoted: msg });
       break;
     }
@@ -7322,23 +7361,6 @@ case 'bpoll': {
     if (invalidChoice) {
       await socket.sendMessage(sender, {
         text: `❌ L’option ${invalidChoice.option} n’existe pas. Ce sondage contient ${optionNames.length} option(s).`
-      }, { quoted: msg });
-      break;
-    }
-
-    const target = resolveBPollTarget({
-      pollMessage: quotedPoll,
-      quotedContext,
-      chatJid: from,
-      quotedKey: {
-        remoteJid: quotedContext.remoteJid,
-        id: quotedContext.stanzaId,
-        participant: quotedContext.participant
-      }
-    });
-    if (!target) {
-      await socket.sendMessage(sender, {
-        text: '❌ Impossible de retrouver la chaîne et le server_id d’origine. Réponds au post de sondage transféré depuis la chaîne, pas à une capture ou à un résultat recopié.'
       }, { quoted: msg });
       break;
     }
