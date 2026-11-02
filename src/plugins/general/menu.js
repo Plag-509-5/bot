@@ -30,26 +30,14 @@ function createFakeMenuEventQuote(botName = 'KAIDO-MD', now = Date.now()) {
 }
 
 async function sendMenuPresentation({ socket, from, msg, text, mentions, botName }) {
-  // WhatsApp ne permet pas de combiner dans un même payload un eventMessage
-  // natif, une image-message et le long texte du menu. Envoyer séparément
-  // produisait trois messages; on garde donc un message texte unique, avec
-  // l'image en vignette externalAdReply et l'événement décoratif cité.
-  const thumbnail = fs.readFileSync(MENU_THUMBNAIL_PATH);
-
+  // Un seul message WhatsApp : le vrai visuel en image, le menu en légende et
+  // l’événement Kaido comme message cité, sans vignette externe ni messages séparés.
+  const image = fs.readFileSync(MENU_IMAGE_PATH);
   const eventQuote = createFakeMenuEventQuote(botName);
   return socket.sendMessage(from, {
-    text,
-    mentions: mentions || [],
-    contextInfo: {
-      externalAdReply: {
-        title: `${String(botName || 'KAIDO-MD').slice(0, 60)} — Menu`,
-        body: 'Guide de la session Kaido MD',
-        thumbnail,
-        mediaType: 1,
-        showAdAttribution: false,
-        renderLargerThumbnail: true
-      }
-    }
+    image,
+    caption: text,
+    mentions: mentions || []
   }, { quoted: eventQuote || msg });
 }
 

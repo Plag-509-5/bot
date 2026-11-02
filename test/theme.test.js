@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const themePlugin = require('../src/plugins/owner/theme');
 const { _test: translationTest, FONT_THEME_OPTIONS } = require('../src/features/translation');
+const { _test: themeTest } = themePlugin;
 
 test('.theme sans argument liste les codes et le thème Small Caps', async () => {
   const sent = [];
@@ -41,4 +42,20 @@ test('.theme a persiste le code et met à jour le thème du cache de session', a
   assert.match(sent[0], /a — Small Caps/);
   assert.ok(FONT_THEME_OPTIONS.a);
   translationTest.clearCache();
+});
+
+test('.theme utilise ses options de secours si le catalogue est absent et tolère une config nulle', async () => {
+  assert.match(themeTest.themeMenu('.', 'b', null), /b — Sans Bold/);
+  const sent = [];
+  await themePlugin.execute({
+    socket: { async sendMessage(jid, content) { sent.push(content.text); } },
+    from: 'owner@s.whatsapp.net',
+    msg: {},
+    prefix: '.',
+    args: [],
+    sessionNumber: '50912345678',
+    sessionCfg: null
+  });
+  assert.match(sent[0], /Thème des réponses du bot/);
+  assert.ok(themeTest.resolveThemeOptions(null).a);
 });
