@@ -74,9 +74,19 @@ test('convertit les erreurs de lancement en échecs et produit un bilan chiffré
       candidates: result.candidates,
       results: result.results
     }),
-    '✅ Reconnexion terminée.\nSessions examinées : 2\nSessions inactives : 2\nReconnexions programmées : 0\nDéjà actives : 0\nDéjà en cours : 0\nÉchecs : 2'
+    '✅ Reconnexion terminée.\nSessions examinées : 2\nSessions inactives : 2\nDémarrages de reconnexion effectués : 0\nDéjà actives : 0\nDéjà en cours : 0\nÉchecs : 2'
   );
   assert.match(formatForceReconnectReport({ fatalErrors: 1 }), /Échecs : 1$/);
+  const startedReport = formatForceReconnectReport({
+    total: 2,
+    candidates: 2,
+    results: [
+      { number: '509777', status: 'connection_initiated' },
+      { number: '509888', status: 'scheduled' }
+    ]
+  });
+  assert.match(startedReport, /Démarrages de reconnexion effectués : 1/);
+  assert.doesNotMatch(startedReport, /programmées/);
 });
 
 test('.forcereconnect et .force sont protégées et passent par les sessions Mongo sauvegardées', () => {
@@ -88,6 +98,7 @@ test('.forcereconnect et .force sont protégées et passent par les sessions Mon
   assert.match(block, /if \(!isPrivileged\)/);
   assert.match(block, /getAllNumbersFromMongo\(\)/);
   assert.match(block, /reconnectInactiveSessions\(/);
-  assert.match(block, /reconnectScheduler\.scheduleImmediate\(/);
+  assert.match(block, /launchSessionsWithConcurrency\(/);
+  assert.doesNotMatch(block, /reconnectScheduler\.scheduleImmediate\(/);
   assert.match(block, /formatForceReconnectReport\(/);
 });

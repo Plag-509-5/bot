@@ -75,7 +75,7 @@ async function reconnectInactiveSessions(numbers, {
 
 function formatForceReconnectReport({ total = 0, candidates = 0, results = [], fatalErrors = 0 } = {}) {
   const entries = Array.isArray(results) ? results : [];
-  const launched = entries.filter(result => ['connection_initiated', 'scheduled'].includes(result?.status)).length;
+  const launched = entries.filter(result => result?.status === 'connection_initiated').length;
   const active = entries.filter(result => result?.status === 'already_connected').length;
   const starting = entries.filter(result => result?.status === 'already_starting').length;
   const failures = entries.filter(result => result?.status === 'failed').length + Math.max(0, Number(fatalErrors) || 0);
@@ -84,7 +84,7 @@ function formatForceReconnectReport({ total = 0, candidates = 0, results = [], f
     '✅ Reconnexion terminée.',
     `Sessions examinées : ${Math.max(0, Number(total) || 0)}`,
     `Sessions inactives : ${Math.max(0, Number(candidates) || 0)}`,
-    `Reconnexions programmées : ${launched}`,
+    `Démarrages de reconnexion effectués : ${launched}`,
     `Déjà actives : ${active}`,
     `Déjà en cours : ${starting}`,
     `Échecs : ${failures}`

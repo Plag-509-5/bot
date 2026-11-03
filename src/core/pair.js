@@ -8731,19 +8731,13 @@ case 'force': {
       closeSocket: candidate => forceCloseSessionSocket(candidate, error => {
         console.warn('[FORCE-RECONNECT] fermeture du socket :', error?.message || error);
       }),
-      launchSessions: inactiveNumbers => inactiveNumbers.map(inactiveNumber => {
-        const scheduled = reconnectScheduler.scheduleImmediate(inactiveNumber, {
-          reason: 'commande forcereconnect'
-        });
-        return {
-          number: inactiveNumber,
-          status: scheduled.scheduled
-            ? 'scheduled'
-            : scheduled.reason === 'deja-programmee'
-              ? 'already_starting'
-              : 'failed'
-        };
-      })
+      // .force doit lancer EmpirePair dans cette même commande, pas placer un
+      // timer à 0 ms dans l'ordonnanceur de reconnexion automatique.
+      launchSessions: inactiveNumbers => launchSessionsWithConcurrency(
+        inactiveNumbers,
+        'commande forcereconnect',
+        { skipLocked: true }
+      )
     });
     report = formatForceReconnectReport(outcome);
   } catch (error) {

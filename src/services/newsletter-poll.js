@@ -85,6 +85,7 @@ function unwrapMessage(message) {
     const nested = current.ephemeralMessage?.message
       || current.viewOnceMessage?.message
       || current.viewOnceMessageV2?.message
+      || current.viewOnceMessageV2Extension?.message
       || current.documentWithCaptionMessage?.message
       || current.deviceSentMessage?.message;
     if (!nested) break;
@@ -93,15 +94,36 @@ function unwrapMessage(message) {
   return current;
 }
 
-function findPollContent(message) {
+function findPollContent(message, depth = 0) {
+  if (!message || depth > 8) return null;
   const unwrapped = unwrapMessage(message);
   const candidates = [
-    ['pollCreationMessage', unwrapped.pollCreationMessage],
-    ['pollCreationMessageV2', unwrapped.pollCreationMessageV2],
-    ['pollCreationMessageV3', unwrapped.pollCreationMessageV3],
-    ['pollResultSnapshotMessage', unwrapped.pollResultSnapshotMessage]
+    unwrapped.pollCreationMessage,
+    unwrapped.pollCreationMessageV2,
+    unwrapped.pollCreationMessageV3,
+    unwrapped.pollResultSnapshotMessage
   ];
-  return candidates.find(([, content]) => content)?.[1] || null;
+  const direct = candidates.find(Boolean);
+  if (direct) return direct;
+
+  // Baileys 7's current schema wraps poll V4/V5 and result-snapshot V3 in
+  // FutureProofMessage.message. Recurse into that Message to find its concrete
+  // poll field instead of treating the wrapper as poll data.
+  const futureProofPolls = [
+    unwrapped.pollCreationMessageV4,
+    unwrapped.pollCreationMessageV5,
+    unwrapped.pollResultSnapshotMessageV3
+  ];
+  for (const wrapper of futureProofPolls) {
+    const nestedMessage = wrapper?.message;
+    if (!nestedMessage) continue;
+    const nestedPoll = findPollContent(nestedMessage, depth + 1);
+    if (nestedPoll) return nestedPoll;
+    // Be tolerant of decoders that expose the poll payload directly inside
+    // the wrapper rather than wrapping it in proto.Message.
+    if (Array.isArray(nestedMessage.options) || Array.isArray(nestedMessage.pollVotes)) return nestedMessage;
+  }
+  return null;
 }
 
 function getPollOptionNames(pollMessage) {

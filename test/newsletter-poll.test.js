@@ -60,6 +60,18 @@ test('allocates the exact session count with largest-remainder rounding', () => 
 test('reads options from poll creation or result snapshot messages', () => {
   assert.deepEqual(getPollOptionNames({ pollCreationMessageV3: { options: options.map(optionName => ({ optionName })) } }), options);
   assert.deepEqual(getPollOptionNames({ pollResultSnapshotMessage: { pollVotes: options.map(optionName => ({ optionName, optionVoteCount: 2 })) } }), options);
+  // Baileys 7 declares poll creation V4/V5 and snapshot V3 as FutureProofMessage
+  // wrappers, unlike the older direct protobuf fields.
+  assert.deepEqual(getPollOptionNames({
+    pollCreationMessageV5: {
+      message: { pollCreationMessageV3: { options: options.map(optionName => ({ optionName })) } }
+    }
+  }), options);
+  assert.deepEqual(getPollOptionNames({
+    pollResultSnapshotMessageV3: {
+      message: { pollResultSnapshotMessage: { pollVotes: options.map(optionName => ({ optionName, optionVoteCount: 2 })) } }
+    }
+  }), options);
   assert.deepEqual(getPollOptionNames({ conversation: 'not a poll' }), []);
 });
 
@@ -120,7 +132,9 @@ test('resolves the invitation URL and fetches the linked poll before voting', as
     }
   };
   const result = await fetchNewsletterPollOptions(socket, parseBPollInput('https://whatsapp.com/channel/0029VbDL70YIyPtO9rc4cx2G/756 | 1'), () => ({
-    pollResultSnapshotMessage: { pollVotes: options.map(optionName => ({ optionName })) }
+    pollCreationMessageV5: {
+      message: { pollCreationMessageV3: { options: options.map(optionName => ({ optionName })) } }
+    }
   }));
   assert.equal(result.jid, '120363123456789012@newsletter');
   assert.equal(result.serverId, '756');
